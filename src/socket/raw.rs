@@ -50,7 +50,7 @@ pub type PacketBuffer<'a> = crate::storage::PacketBuffer<'a, ()>;
 pub struct Socket<'a> {
     ip_version: IpVersion,
     ip_protocol: IpProtocol,
-    rx_buffer: PacketBuffer<'a>,
+    pub rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
@@ -129,6 +129,9 @@ impl<'a> Socket<'a> {
     /// Check whether the transmit buffer is full.
     #[inline]
     pub fn can_send(&self) -> bool {
+        if self.tx_buffer.packet_capacity() == 0 {
+            return true;
+        }
         !self.tx_buffer.is_full()
     }
 

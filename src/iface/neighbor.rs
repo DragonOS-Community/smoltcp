@@ -14,14 +14,14 @@ use crate::wire::{HardwareAddress, IpAddress};
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Neighbor {
-    hardware_addr: HardwareAddress,
-    expires_at: Instant,
+    pub hardware_addr: HardwareAddress,
+    pub expires_at: Instant,
 }
 
 /// An answer to a neighbor cache lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub(crate) enum Answer {
+pub enum Answer {
     /// The neighbor address is in the cache and not expired.
     Found(HardwareAddress),
     /// The neighbor address is not in the cache, or has expired.
@@ -33,7 +33,7 @@ pub(crate) enum Answer {
 
 impl Answer {
     /// Returns whether a valid address was found.
-    pub(crate) fn found(&self) -> bool {
+    pub fn found(&self) -> bool {
         match self {
             Answer::Found(_) => true,
             _ => false,
@@ -50,10 +50,10 @@ pub struct Cache {
 
 impl Cache {
     /// Minimum delay between discovery requests, in milliseconds.
-    pub(crate) const SILENT_TIME: Duration = Duration::from_millis(1_000);
+    pub const SILENT_TIME: Duration = Duration::from_millis(1_000);
 
     /// Neighbor entry lifetime, in milliseconds.
-    pub(crate) const ENTRY_LIFETIME: Duration = Duration::from_millis(60_000);
+    pub const ENTRY_LIFETIME: Duration = Duration::from_millis(60_000);
 
     /// Create a cache.
     pub fn new() -> Self {
@@ -147,7 +147,7 @@ impl Cache {
         }
     }
 
-    pub(crate) fn lookup(&self, protocol_addr: &IpAddress, timestamp: Instant) -> Answer {
+    pub fn lookup(&self, protocol_addr: &IpAddress, timestamp: Instant) -> Answer {
         assert!(protocol_addr.is_unicast());
 
         if let Some(&Neighbor {
@@ -167,12 +167,27 @@ impl Cache {
         }
     }
 
-    pub(crate) fn limit_rate(&mut self, timestamp: Instant) {
+    pub fn limit_rate(&mut self, timestamp: Instant) {
         self.silent_until = timestamp + Self::SILENT_TIME;
     }
 
-    pub(crate) fn flush(&mut self) {
+    pub fn flush(&mut self) {
         self.storage.clear()
+    }
+
+    /// 获取ARP缓存条目的迭代器
+    pub fn iter(&self) -> impl Iterator<Item = (&IpAddress, &Neighbor)> {
+        self.storage.iter()
+    }
+
+    /// 获取ARP缓存中的条目数量
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    /// 检查ARP缓存是否为空
+    pub fn is_empty(&self) -> bool {
+        self.storage.is_empty()
     }
 }
 

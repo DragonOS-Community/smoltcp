@@ -558,6 +558,16 @@ impl<'a> Socket<'a> {
         }
     }
 
+    #[cfg(feature = "alloc")]
+    pub fn set_send_buffer_size(&mut self, size: usize) {
+        self.tx_buffer.resize(size, 0);
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn set_recv_buffer_size(&mut self, size: usize) {
+        self.rx_buffer.resize(size, 0);
+    }
+
     /// Enable or disable TCP Timestamp.
     pub fn set_tsval_generator(&mut self, generator: Option<TcpTimestampGenerator>) {
         self.tsval_generator = generator;
@@ -695,7 +705,11 @@ impl<'a> Socket<'a> {
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
 
         let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
-        let last_win_adjusted = last_ack + last_win - next_ack;
+        let window_edge = last_ack + last_win;
+        if next_ack > window_edge {
+            return Some(0);
+        }
+        let last_win_adjusted = window_edge - next_ack;
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }
@@ -2393,6 +2407,15 @@ impl<'a> Socket<'a> {
             | State::Closing
             | State::CloseWait
             | State::LastAck => {
+                // Ensure remote_last_seq is at least local_seq_no.
+                // This can happen if we receive an ACK for data we haven't sent yet
+                // (which is invalid but shouldn't crash us), or if the remote side
+                // has acknowledged data that we were about to retransmit.
+                if self.remote_last_seq < self.local_seq_no {
+                    self.remote_last_seq = self.local_seq_no;
+                    repr.seq_number = self.remote_last_seq;
+                }
+
                 // Extract as much data as the remote side can receive in this packet
                 // from the transmit buffer.
 
@@ -6820,6 +6843,16 @@ mod test {
         assert!(s.window_to_update());
     }
 
+    #[test]
+    fn test_last_scaled_window_returns_zero_on_invalid_last_window() {
+        let mut s = socket_established();
+        s.remote_last_ack = Some(s.remote_seq_no);
+        s.remote_last_win = 0;
+        assert_eq!(s.rx_buffer.enqueue_slice(&[0u8; 4]), 4);
+
+        assert_eq!(s.last_scaled_window(), Some(0));
+    }
+
     // =========================================================================================//
     // Tests for timeouts.
     // =========================================================================================//
@@ -7223,6 +7256,43 @@ mod test {
                 ..RECV_TEMPL
             })
         );
+    }
+
+    #[test]
+    fn test_dispatch_clamps_remote_last_seq_before_sending() {
+        let mut s = socket_established();
+        s.set_nagle_enabled(false);
+
+        let local_seq = s.local_seq_no;
+        s.remote_last_seq = local_seq - 5;
+
+        assert_eq!(s.send_slice(b"abc"), Ok(3));
+        recv!(s, time 0, Ok(TcpRepr {
+            control: TcpControl::Psh,
+            seq_number: local_seq,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abc"[..],
+            ..RECV_TEMPL
+        }), exact);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_set_buffer_size_updates_capacity() {
+        let mut s = socket_established();
+        s.set_send_buffer_size(128);
+        s.set_recv_buffer_size(256);
+        assert_eq!(s.tx_buffer.capacity(), 128);
+        assert_eq!(s.rx_buffer.capacity(), 256);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_set_send_buffer_size_does_not_shrink_below_length() {
+        let mut s = socket_established_with_buffer_sizes(16, 64);
+        assert_eq!(s.send_slice(b"abcdef"), Ok(6));
+        s.set_send_buffer_size(4);
+        assert_eq!(s.tx_buffer.capacity(), 16);
     }
 
     // =========================================================================================//

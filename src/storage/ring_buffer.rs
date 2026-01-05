@@ -2,6 +2,8 @@
 // these functions may have side effects, and it's implemented by [RFC 1940].
 // [RFC 1940]: https://github.com/rust-lang/rust/issues/43302
 
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
 use core::cmp;
 use managed::ManagedSlice;
 
@@ -49,6 +51,37 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     pub fn clear(&mut self) {
         self.read_at = 0;
         self.length = 0;
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn resize(&mut self, new_capacity: usize, default: T)
+    where
+        T: Clone,
+    {
+        if new_capacity < self.length {
+            return;
+        }
+
+        match &mut self.storage {
+            ManagedSlice::Owned(vec) => {
+                let old_capacity = vec.len();
+                if new_capacity == old_capacity {
+                    return;
+                }
+
+                let mut new_vec = Vec::with_capacity(new_capacity);
+                new_vec.resize(new_capacity, default);
+
+                for i in 0..self.length {
+                    let old_idx = (self.read_at + i) % old_capacity;
+                    new_vec[i] = vec[old_idx].clone();
+                }
+
+                *vec = new_vec;
+                self.read_at = 0;
+            }
+            _ => {}
+        }
     }
 
     /// Return the maximum number of elements in the ring buffer.
@@ -433,6 +466,52 @@ mod test {
         assert_eq!(ring.len(), 2);
         assert_eq!(ring.capacity(), 2);
         assert_eq!(ring.window(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_buffer_resize_preserves_order_and_resets_read_at() {
+        let mut ring = RingBuffer::new(vec![0u8; 4]);
+        assert_eq!(ring.enqueue_slice(b"abcd"), 4);
+
+        ring.dequeue_many(2).copy_from_slice(b"..");
+        assert_eq!(ring.enqueue_slice(b"ef"), 2);
+        assert_eq!(ring.len(), 4);
+
+        ring.resize(8, 0);
+        assert_eq!(ring.capacity(), 8);
+        assert_eq!(ring.read_at, 0);
+        assert_eq!(ring.len(), 4);
+
+        let mut data = vec![0u8; ring.len()];
+        assert_eq!(ring.read_allocated(0, &mut data[..]), 4);
+        assert_eq!(&data[..], b"cdef");
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_buffer_resize_does_not_shrink_below_length() {
+        let mut ring = RingBuffer::new(vec![0u8; 4]);
+        assert_eq!(ring.enqueue_slice(b"abc"), 3);
+
+        ring.resize(2, 0);
+        assert_eq!(ring.capacity(), 4);
+        assert_eq!(ring.len(), 3);
+
+        let mut data = vec![0u8; ring.len()];
+        assert_eq!(ring.read_allocated(0, &mut data[..]), 3);
+        assert_eq!(&data[..], b"abc");
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_buffer_resize_is_noop_for_borrowed_storage() {
+        let mut storage = [0u8; 4];
+        let mut ring = RingBuffer::new(&mut storage[..]);
+        assert_eq!(ring.capacity(), 4);
+
+        ring.resize(8, 0);
+        assert_eq!(ring.capacity(), 4);
     }
 
     #[test]

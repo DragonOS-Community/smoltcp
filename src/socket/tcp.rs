@@ -683,6 +683,50 @@ impl<'a> Socket<'a> {
         self.nagle
     }
 
+    pub fn remote_mss(&self) -> usize {
+        self.remote_mss
+    }
+
+    pub fn remote_win_len(&self) -> usize {
+        self.remote_win_len
+    }
+
+    pub fn remote_win_scale(&self) -> Option<u8> {
+        self.remote_win_scale
+    }
+
+    pub fn rtt(&self) -> u32 {
+        self.rtte.rtt
+    }
+
+    pub fn rtt_var(&self) -> u32 {
+        self.rtte.deviation
+    }
+
+    pub fn rto(&self) -> Duration {
+        self.rtte.retransmission_timeout()
+    }
+
+    pub fn retransmits(&self) -> u8 {
+        self.rtte.rto_count
+    }
+
+    pub fn cwnd(&self) -> usize {
+        self.congestion_controller.cwnd()
+    }
+
+    pub fn ssthresh(&self) -> usize {
+        self.congestion_controller.ssthresh()
+    }
+
+    pub fn local_seq_no(&self) -> TcpSeqNumber {
+        self.local_seq_no
+    }
+
+    pub fn remote_last_ack(&self) -> Option<TcpSeqNumber> {
+        self.remote_last_ack
+    }
+
     /// Return the current window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.

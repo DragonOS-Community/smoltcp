@@ -47,6 +47,14 @@ impl Controller for Reno {
         self.ssthresh = (self.cwnd >> 1).max(self.min_cwnd);
     }
 
+    fn cwnd(&self) -> usize {
+        self.cwnd
+    }
+
+    fn ssthresh(&self) -> usize {
+        self.ssthresh
+    }
+
     fn on_retransmit(&mut self, _now: Instant) {
         self.cwnd = (self.cwnd >> 1).max(self.min_cwnd);
     }

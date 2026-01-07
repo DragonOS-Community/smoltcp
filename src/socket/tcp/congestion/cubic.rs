@@ -38,6 +38,14 @@ impl Controller for Cubic {
         self.cwnd
     }
 
+    fn cwnd(&self) -> usize {
+        self.cwnd
+    }
+
+    fn ssthresh(&self) -> usize {
+        self.ssthresh
+    }
+
     fn on_retransmit(&mut self, now: Instant) {
         self.w_max = self.cwnd;
         self.ssthresh = self.cwnd >> 1;

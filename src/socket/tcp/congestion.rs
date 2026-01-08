@@ -30,6 +30,12 @@ pub(super) trait Controller {
 
     /// Set the maximum segment size.
     fn set_mss(&mut self, mss: usize) {}
+
+    /// Returns the current congestion window size.
+    fn cwnd(&self) -> usize;
+
+    /// Returns the current slow start threshold.
+    fn ssthresh(&self) -> usize;
 }
 
 #[derive(Debug)]
@@ -71,6 +77,16 @@ impl AnyController {
         }
 
         AnyController::None(no_control::NoControl)
+    }
+
+    #[inline]
+    pub fn cwnd(&self) -> usize {
+        self.inner().cwnd()
+    }
+
+    #[inline]
+    pub fn ssthresh(&self) -> usize {
+        self.inner().ssthresh()
     }
 
     #[inline]

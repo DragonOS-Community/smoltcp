@@ -8,4 +8,12 @@ impl Controller for NoControl {
     fn window(&self) -> usize {
         usize::MAX
     }
+
+    fn cwnd(&self) -> usize {
+        0
+    }
+
+    fn ssthresh(&self) -> usize {
+        usize::MAX
+    }
 }

@@ -875,6 +875,19 @@ impl<'a> Socket<'a> {
         self.state
     }
 
+    /// Returns the window scaling factor advertised to the remote.
+    /// This is the shift value we use when sending window sizes to the peer.
+    #[inline]
+    pub fn remote_win_shift(&self) -> u8 {
+        self.remote_win_shift
+    }
+
+    /// Returns whether the remote endpoint supports Selective ACK (SACK).
+    #[inline]
+    pub fn remote_has_sack(&self) -> bool {
+        self.remote_has_sack
+    }
+
     fn reset(&mut self) {
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;

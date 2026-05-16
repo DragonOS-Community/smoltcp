@@ -419,6 +419,12 @@ pub struct Socket<'a> {
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
     rx_fin_received: bool,
+    /// The local receive half has been shut down by the user.
+    ///
+    /// This models the BSD/Linux close(2) orphan case. Once the application has
+    /// closed the receive side, new data in FIN-WAIT states must reset the
+    /// connection instead of being queued indefinitely.
+    rx_shutdown: bool,
     tx_buffer: SocketBuffer<'a>,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
@@ -524,6 +530,7 @@ impl<'a> Socket<'a> {
             tx_buffer,
             rx_buffer,
             rx_fin_received: false,
+            rx_shutdown: false,
             timeout: None,
             keep_alive: None,
             hop_limit: None,
@@ -899,6 +906,7 @@ impl<'a> Socket<'a> {
         self.tx_buffer.clear();
         self.rx_buffer.clear();
         self.rx_fin_received = false;
+        self.rx_shutdown = false;
         self.listen_endpoint = IpListenEndpoint::default();
         self.tuple = None;
         self.local_seq_no = TcpSeqNumber::default();
@@ -1102,6 +1110,22 @@ impl<'a> Socket<'a> {
         self.set_state(State::Closed);
     }
 
+    /// Shut down the receive half of the connection.
+    ///
+    /// This mirrors the transport effect of Linux `sk_shutdown & RCV_SHUTDOWN`.
+    /// In FIN-WAIT states, any new data that advances the peer sequence space
+    /// actively resets the connection instead of being queued.
+    #[inline]
+    pub fn shutdown_recv(&mut self) {
+        self.rx_shutdown = true;
+    }
+
+    /// Return whether the receive half has been explicitly shut down.
+    #[inline]
+    pub fn recv_shutdown(&self) -> bool {
+        self.rx_shutdown
+    }
+
     /// Return whether the socket is passively listening for incoming connections.
     ///
     /// In terms of the TCP state machine, the socket must be in the `LISTEN` state.
@@ -1182,6 +1206,10 @@ impl<'a> Socket<'a> {
     /// `FIN-WAIT-1`, or `FIN-WAIT-2` state, or have data in the receive buffer instead.
     #[inline]
     pub fn may_recv(&self) -> bool {
+        if self.rx_shutdown && self.rx_buffer.is_empty() {
+            return false;
+        }
+
         match self.state {
             State::Established => true,
             // In FIN-WAIT-1/2, we have closed our transmit half of the connection but
@@ -1517,6 +1545,19 @@ impl<'a> Socket<'a> {
         Some(self.ack_reply(ip_repr, repr))
     }
 
+    #[inline]
+    fn should_reset_receive_shutdown_data(
+        &self,
+        segment_start: TcpSeqNumber,
+        segment_end: TcpSeqNumber,
+        window_start: TcpSeqNumber,
+    ) -> bool {
+        self.rx_shutdown
+            && matches!(self.state, State::FinWait1 | State::FinWait2)
+            && segment_start != segment_end
+            && segment_end > window_start
+    }
+
     pub fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
         if self.state == State::Closed {
             return false;
@@ -1670,6 +1711,15 @@ impl<'a> Socket<'a> {
         let window_end = self.remote_seq_no + self.rx_buffer.capacity();
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
+
+        if self.should_reset_receive_shutdown_data(segment_start, segment_end, window_start) {
+            net_debug!(
+                "received data after receive shutdown in {}, sending RST",
+                self.state
+            );
+            self.set_state(State::Closed);
+            return Some(Self::rst_reply(ip_repr, repr));
+        }
 
         let (payload, payload_offset) = match self.state {
             // In LISTEN and SYN-SENT states, we have not yet synchronized with the remote end.
@@ -4805,6 +4855,37 @@ mod test {
         s.close();
         assert_eq!(s.state, State::FinWait1);
         sanity!(s, socket_fin_wait_1());
+    }
+
+    #[test]
+    fn test_fin_wait_receive_shutdown_data_resets() {
+        let mut s = socket_fin_wait_1();
+        s.shutdown_recv();
+
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"x"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                src_port: LOCAL_PORT,
+                dst_port: REMOTE_PORT,
+                control: TcpControl::Rst,
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: None,
+                window_len: 0,
+                window_scale: None,
+                max_seg_size: None,
+                sack_permitted: false,
+                sack_ranges: [None, None, None],
+                timestamp: None,
+                payload: &[],
+            })
+        );
+        assert_eq!(s.state, State::Closed);
     }
 
     #[test]

@@ -426,12 +426,7 @@ impl<'a> Socket<'a> {
     /// Accepted packets are enqueued into the socket's receive buffer.
     #[cfg(feature = "proto-ipv4")]
     #[inline]
-    pub fn accepts_v4(
-        &self,
-        cx: &mut Context,
-        ip_repr: &Ipv4Repr,
-        icmp_repr: &Icmpv4Repr,
-    ) -> bool {
+    pub fn accepts_v4(&self, cx: &mut Context, ip_repr: &Ipv4Repr, icmp_repr: &Icmpv4Repr) -> bool {
         match (&self.endpoint, icmp_repr) {
             // If we are bound to ICMP errors associated to a UDP port, only
             // accept Destination Unreachable or Time Exceeded messages with
@@ -468,12 +463,7 @@ impl<'a> Socket<'a> {
     /// Accepted packets are enqueued into the socket's receive buffer.
     #[cfg(feature = "proto-ipv6")]
     #[inline]
-    pub fn accepts_v6(
-        &self,
-        cx: &mut Context,
-        ip_repr: &Ipv6Repr,
-        icmp_repr: &Icmpv6Repr,
-    ) -> bool {
+    pub fn accepts_v6(&self, cx: &mut Context, ip_repr: &Ipv6Repr, icmp_repr: &Icmpv6Repr) -> bool {
         match (&self.endpoint, icmp_repr) {
             // If we are bound to ICMP errors associated to a UDP port, only
             // accept Destination Unreachable or Time Exceeded messages with
@@ -507,12 +497,7 @@ impl<'a> Socket<'a> {
     }
 
     #[cfg(feature = "proto-ipv4")]
-    pub fn process_v4(
-        &mut self,
-        _cx: &mut Context,
-        ip_repr: &Ipv4Repr,
-        icmp_repr: &Icmpv4Repr,
-    ) {
+    pub fn process_v4(&mut self, _cx: &mut Context, ip_repr: &Ipv4Repr, icmp_repr: &Icmpv4Repr) {
         net_trace!("icmp: receiving {} octets", icmp_repr.buffer_len());
 
         match self
@@ -533,12 +518,7 @@ impl<'a> Socket<'a> {
     }
 
     #[cfg(feature = "proto-ipv6")]
-    pub fn process_v6(
-        &mut self,
-        _cx: &mut Context,
-        ip_repr: &Ipv6Repr,
-        icmp_repr: &Icmpv6Repr,
-    ) {
+    pub fn process_v6(&mut self, _cx: &mut Context, ip_repr: &Ipv6Repr, icmp_repr: &Icmpv6Repr) {
         net_trace!("icmp: receiving {} octets", icmp_repr.buffer_len());
 
         match self

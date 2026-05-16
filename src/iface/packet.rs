@@ -70,12 +70,7 @@ impl<'p> Packet<'p> {
         }
     }
 
-    pub fn emit_payload(
-        &self,
-        _ip_repr: &IpRepr,
-        payload: &mut [u8],
-        caps: &DeviceCapabilities,
-    ) {
+    pub fn emit_payload(&self, _ip_repr: &IpRepr, payload: &mut [u8], caps: &DeviceCapabilities) {
         match self.payload() {
             #[cfg(feature = "proto-ipv4")]
             IpPayload::Icmpv4(icmpv4_repr) => {

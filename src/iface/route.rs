@@ -21,12 +21,14 @@ impl core::fmt::Display for RouteTableFull {
 #[cfg(feature = "std")]
 impl std::error::Error for RouteTableFull {}
 
-/// A prefix of addresses that should be routed via a router
+/// A prefix of addresses that should be routed either via a router or directly on-link.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Route {
     pub cidr: IpCidr,
-    pub via_router: IpAddress,
+    /// `Some(router)` means route via a next-hop router. `None` means the
+    /// destination is on-link and should be resolved directly.
+    pub via_router: Option<IpAddress>,
     /// `None` means "forever".
     pub preferred_until: Option<Instant>,
     /// `None` means "forever".
@@ -45,7 +47,7 @@ impl Route {
     pub fn new_ipv4_gateway(gateway: Ipv4Address) -> Route {
         Route {
             cidr: IPV4_DEFAULT,
-            via_router: gateway.into(),
+            via_router: Some(gateway.into()),
             preferred_until: None,
             expires_at: None,
         }
@@ -56,7 +58,7 @@ impl Route {
     pub fn new_ipv6_gateway(gateway: Ipv6Address) -> Route {
         Route {
             cidr: IPV6_DEFAULT,
-            via_router: gateway.into(),
+            via_router: Some(gateway.into()),
             preferred_until: None,
             expires_at: None,
         }
@@ -162,7 +164,7 @@ impl Routes {
             })
             // pick the most specific one (highest prefix_len)
             .max_by_key(|route| route.cidr.prefix_len())
-            .map(|route| route.via_router)
+            .map(|route| route.via_router.unwrap_or(*addr))
     }
 }
 
@@ -232,7 +234,7 @@ mod test {
 
         let route = Route {
             cidr: cidr_1().into(),
-            via_router: ADDR_1A.into(),
+            via_router: Some(ADDR_1A.into()),
             preferred_until: None,
             expires_at: None,
         };
@@ -263,7 +265,7 @@ mod test {
 
         let route2 = Route {
             cidr: cidr_2().into(),
-            via_router: ADDR_2A.into(),
+            via_router: Some(ADDR_2A.into()),
             preferred_until: Some(Instant::from_millis(10)),
             expires_at: Some(Instant::from_millis(10)),
         };
@@ -311,6 +313,26 @@ mod test {
         assert_eq!(
             routes.lookup(&ADDR_2B.into(), Instant::from_millis(10)),
             Some(ADDR_2A.into())
+        );
+    }
+
+    #[test]
+    fn test_on_link_route_returns_destination() {
+        let mut routes = Routes::new();
+        routes.update(|storage| {
+            storage
+                .push(Route {
+                    cidr: cidr_1().into(),
+                    via_router: None,
+                    preferred_until: None,
+                    expires_at: None,
+                })
+                .unwrap();
+        });
+
+        assert_eq!(
+            routes.lookup(&ADDR_1B.into(), Instant::from_millis(0)),
+            Some(ADDR_1B.into())
         );
     }
 }

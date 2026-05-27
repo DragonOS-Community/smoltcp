@@ -73,7 +73,9 @@ fn any_ip(#[case] medium: Medium) {
                     Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0),
                     64,
                 )),
-                via_router: IpAddress::Ipv6(Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0001)),
+                via_router: Some(IpAddress::Ipv6(Ipv6Address::new(
+                    0xfdbe, 0, 0, 0, 0, 0, 0, 0x0001,
+                ))),
                 preferred_until: None,
                 expires_at: None,
             })

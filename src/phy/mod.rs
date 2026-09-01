@@ -400,6 +400,15 @@ pub trait TxToken {
         None
     }
 
+    /// Apply egress properties saved while an earlier fragment was emitted.
+    ///
+    /// The default implementation is a no-op. Integrations that attach an
+    /// opaque routing decision to [`TxEgressOverride`] can use this callback to
+    /// restore that decision on the transmit tokens for later fragments.
+    fn apply_egress_override(&mut self, egress: TxEgressOverride) {
+        let _ = egress;
+    }
+
     /// Consumes the token to send a single network packet.
     ///
     /// This method constructs a transmit buffer of size `len` and calls the passed
@@ -422,4 +431,6 @@ pub struct TxEgressOverride {
     pub medium: Medium,
     /// Maximum IP packet size accepted by the selected egress route.
     pub ip_mtu: usize,
+    /// Opaque integration-defined context preserved across IP fragments.
+    pub context: u64,
 }

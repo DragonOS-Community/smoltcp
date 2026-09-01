@@ -910,11 +910,13 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
 
     const ROUTED_IP_MTU: usize = 256;
     const META_ID: u32 = 17;
+    const ROUTE_CONTEXT: u64 = 0x1234_5678_9abc_def0;
 
     #[derive(Clone)]
     struct RoutedTxToken {
-        observed: Rc<RefCell<Vec<(usize, PacketMeta)>>>,
+        observed: Rc<RefCell<Vec<(usize, PacketMeta, Option<u64>)>>>,
         meta: PacketMeta,
+        context: Option<u64>,
     }
 
     impl TxToken for RoutedTxToken {
@@ -927,7 +929,12 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
             Some(crate::phy::TxEgressOverride {
                 medium: Medium::Ip,
                 ip_mtu: ROUTED_IP_MTU,
+                context: ROUTE_CONTEXT,
             })
+        }
+
+        fn apply_egress_override(&mut self, egress: crate::phy::TxEgressOverride) {
+            self.context = Some(egress.context);
         }
 
         fn consume<R, F>(self, len: usize, f: F) -> R
@@ -935,7 +942,9 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
             F: FnOnce(&mut [u8]) -> R,
         {
             assert!(len <= ROUTED_IP_MTU);
-            self.observed.borrow_mut().push((len, self.meta));
+            self.observed
+                .borrow_mut()
+                .push((len, self.meta, self.context));
             let mut buffer = vec![0; len];
             f(&mut buffer)
         }
@@ -968,6 +977,7 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
             RoutedTxToken {
                 observed: observed.clone(),
                 meta: PacketMeta::default(),
+                context: None,
             },
             meta,
             packet,
@@ -980,6 +990,7 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
             RoutedTxToken {
                 observed: observed.clone(),
                 meta: PacketMeta::default(),
+                context: None,
             },
             &mut iface.fragmenter,
         );
@@ -989,7 +1000,11 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
     assert!(observed.len() > 1);
     assert!(observed
         .iter()
-        .all(|(len, meta)| *len <= ROUTED_IP_MTU && meta.id == META_ID));
+        .all(|(len, meta, _)| *len <= ROUTED_IP_MTU && meta.id == META_ID));
+    assert_eq!(observed[0].2, None);
+    assert!(observed[1..]
+        .iter()
+        .all(|(_, _, context)| *context == Some(ROUTE_CONTEXT)));
 }
 
 #[rstest]

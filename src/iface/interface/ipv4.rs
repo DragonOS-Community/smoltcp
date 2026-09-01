@@ -411,8 +411,15 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "proto-ipv4-fragmentation")]
-    pub(super) fn dispatch_ipv4_frag<Tx: TxToken>(&mut self, tx_token: Tx, frag: &mut Fragmenter) {
+    pub(super) fn dispatch_ipv4_frag<Tx: TxToken>(
+        &mut self,
+        mut tx_token: Tx,
+        frag: &mut Fragmenter,
+    ) {
         let caps = self.caps.clone();
+        let tx_medium = tx_token
+            .medium_override(IpVersion::Ipv4)
+            .unwrap_or(caps.medium);
 
         let mtu_max = self.ip_mtu();
         let ip_len = (frag.packet_len - frag.sent_bytes + frag.ipv4.repr.buffer_len()).min(mtu_max);
@@ -424,7 +431,7 @@ impl InterfaceInner {
 
         let mut tx_len = ip_len;
         #[cfg(feature = "medium-ethernet")]
-        if matches!(caps.medium, Medium::Ethernet) {
+        if matches!(tx_medium, Medium::Ethernet) {
             tx_len += EthernetFrame::<&[u8]>::header_len();
         }
 
@@ -447,7 +454,7 @@ impl InterfaceInner {
 
         tx_token.consume(tx_len, |mut tx_buffer| {
             #[cfg(feature = "medium-ethernet")]
-            if matches!(self.caps.medium, Medium::Ethernet) {
+            if matches!(tx_medium, Medium::Ethernet) {
                 emit_ethernet(&IpRepr::Ipv4(frag.ipv4.repr), tx_buffer);
                 tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
             }

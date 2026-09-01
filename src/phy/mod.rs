@@ -384,6 +384,16 @@ pub trait RxToken {
 
 /// A token to transmit a single network packet.
 pub trait TxToken {
+    /// Override the medium used to serialize this packet.
+    ///
+    /// Most devices use the interface medium and return `None`. Stack
+    /// integrations that defer routing and link-layer resolution may request
+    /// an IP packet even when the interface itself uses Ethernet.
+    fn medium_override(&mut self, version: crate::wire::IpVersion) -> Option<Medium> {
+        let _ = version;
+        None
+    }
+
     /// Consumes the token to send a single network packet.
     ///
     /// This method constructs a transmit buffer of size `len` and calls the passed

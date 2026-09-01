@@ -384,17 +384,18 @@ pub trait RxToken {
 
 /// A token to transmit a single network packet.
 pub trait TxToken {
-    /// Override the medium used to serialize this packet.
+    /// Override the egress properties used to serialize this packet.
     ///
     /// Most devices use the interface medium and return `None`. Stack
     /// integrations that defer routing and link-layer resolution may request
-    /// an IP packet even when the interface itself uses Ethernet.
-    fn medium_override(
+    /// an IP packet and the route-selected IP MTU even when the interface
+    /// itself uses Ethernet.
+    fn egress_override(
         &mut self,
         version: crate::wire::IpVersion,
         destination: crate::wire::IpAddress,
         meta: PacketMeta,
-    ) -> Option<Medium> {
+    ) -> Option<TxEgressOverride> {
         let _ = (version, destination, meta);
         None
     }
@@ -412,4 +413,13 @@ pub trait TxToken {
     /// The Packet ID to be associated with the frame to be transmitted by this [`TxToken`].
     #[allow(unused_variables)]
     fn set_meta(&mut self, meta: PacketMeta) {}
+}
+
+/// Route-selected properties for a packet emitted through a transmit token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxEgressOverride {
+    /// Medium used to serialize the packet handed to the token.
+    pub medium: Medium,
+    /// Maximum IP packet size accepted by the selected egress route.
+    pub ip_mtu: usize,
 }

@@ -1153,9 +1153,9 @@ impl InterfaceInner {
     ) -> Result<(), DispatchError> {
         let mut ip_repr = packet.ip_repr();
         assert!(!ip_repr.dst_addr().is_unspecified());
-        let tx_medium = tx_token
-            .medium_override(ip_repr.version(), ip_repr.dst_addr(), meta)
-            .unwrap_or(self.caps.medium);
+        let egress = tx_token.egress_override(ip_repr.version(), ip_repr.dst_addr(), meta);
+        let tx_medium = egress.map_or(self.caps.medium, |egress| egress.medium);
+        let ip_mtu = egress.map_or(self.caps.ip_mtu(), |egress| egress.ip_mtu);
 
         // Dispatch IEEE802.15.4:
 
@@ -1230,13 +1230,17 @@ impl InterfaceInner {
             #[cfg(feature = "proto-ipv4")]
             IpRepr::Ipv4(repr) => {
                 // If we have an IPv4 packet, then we need to check if we need to fragment it.
-                if total_ip_len > self.caps.ip_mtu() {
+                if total_ip_len > ip_mtu {
                     #[cfg(feature = "proto-ipv4-fragmentation")]
                     {
                         net_debug!("start fragmentation");
 
                         let ip_header_len = repr.buffer_len();
-                        let first_frag_ip_len = self.caps.ip_mtu();
+                        if ip_mtu < ip_header_len {
+                            net_debug!("egress IP MTU is smaller than the IPv4 header; dropping");
+                            return Ok(());
+                        }
+                        let first_frag_ip_len = ip_mtu;
                         // Calculate how much we will send now (including the Ethernet header).
                         let tx_len = if matches!(tx_medium, Medium::Ethernet) {
                             self.caps.max_transmission_unit
@@ -1264,6 +1268,7 @@ impl InterfaceInner {
                         // Save the IP header for other fragments.
                         frag.ipv4.repr = *repr;
                         frag.ipv4.meta = meta;
+                        frag.ipv4.egress = egress;
 
                         // Save how much bytes we will send now.
                         frag.sent_bytes = first_frag_ip_len;

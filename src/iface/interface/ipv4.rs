@@ -417,16 +417,13 @@ impl InterfaceInner {
         frag: &mut Fragmenter,
     ) {
         let caps = self.caps.clone();
-        let tx_medium = tx_token
-            .medium_override(
-                IpVersion::Ipv4,
-                IpAddress::Ipv4(frag.ipv4.repr.dst_addr),
-                frag.ipv4.meta,
-            )
-            .unwrap_or(caps.medium);
+        let tx_medium = frag.ipv4.egress.map_or(caps.medium, |egress| egress.medium);
         tx_token.set_meta(frag.ipv4.meta);
 
-        let mtu_max = self.ip_mtu();
+        let mtu_max = frag
+            .ipv4
+            .egress
+            .map_or_else(|| self.ip_mtu(), |egress| egress.ip_mtu);
         let ip_len = (frag.packet_len - frag.sent_bytes + frag.ipv4.repr.buffer_len()).min(mtu_max);
         let payload_len = ip_len - frag.ipv4.repr.buffer_len();
 

@@ -16,6 +16,11 @@ type Buffer = alloc::vec::Vec<u8>;
 #[cfg(not(feature = "alloc"))]
 type Buffer = [u8; REASSEMBLY_BUFFER_SIZE];
 
+#[cfg(feature = "alloc")]
+type FragmentationBuffer = alloc::vec::Vec<u8>;
+#[cfg(not(feature = "alloc"))]
+type FragmentationBuffer = [u8; FRAGMENTATION_BUFFER_SIZE];
+
 /// Problem when assembling: something was out of bounds.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -276,7 +281,7 @@ impl Fragmenter {
 #[cfg(feature = "_proto-fragmentation")]
 pub struct Fragmenter {
     /// The buffer that holds the unfragmented 6LoWPAN packet.
-    pub buffer: [u8; FRAGMENTATION_BUFFER_SIZE],
+    pub buffer: FragmentationBuffer,
     /// The size of the packet without the IEEE802.15.4 header and the fragmentation headers.
     pub packet_len: usize,
     /// The amount of bytes that already have been transmitted.
@@ -326,6 +331,9 @@ pub struct SixlowpanFragmenter {
 impl Fragmenter {
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "alloc")]
+            buffer: alloc::vec::Vec::new(),
+            #[cfg(not(feature = "alloc"))]
             buffer: [0u8; FRAGMENTATION_BUFFER_SIZE],
             packet_len: 0,
             sent_bytes: 0,
@@ -371,6 +379,30 @@ impl Fragmenter {
         self.packet_len == 0
     }
 
+    /// Prepare storage for one complete packet before fragmentation starts.
+    /// Allocating integrations grow on demand; allocation-free integrations
+    /// retain their configured fixed-capacity behavior.
+    pub fn prepare_buffer(&mut self, len: usize) -> bool {
+        #[cfg(feature = "alloc")]
+        {
+            if self.buffer.len() < len {
+                if self
+                    .buffer
+                    .try_reserve_exact(len - self.buffer.len())
+                    .is_err()
+                {
+                    return false;
+                }
+                self.buffer.resize(len, 0);
+            }
+            true
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            self.buffer.len() >= len
+        }
+    }
+
     // Reset the buffer.
     pub fn reset(&mut self) {
         self.packet_len = 0;
@@ -386,6 +418,7 @@ impl Fragmenter {
                 hop_limit: 0,
             };
             self.ipv4.meta = crate::phy::PacketMeta::default();
+            self.ipv4.egress = None;
             #[cfg(feature = "medium-ethernet")]
             {
                 self.ipv4.dst_hardware_addr = EthernetAddress::default();

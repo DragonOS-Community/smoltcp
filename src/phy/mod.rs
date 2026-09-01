@@ -405,8 +405,11 @@ pub trait TxToken {
     /// The default implementation is a no-op. Integrations that attach an
     /// opaque routing decision to [`TxEgressOverride`] can use this callback to
     /// restore that decision on the transmit tokens for later fragments.
-    fn apply_egress_override(&mut self, egress: TxEgressOverride) {
+    /// Return `false` when the token cannot honor the saved properties. The
+    /// stack then aborts the remaining fragments without calling `consume`.
+    fn apply_egress_override(&mut self, egress: TxEgressOverride) -> bool {
         let _ = egress;
+        true
     }
 
     /// Consumes the token to send a single network packet.

@@ -328,7 +328,7 @@ impl InterfaceInner {
                 // the link local source and destination address...
 
                 let pkt = frag;
-                if pkt.buffer.len() < total_size {
+                if !pkt.prepare_buffer(total_size) {
                     net_debug!(
                         "dispatch_ieee802154: dropping, \
                         fragmentation buffer is too small, at least {} needed",

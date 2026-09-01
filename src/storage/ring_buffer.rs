@@ -62,25 +62,22 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
             return;
         }
 
-        match &mut self.storage {
-            ManagedSlice::Owned(vec) => {
-                let old_capacity = vec.len();
-                if new_capacity == old_capacity {
-                    return;
-                }
-
-                let mut new_vec = Vec::with_capacity(new_capacity);
-                new_vec.resize(new_capacity, default);
-
-                for i in 0..self.length {
-                    let old_idx = (self.read_at + i) % old_capacity;
-                    new_vec[i] = vec[old_idx].clone();
-                }
-
-                *vec = new_vec;
-                self.read_at = 0;
+        if let ManagedSlice::Owned(vec) = &mut self.storage {
+            let old_capacity = vec.len();
+            if new_capacity == old_capacity {
+                return;
             }
-            _ => {}
+
+            let mut new_vec = Vec::with_capacity(new_capacity);
+            new_vec.resize(new_capacity, default);
+
+            for (i, slot) in new_vec.iter_mut().take(self.length).enumerate() {
+                let old_idx = (self.read_at + i) % old_capacity;
+                *slot = vec[old_idx].clone();
+            }
+
+            *vec = new_vec;
+            self.read_at = 0;
         }
     }
 

@@ -1,6 +1,69 @@
 use super::*;
 
 #[rstest]
+#[case(Medium::Ip)]
+#[cfg(feature = "medium-ip")]
+#[case(Medium::Ethernet)]
+#[cfg(feature = "medium-ethernet")]
+fn test_route_uses_explicit_longest_prefix_and_preserves_broadcast(#[case] medium: Medium) {
+    let (mut iface, _, _) = setup(medium);
+    iface.set_route_table_includes_connected_prefixes(true);
+    let gateway = IpAddress::v4(192, 168, 1, 2);
+
+    iface.routes_mut().update(|routes| {
+        let direct = crate::iface::Route {
+            cidr: IpCidr::new(IpAddress::v4(192, 168, 1, 0), 24),
+            via_router: None,
+            preferred_until: None,
+            expires_at: None,
+        };
+        let more_specific = crate::iface::Route {
+            cidr: IpCidr::new(IpAddress::v4(192, 168, 1, 128), 25),
+            via_router: Some(gateway),
+            preferred_until: None,
+            expires_at: None,
+        };
+        #[cfg(feature = "alloc")]
+        {
+            routes.push(direct);
+            routes.push(more_specific);
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            routes.push(direct).unwrap();
+            routes.push(more_specific).unwrap();
+        }
+    });
+
+    assert_eq!(
+        iface
+            .inner
+            .route(&IpAddress::v4(192, 168, 1, 42), Instant::ZERO),
+        Some(IpAddress::v4(192, 168, 1, 42))
+    );
+    assert_eq!(
+        iface
+            .inner
+            .route(&IpAddress::v4(192, 168, 1, 200), Instant::ZERO),
+        Some(gateway)
+    );
+    assert_eq!(
+        iface
+            .inner
+            .route(&IpAddress::v4(192, 168, 1, 255), Instant::ZERO),
+        Some(IpAddress::v4(192, 168, 1, 255))
+    );
+
+    iface.routes_mut().update(|routes| routes.clear());
+    assert_eq!(
+        iface
+            .inner
+            .route(&IpAddress::v4(192, 168, 1, 42), Instant::ZERO),
+        None
+    );
+}
+
+#[rstest]
 #[case(Medium::Ethernet)]
 #[cfg(feature = "medium-ethernet")]
 fn test_any_ip_accept_arp(#[case] medium: Medium) {

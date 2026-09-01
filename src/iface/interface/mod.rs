@@ -142,6 +142,8 @@ pub struct InterfaceInner {
     tag: u16,
     ip_addrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
     any_ip: bool,
+    /// Whether connected prefixes are represented explicitly in `routes`.
+    route_table_includes_connected_prefixes: bool,
     routes: Routes,
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
@@ -247,6 +249,7 @@ impl Interface {
                 hardware_addr: config.hardware_addr,
                 ip_addrs: Vec::new(),
                 any_ip: false,
+                route_table_includes_connected_prefixes: false,
                 routes: Routes::new(),
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
@@ -380,6 +383,16 @@ impl Interface {
 
     pub fn routes_mut(&mut self) -> &mut Routes {
         &mut self.inner.routes
+    }
+
+    /// Select whether the route table includes connected prefixes.
+    ///
+    /// The default keeps smoltcp's traditional behavior where configured
+    /// addresses implicitly make their subnet on-link. Set this to `true`
+    /// when an external control plane installs connected routes explicitly;
+    /// route removal will then make that subnet unreachable as expected.
+    pub fn set_route_table_includes_connected_prefixes(&mut self, enabled: bool) {
+        self.inner.route_table_includes_connected_prefixes = enabled;
     }
 
     /// Enable or disable the AnyIP capability.
@@ -943,15 +956,17 @@ impl InterfaceInner {
     }
 
     pub fn route(&self, addr: &IpAddress, timestamp: Instant) -> Option<IpAddress> {
-        // Send directly.
-        // note: no need to use `self.is_broadcast()` to check for subnet-local broadcast addrs
-        //       here because `in_same_network` will already return true.
-        if self.in_same_network(addr) || addr.is_broadcast() {
+        // Broadcast traffic is always sent directly. Unicast traffic, including
+        // destinations covered by an interface address, follows the explicit
+        // route table so that a more-specific gateway route can win.
+        if self.is_broadcast(addr) {
             return Some(*addr);
         }
 
-        // Route via a router.
-        self.routes.lookup(addr, timestamp)
+        self.routes.lookup(addr, timestamp).or_else(|| {
+            (!self.route_table_includes_connected_prefixes && self.in_same_network(addr))
+                .then_some(*addr)
+        })
     }
 
     fn has_neighbor(&self, addr: &IpAddress) -> bool {

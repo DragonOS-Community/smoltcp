@@ -33,7 +33,9 @@ heapless = "0.8"
 env_logger = "0.10"
 getopts = "0.2"
 rand = "0.8"
-url = "2.0"
+# url 2.5 pulls an ICU dependency graph that now requires Edition 2024,
+# which is incompatible with this crate's declared Rust 1.80 MSRV.
+url = "=2.4.1"
 rstest = "0.17"
 
 [features]

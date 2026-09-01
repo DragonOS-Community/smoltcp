@@ -1153,11 +1153,14 @@ impl InterfaceInner {
     ) -> Result<(), DispatchError> {
         let mut ip_repr = packet.ip_repr();
         assert!(!ip_repr.dst_addr().is_unspecified());
+        let tx_medium = tx_token
+            .medium_override(ip_repr.version())
+            .unwrap_or(self.caps.medium);
 
         // Dispatch IEEE802.15.4:
 
         #[cfg(feature = "medium-ieee802154")]
-        if matches!(self.caps.medium, Medium::Ieee802154) {
+        if matches!(tx_medium, Medium::Ieee802154) {
             let (addr, tx_token) =
                 self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)?;
             let addr = addr.ieee802154_or_panic();
@@ -1178,13 +1181,13 @@ impl InterfaceInner {
 
         // Add the size of the Ethernet header if the medium is Ethernet.
         #[cfg(feature = "medium-ethernet")]
-        if matches!(self.caps.medium, Medium::Ethernet) {
+        if matches!(tx_medium, Medium::Ethernet) {
             total_len = EthernetFrame::<&[u8]>::buffer_len(total_len);
         }
 
         // If the medium is Ethernet, then we need to retrieve the destination hardware address.
         #[cfg(feature = "medium-ethernet")]
-        let (dst_hardware_addr, mut tx_token) = match self.caps.medium {
+        let (dst_hardware_addr, mut tx_token) = match tx_medium {
             Medium::Ethernet => {
                 match self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)? {
                     (HardwareAddress::Ethernet(addr), tx_token) => (addr, tx_token),
@@ -1232,11 +1235,14 @@ impl InterfaceInner {
                     {
                         net_debug!("start fragmentation");
 
-                        // Calculate how much we will send now (including the Ethernet header).
-                        let tx_len = self.caps.max_transmission_unit;
-
                         let ip_header_len = repr.buffer_len();
                         let first_frag_ip_len = self.caps.ip_mtu();
+                        // Calculate how much we will send now (including the Ethernet header).
+                        let tx_len = if matches!(tx_medium, Medium::Ethernet) {
+                            self.caps.max_transmission_unit
+                        } else {
+                            first_frag_ip_len
+                        };
 
                         if frag.buffer.len() < total_ip_len {
                             net_debug!(
@@ -1281,7 +1287,7 @@ impl InterfaceInner {
                         // Transmit the first packet.
                         tx_token.consume(tx_len, |mut tx_buffer| {
                             #[cfg(feature = "medium-ethernet")]
-                            if matches!(self.caps.medium, Medium::Ethernet) {
+                            if matches!(tx_medium, Medium::Ethernet) {
                                 emit_ethernet(&ip_repr, tx_buffer)?;
                                 tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
                             }
@@ -1308,7 +1314,7 @@ impl InterfaceInner {
                     // No fragmentation is required.
                     tx_token.consume(total_len, |mut tx_buffer| {
                         #[cfg(feature = "medium-ethernet")]
-                        if matches!(self.caps.medium, Medium::Ethernet) {
+                        if matches!(tx_medium, Medium::Ethernet) {
                             emit_ethernet(&ip_repr, tx_buffer)?;
                             tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
                         }
@@ -1322,7 +1328,7 @@ impl InterfaceInner {
             #[cfg(feature = "proto-ipv6")]
             IpRepr::Ipv6(_) => tx_token.consume(total_len, |mut tx_buffer| {
                 #[cfg(feature = "medium-ethernet")]
-                if matches!(self.caps.medium, Medium::Ethernet) {
+                if matches!(tx_medium, Medium::Ethernet) {
                     emit_ethernet(&ip_repr, tx_buffer)?;
                     tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
                 }

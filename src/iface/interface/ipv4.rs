@@ -418,6 +418,9 @@ impl InterfaceInner {
     ) {
         let caps = self.caps.clone();
         let tx_medium = frag.ipv4.egress.map_or(caps.medium, |egress| egress.medium);
+        if let Some(egress) = frag.ipv4.egress {
+            tx_token.apply_egress_override(egress);
+        }
         tx_token.set_meta(frag.ipv4.meta);
 
         let mtu_max = frag

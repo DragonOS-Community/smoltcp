@@ -11,22 +11,28 @@ fn test_route_uses_explicit_longest_prefix_and_preserves_broadcast(#[case] mediu
     let gateway = IpAddress::v4(192, 168, 1, 2);
 
     iface.routes_mut().update(|routes| {
-        routes
-            .push(crate::iface::Route {
-                cidr: IpCidr::new(IpAddress::v4(192, 168, 1, 0), 24),
-                via_router: None,
-                preferred_until: None,
-                expires_at: None,
-            })
-            .unwrap();
-        routes
-            .push(crate::iface::Route {
-                cidr: IpCidr::new(IpAddress::v4(192, 168, 1, 128), 25),
-                via_router: Some(gateway),
-                preferred_until: None,
-                expires_at: None,
-            })
-            .unwrap();
+        let direct = crate::iface::Route {
+            cidr: IpCidr::new(IpAddress::v4(192, 168, 1, 0), 24),
+            via_router: None,
+            preferred_until: None,
+            expires_at: None,
+        };
+        let more_specific = crate::iface::Route {
+            cidr: IpCidr::new(IpAddress::v4(192, 168, 1, 128), 25),
+            via_router: Some(gateway),
+            preferred_until: None,
+            expires_at: None,
+        };
+        #[cfg(feature = "alloc")]
+        {
+            routes.push(direct);
+            routes.push(more_specific);
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            routes.push(direct).unwrap();
+            routes.push(more_specific).unwrap();
+        }
     });
 
     assert_eq!(

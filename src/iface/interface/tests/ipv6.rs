@@ -67,19 +67,21 @@ fn any_ip(#[case] medium: Medium) {
 
     // Add a route to the interface, otherwise, we don't know if the packet is routed localy.
     iface.routes_mut().update(|routes| {
-        routes
-            .push(crate::iface::Route {
-                cidr: IpCidr::Ipv6(Ipv6Cidr::new(
-                    Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0),
-                    64,
-                )),
-                via_router: Some(IpAddress::Ipv6(Ipv6Address::new(
-                    0xfdbe, 0, 0, 0, 0, 0, 0, 0x0001,
-                ))),
-                preferred_until: None,
-                expires_at: None,
-            })
-            .unwrap();
+        let route = crate::iface::Route {
+            cidr: IpCidr::Ipv6(Ipv6Cidr::new(
+                Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0),
+                64,
+            )),
+            via_router: Some(IpAddress::Ipv6(Ipv6Address::new(
+                0xfdbe, 0, 0, 0, 0, 0, 0, 0x0001,
+            ))),
+            preferred_until: None,
+            expires_at: None,
+        };
+        #[cfg(feature = "alloc")]
+        routes.push(route);
+        #[cfg(not(feature = "alloc"))]
+        routes.push(route).unwrap();
     });
 
     assert_eq!(

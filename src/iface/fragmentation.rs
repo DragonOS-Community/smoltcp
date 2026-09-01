@@ -294,6 +294,8 @@ pub struct Ipv4Fragmenter {
     pub repr: Ipv4Repr,
     /// Packet metadata applied to every fragment.
     pub meta: crate::phy::PacketMeta,
+    /// Route-selected serialization properties shared by every fragment.
+    pub egress: Option<crate::phy::TxEgressOverride>,
     /// The destination hardware address.
     #[cfg(feature = "medium-ethernet")]
     pub dst_hardware_addr: EthernetAddress,
@@ -338,6 +340,7 @@ impl Fragmenter {
                     hop_limit: 0,
                 },
                 meta: crate::phy::PacketMeta::default(),
+                egress: None,
                 #[cfg(feature = "medium-ethernet")]
                 dst_hardware_addr: EthernetAddress::default(),
                 frag_offset: 0,

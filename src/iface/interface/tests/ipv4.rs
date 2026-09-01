@@ -898,6 +898,100 @@ fn test_packet_len(#[case] medium: Medium) {
     }
 }
 
+#[test]
+#[cfg(all(
+    feature = "proto-ipv4-fragmentation",
+    feature = "medium-ethernet",
+    feature = "medium-ip"
+))]
+fn routed_egress_override_controls_fragment_mtu_and_metadata() {
+    use core::cell::RefCell;
+    use std::rc::Rc;
+
+    const ROUTED_IP_MTU: usize = 256;
+    const META_ID: u32 = 17;
+
+    #[derive(Clone)]
+    struct RoutedTxToken {
+        observed: Rc<RefCell<Vec<(usize, PacketMeta)>>>,
+        meta: PacketMeta,
+    }
+
+    impl TxToken for RoutedTxToken {
+        fn egress_override(
+            &mut self,
+            _version: IpVersion,
+            _destination: IpAddress,
+            _meta: PacketMeta,
+        ) -> Option<crate::phy::TxEgressOverride> {
+            Some(crate::phy::TxEgressOverride {
+                medium: Medium::Ip,
+                ip_mtu: ROUTED_IP_MTU,
+            })
+        }
+
+        fn consume<R, F>(self, len: usize, f: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            assert!(len <= ROUTED_IP_MTU);
+            self.observed.borrow_mut().push((len, self.meta));
+            let mut buffer = vec![0; len];
+            f(&mut buffer)
+        }
+
+        fn set_meta(&mut self, meta: PacketMeta) {
+            self.meta = meta;
+        }
+    }
+
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let meta = PacketMeta { id: META_ID };
+    let ip_repr = Ipv4Repr {
+        src_addr: Ipv4Address::new(192, 0, 2, 1),
+        dst_addr: Ipv4Address::new(198, 51, 100, 1),
+        next_header: IpProtocol::Udp,
+        payload_len: 600,
+        hop_limit: 64,
+    };
+    let udp_repr = UdpRepr {
+        src_port: 12345,
+        dst_port: 54321,
+    };
+    let payload = vec![0xa5; ip_repr.payload_len - udp_repr.header_len()];
+    let packet = Packet::new_ipv4(ip_repr, IpPayload::Udp(udp_repr, &payload));
+
+    iface
+        .inner
+        .dispatch_ip(
+            RoutedTxToken {
+                observed: observed.clone(),
+                meta: PacketMeta::default(),
+            },
+            meta,
+            packet,
+            &mut iface.fragmenter,
+        )
+        .unwrap();
+
+    while iface.fragmenter.sent_bytes < iface.fragmenter.packet_len {
+        iface.inner.dispatch_ipv4_frag(
+            RoutedTxToken {
+                observed: observed.clone(),
+                meta: PacketMeta::default(),
+            },
+            &mut iface.fragmenter,
+        );
+    }
+
+    let observed = observed.borrow();
+    assert!(observed.len() > 1);
+    assert!(observed
+        .iter()
+        .all(|(len, meta)| *len <= ROUTED_IP_MTU && meta.id == META_ID));
+}
+
 #[rstest]
 #[case(Medium::Ip)]
 #[cfg(all(feature = "socket-raw", feature = "medium-ip"))]

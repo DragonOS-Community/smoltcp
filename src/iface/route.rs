@@ -1,5 +1,9 @@
-use heapless::Vec;
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec as AllocVec;
+#[cfg(not(feature = "alloc"))]
+use heapless::Vec as HeaplessVec;
 
+#[cfg(not(feature = "alloc"))]
 use crate::config::IFACE_MAX_ROUTE_COUNT;
 use crate::time::Instant;
 use crate::wire::{IpAddress, IpCidr};
@@ -11,6 +15,11 @@ use crate::wire::{Ipv6Address, Ipv6Cidr};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RouteTableFull;
+
+#[cfg(feature = "alloc")]
+pub type RouteStorage = AllocVec<Route>;
+#[cfg(not(feature = "alloc"))]
+pub type RouteStorage = HeaplessVec<Route, IFACE_MAX_ROUTE_COUNT>;
 
 impl core::fmt::Display for RouteTableFull {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -68,20 +77,31 @@ impl Route {
 /// A routing table.
 #[derive(Debug)]
 pub struct Routes {
-    storage: Vec<Route, IFACE_MAX_ROUTE_COUNT>,
+    storage: RouteStorage,
 }
 
 impl Routes {
     /// Creates a new empty routing table.
     pub fn new() -> Self {
         Self {
-            storage: Vec::new(),
+            storage: RouteStorage::new(),
         }
     }
 
     /// Update the routes of this node.
-    pub fn update<F: FnOnce(&mut Vec<Route, IFACE_MAX_ROUTE_COUNT>)>(&mut self, f: F) {
+    pub fn update<F: FnOnce(&mut RouteStorage)>(&mut self, f: F) {
         f(&mut self.storage);
+    }
+
+    #[cfg(feature = "alloc")]
+    fn push(&mut self, route: Route) -> Result<(), RouteTableFull> {
+        self.storage.push(route);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "alloc"))]
+    fn push(&mut self, route: Route) -> Result<(), RouteTableFull> {
+        self.storage.push(route).map_err(|_| RouteTableFull)
     }
 
     /// Add a default ipv4 gateway (ie. "ip route add 0.0.0.0/0 via `gateway`").
@@ -93,9 +113,7 @@ impl Routes {
         gateway: Ipv4Address,
     ) -> Result<Option<Route>, RouteTableFull> {
         let old = self.remove_default_ipv4_route();
-        self.storage
-            .push(Route::new_ipv4_gateway(gateway))
-            .map_err(|_| RouteTableFull)?;
+        self.push(Route::new_ipv4_gateway(gateway))?;
         Ok(old)
     }
 
@@ -108,9 +126,7 @@ impl Routes {
         gateway: Ipv6Address,
     ) -> Result<Option<Route>, RouteTableFull> {
         let old = self.remove_default_ipv6_route();
-        self.storage
-            .push(Route::new_ipv6_gateway(gateway))
-            .map_err(|_| RouteTableFull)?;
+        self.push(Route::new_ipv6_gateway(gateway))?;
         Ok(old)
     }
 
@@ -171,6 +187,13 @@ impl Routes {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn push_route(storage: &mut RouteStorage, route: Route) {
+        #[cfg(feature = "alloc")]
+        storage.push(route);
+        #[cfg(not(feature = "alloc"))]
+        storage.push(route).unwrap();
+    }
     #[cfg(feature = "proto-ipv6")]
     mod mock {
         use super::super::*;
@@ -239,7 +262,7 @@ mod test {
             expires_at: None,
         };
         routes.update(|storage| {
-            storage.push(route).unwrap();
+            push_route(storage, route);
         });
 
         assert_eq!(
@@ -270,7 +293,7 @@ mod test {
             expires_at: Some(Instant::from_millis(10)),
         };
         routes.update(|storage| {
-            storage.push(route2).unwrap();
+            push_route(storage, route2);
         });
 
         assert_eq!(
@@ -320,19 +343,44 @@ mod test {
     fn test_on_link_route_returns_destination() {
         let mut routes = Routes::new();
         routes.update(|storage| {
-            storage
-                .push(Route {
+            push_route(
+                storage,
+                Route {
                     cidr: cidr_1().into(),
                     via_router: None,
                     preferred_until: None,
                     expires_at: None,
-                })
-                .unwrap();
+                },
+            );
         });
 
         assert_eq!(
             routes.lookup(&ADDR_1B.into(), Instant::from_millis(0)),
             Some(ADDR_1B.into())
+        );
+    }
+
+    #[cfg(all(feature = "alloc", feature = "proto-ipv4"))]
+    #[test]
+    fn alloc_route_storage_is_not_limited_by_iface_max_route_count() {
+        let mut routes = Routes::new();
+        routes.update(|storage| {
+            for third_octet in 0..=crate::config::IFACE_MAX_ROUTE_COUNT {
+                storage.push(Route {
+                    cidr: Ipv4Cidr::new(Ipv4Address::new(198, 18, third_octet as u8, 0), 24).into(),
+                    via_router: None,
+                    preferred_until: None,
+                    expires_at: None,
+                });
+            }
+        });
+
+        assert_eq!(
+            routes.lookup(
+                &Ipv4Address::new(198, 18, crate::config::IFACE_MAX_ROUTE_COUNT as u8, 1).into(),
+                Instant::from_millis(0)
+            ),
+            Some(Ipv4Address::new(198, 18, crate::config::IFACE_MAX_ROUTE_COUNT as u8, 1).into())
         );
     }
 }

@@ -1154,7 +1154,7 @@ impl InterfaceInner {
         let mut ip_repr = packet.ip_repr();
         assert!(!ip_repr.dst_addr().is_unspecified());
         let tx_medium = tx_token
-            .medium_override(ip_repr.version())
+            .medium_override(ip_repr.version(), ip_repr.dst_addr(), meta)
             .unwrap_or(self.caps.medium);
 
         // Dispatch IEEE802.15.4:
@@ -1263,6 +1263,7 @@ impl InterfaceInner {
 
                         // Save the IP header for other fragments.
                         frag.ipv4.repr = *repr;
+                        frag.ipv4.meta = meta;
 
                         // Save how much bytes we will send now.
                         frag.sent_bytes = first_frag_ip_len;
@@ -1285,6 +1286,7 @@ impl InterfaceInner {
                         }
 
                         // Transmit the first packet.
+                        tx_token.set_meta(meta);
                         tx_token.consume(tx_len, |mut tx_buffer| {
                             #[cfg(feature = "medium-ethernet")]
                             if matches!(tx_medium, Medium::Ethernet) {

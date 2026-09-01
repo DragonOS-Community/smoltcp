@@ -908,13 +908,13 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
     use core::cell::RefCell;
     use std::rc::Rc;
 
-    const ROUTED_IP_MTU: usize = 256;
+    const ROUTED_IP_MTU: usize = 577;
     const META_ID: u32 = 17;
     const ROUTE_CONTEXT: u64 = 0x1234_5678_9abc_def0;
 
     #[derive(Clone)]
     struct RoutedTxToken {
-        observed: Rc<RefCell<Vec<(usize, PacketMeta, Option<u64>)>>>,
+        observed: Rc<RefCell<Vec<(usize, PacketMeta, Option<u64>, u16, bool, usize)>>>,
         meta: PacketMeta,
         context: Option<u64>,
     }
@@ -933,8 +933,9 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
             })
         }
 
-        fn apply_egress_override(&mut self, egress: crate::phy::TxEgressOverride) {
+        fn apply_egress_override(&mut self, egress: crate::phy::TxEgressOverride) -> bool {
             self.context = Some(egress.context);
+            true
         }
 
         fn consume<R, F>(self, len: usize, f: F) -> R
@@ -942,11 +943,18 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
             F: FnOnce(&mut [u8]) -> R,
         {
             assert!(len <= ROUTED_IP_MTU);
-            self.observed
-                .borrow_mut()
-                .push((len, self.meta, self.context));
             let mut buffer = vec![0; len];
-            f(&mut buffer)
+            let result = f(&mut buffer);
+            let packet = Ipv4Packet::new_checked(&buffer).unwrap();
+            self.observed.borrow_mut().push((
+                len,
+                self.meta,
+                self.context,
+                packet.frag_offset(),
+                packet.more_frags(),
+                packet.header_len() as usize,
+            ));
+            result
         }
 
         fn set_meta(&mut self, meta: PacketMeta) {
@@ -961,7 +969,7 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
         src_addr: Ipv4Address::new(192, 0, 2, 1),
         dst_addr: Ipv4Address::new(198, 51, 100, 1),
         next_header: IpProtocol::Udp,
-        payload_len: 600,
+        payload_len: 2000,
         hop_limit: 64,
     };
     let udp_repr = UdpRepr {
@@ -1000,11 +1008,20 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
     assert!(observed.len() > 1);
     assert!(observed
         .iter()
-        .all(|(len, meta, _)| *len <= ROUTED_IP_MTU && meta.id == META_ID));
+        .all(|(len, meta, _, _, _, _)| *len <= ROUTED_IP_MTU && meta.id == META_ID));
     assert_eq!(observed[0].2, None);
     assert!(observed[1..]
         .iter()
-        .all(|(_, _, context)| *context == Some(ROUTE_CONTEXT)));
+        .all(|(_, _, context, _, _, _)| *context == Some(ROUTE_CONTEXT)));
+    let mut expected_offset = 0;
+    for (len, _, _, offset, more_fragments, header_len) in observed.iter() {
+        assert_eq!(*offset as usize, expected_offset);
+        let payload_len = len - header_len;
+        if *more_fragments {
+            assert_eq!(payload_len % 8, 0);
+        }
+        expected_offset += payload_len;
+    }
 }
 
 #[rstest]

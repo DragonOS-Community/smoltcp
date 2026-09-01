@@ -419,7 +419,10 @@ impl InterfaceInner {
         let caps = self.caps.clone();
         let tx_medium = frag.ipv4.egress.map_or(caps.medium, |egress| egress.medium);
         if let Some(egress) = frag.ipv4.egress {
-            tx_token.apply_egress_override(egress);
+            if !tx_token.apply_egress_override(egress) {
+                frag.sent_bytes = frag.packet_len;
+                return;
+            }
         }
         tx_token.set_meta(frag.ipv4.meta);
 
@@ -427,10 +430,25 @@ impl InterfaceInner {
             .ipv4
             .egress
             .map_or_else(|| self.ip_mtu(), |egress| egress.ip_mtu);
-        let ip_len = (frag.packet_len - frag.sent_bytes + frag.ipv4.repr.buffer_len()).min(mtu_max);
-        let payload_len = ip_len - frag.ipv4.repr.buffer_len();
+        let header_len = frag.ipv4.repr.buffer_len();
+        if mtu_max <= header_len {
+            frag.sent_bytes = frag.packet_len;
+            return;
+        }
+        let remaining_payload = frag.packet_len - frag.sent_bytes;
+        let max_payload_len = mtu_max - header_len;
+        let payload_len = if remaining_payload > max_payload_len {
+            max_payload_len & !7
+        } else {
+            remaining_payload
+        };
+        if payload_len == 0 {
+            frag.sent_bytes = frag.packet_len;
+            return;
+        }
+        let ip_len = header_len + payload_len;
 
-        let more_frags = (frag.packet_len - frag.sent_bytes) != payload_len;
+        let more_frags = remaining_payload != payload_len;
         frag.ipv4.repr.payload_len = payload_len;
         frag.sent_bytes += payload_len;
 

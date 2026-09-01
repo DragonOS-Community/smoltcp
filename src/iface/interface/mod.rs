@@ -413,6 +413,21 @@ impl Interface {
         self.inner.any_ip
     }
 
+    /// Return whether IPv4 fragmentation still needs transmit tokens carrying
+    /// an integration-provided egress override.
+    pub fn has_pending_egress_override(&self) -> bool {
+        #[cfg(feature = "proto-ipv4-fragmentation")]
+        {
+            !self.fragmenter.is_empty()
+                && !self.fragmenter.finished()
+                && self.fragmenter.ipv4.egress.is_some()
+        }
+        #[cfg(not(feature = "proto-ipv4-fragmentation"))]
+        {
+            false
+        }
+    }
+
     /// Get the packet reassembly timeout.
     #[cfg(feature = "_proto-fragmentation")]
     pub fn reassembly_timeout(&self) -> Duration {
@@ -1240,15 +1255,21 @@ impl InterfaceInner {
                             net_debug!("egress IP MTU is smaller than the IPv4 header; dropping");
                             return Ok(());
                         }
-                        let first_frag_ip_len = ip_mtu;
+                        let max_payload_len = ip_mtu - ip_header_len;
+                        let first_payload_len = max_payload_len & !7;
+                        if first_payload_len == 0 {
+                            net_debug!("egress IP MTU cannot hold an aligned IPv4 fragment");
+                            return Ok(());
+                        }
+                        let first_frag_ip_len = ip_header_len + first_payload_len;
                         // Calculate how much we will send now (including the Ethernet header).
                         let tx_len = if matches!(tx_medium, Medium::Ethernet) {
-                            self.caps.max_transmission_unit
+                            first_frag_ip_len + EthernetFrame::<&[u8]>::header_len()
                         } else {
                             first_frag_ip_len
                         };
 
-                        if frag.buffer.len() < total_ip_len {
+                        if !frag.prepare_buffer(total_ip_len) {
                             net_debug!(
                                 "Fragmentation buffer is too small, at least {} needed. Dropping",
                                 total_ip_len

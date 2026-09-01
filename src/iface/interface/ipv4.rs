@@ -418,8 +418,13 @@ impl InterfaceInner {
     ) {
         let caps = self.caps.clone();
         let tx_medium = tx_token
-            .medium_override(IpVersion::Ipv4)
+            .medium_override(
+                IpVersion::Ipv4,
+                IpAddress::Ipv4(frag.ipv4.repr.dst_addr),
+                frag.ipv4.meta,
+            )
             .unwrap_or(caps.medium);
+        tx_token.set_meta(frag.ipv4.meta);
 
         let mtu_max = self.ip_mtu();
         let ip_len = (frag.packet_len - frag.sent_bytes + frag.ipv4.repr.buffer_len()).min(mtu_max);

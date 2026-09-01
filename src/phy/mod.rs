@@ -389,8 +389,13 @@ pub trait TxToken {
     /// Most devices use the interface medium and return `None`. Stack
     /// integrations that defer routing and link-layer resolution may request
     /// an IP packet even when the interface itself uses Ethernet.
-    fn medium_override(&mut self, version: crate::wire::IpVersion) -> Option<Medium> {
-        let _ = version;
+    fn medium_override(
+        &mut self,
+        version: crate::wire::IpVersion,
+        destination: crate::wire::IpAddress,
+        meta: PacketMeta,
+    ) -> Option<Medium> {
+        let _ = (version, destination, meta);
         None
     }
 

@@ -88,6 +88,25 @@ impl<K> PacketAssembler<K> {
         self.expires_at = Instant::ZERO;
     }
 
+    #[cfg(feature = "alloc")]
+    fn ensure_buffer_len(&mut self, size: usize) -> Result<(), AssemblerError> {
+        if self.buffer.len() >= size {
+            return Ok(());
+        }
+        self.buffer
+            .try_reserve_exact(size - self.buffer.len())
+            .map_err(|_| AssemblerError)?;
+        self.buffer.resize(size, 0);
+        Ok(())
+    }
+
+    fn release_oversized_buffer(&mut self) {
+        #[cfg(feature = "alloc")]
+        if self.buffer.capacity() > REASSEMBLY_BUFFER_SIZE {
+            self.buffer = Buffer::new();
+        }
+    }
+
     /// Set the total size of the packet assembler.
     pub fn set_total_size(&mut self, size: usize) -> Result<(), AssemblerError> {
         if let Some(old_size) = self.total_size {
@@ -102,9 +121,7 @@ impl<K> PacketAssembler<K> {
         }
 
         #[cfg(feature = "alloc")]
-        if self.buffer.len() < size {
-            self.buffer.resize(size, 0);
-        }
+        self.ensure_buffer_len(size)?;
 
         self.total_size = Some(size);
         Ok(())
@@ -144,15 +161,15 @@ impl<K> PacketAssembler<K> {
     /// - Returns [`Error::PacketAssemblerBufferTooSmall`] when trying to add data into the buffer at a non-existing
     ///   place.
     pub fn add(&mut self, data: &[u8], offset: usize) -> Result<(), AssemblerError> {
+        let end = offset.checked_add(data.len()).ok_or(AssemblerError)?;
+
         #[cfg(not(feature = "alloc"))]
-        if self.buffer.len() < offset + data.len() {
+        if self.buffer.len() < end {
             return Err(AssemblerError);
         }
 
         #[cfg(feature = "alloc")]
-        if self.buffer.len() < offset + data.len() {
-            self.buffer.resize(offset + data.len(), 0);
-        }
+        self.ensure_buffer_len(end)?;
 
         let len = data.len();
         self.buffer[offset..][..len].copy_from_slice(data);
@@ -238,6 +255,9 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
         for frag in &mut self.assemblers {
             if !frag.is_free() && frag.expires_at < timestamp {
                 frag.reset();
+            }
+            if frag.is_free() {
+                frag.release_oversized_buffer();
             }
         }
     }
@@ -456,6 +476,30 @@ mod tests {
         p_assembler.add(&data[..], 1);
 
         assert_eq!(p_assembler.assemble(), Some(&b"RRust"[..]))
+    }
+
+    #[test]
+    fn packet_assembler_rejects_offset_overflow() {
+        let mut p_assembler = PacketAssembler::<Key>::new();
+        assert_eq!(p_assembler.add(&[1], usize::MAX), Err(AssemblerError));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn packet_assembler_set_releases_oversized_free_buffer() {
+        let mut set = PacketAssemblerSet::new();
+        let assembler = set.get(&Key { id: 1 }, Instant::ZERO).unwrap();
+        assembler
+            .set_total_size(REASSEMBLY_BUFFER_SIZE + 1)
+            .unwrap();
+        assembler
+            .add(&vec![0; REASSEMBLY_BUFFER_SIZE + 1], 0)
+            .unwrap();
+        assert!(assembler.assemble().is_some());
+
+        set.remove_expired(Instant::ZERO);
+        let assembler = set.get(&Key { id: 2 }, Instant::ZERO).unwrap();
+        assert_eq!(assembler.buffer.capacity(), 0);
     }
 
     #[test]

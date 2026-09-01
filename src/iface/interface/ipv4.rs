@@ -100,6 +100,18 @@ impl InterfaceInner {
         #[cfg(feature = "proto-ipv4-fragmentation")]
         let ip_payload = {
             if ipv4_packet.more_frags() || ipv4_packet.frag_offset() != 0 {
+                let fragment_offset = ipv4_packet.frag_offset() as usize;
+                let fragment_payload = ipv4_packet.payload();
+                if ipv4_packet.more_frags() && fragment_payload.len() % 8 != 0 {
+                    net_debug!("non-final IPv4 fragment payload is not eight-byte aligned");
+                    return None;
+                }
+                let fragment_end = fragment_offset.checked_add(fragment_payload.len())?;
+                let max_payload_len = u16::MAX as usize - crate::wire::ipv4::HEADER_LEN;
+                if fragment_end > max_payload_len {
+                    net_debug!("IPv4 fragment exceeds the maximum datagram length");
+                    return None;
+                }
                 let key = FragKey::Ipv4(ipv4_packet.get_key());
 
                 let f = match frag.assembler.get(&key, self.now + frag.reassembly_timeout) {
@@ -112,13 +124,10 @@ impl InterfaceInner {
 
                 if !ipv4_packet.more_frags() {
                     // This is the last fragment, so we know the total size
-                    check!(f.set_total_size(
-                        ipv4_packet.total_len() as usize - ipv4_packet.header_len() as usize
-                            + ipv4_packet.frag_offset() as usize,
-                    ));
+                    check!(f.set_total_size(fragment_end));
                 }
 
-                if let Err(e) = f.add(ipv4_packet.payload(), ipv4_packet.frag_offset() as usize) {
+                if let Err(e) = f.add(fragment_payload, fragment_offset) {
                     net_debug!("fragmentation error: {:?}", e);
                     return None;
                 }

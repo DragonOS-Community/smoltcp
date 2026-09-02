@@ -45,7 +45,7 @@ impl Answer {
 #[derive(Debug)]
 pub struct Cache {
     storage: LinearMap<IpAddress, Neighbor, IFACE_NEIGHBOR_CACHE_COUNT>,
-    silent_until: Instant,
+    silent_until: LinearMap<IpAddress, Instant, IFACE_NEIGHBOR_CACHE_COUNT>,
 }
 
 impl Cache {
@@ -59,7 +59,7 @@ impl Cache {
     pub fn new() -> Self {
         Self {
             storage: LinearMap::new(),
-            silent_until: Instant::from_millis(0),
+            silent_until: LinearMap::new(),
         }
     }
 
@@ -106,6 +106,7 @@ impl Cache {
             expires_at,
             hardware_addr,
         };
+        self.silent_until.remove(&protocol_addr);
         match self.storage.insert(protocol_addr, neighbor) {
             Ok(Some(old_neighbor)) => {
                 if old_neighbor.hardware_addr != hardware_addr {
@@ -160,28 +161,55 @@ impl Cache {
             }
         }
 
-        if timestamp < self.silent_until {
+        if self
+            .silent_until
+            .get(protocol_addr)
+            .is_some_and(|silent_until| timestamp < *silent_until)
+        {
             Answer::RateLimited
         } else {
             Answer::NotFound
         }
     }
 
-    pub fn limit_rate(&mut self, timestamp: Instant) {
-        self.silent_until = timestamp + Self::SILENT_TIME;
-    }
-
-    /// Return the earliest time at which another discovery request may be sent.
-    pub(crate) fn discovery_retry_at(&self, timestamp: Instant) -> Instant {
-        if self.silent_until > timestamp {
+    pub fn limit_rate(&mut self, protocol_addr: IpAddress, timestamp: Instant) {
+        let silent_until = timestamp + Self::SILENT_TIME;
+        if let Some(existing) = self.silent_until.get_mut(&protocol_addr) {
+            *existing = silent_until;
+            return;
+        }
+        if let Err((protocol_addr, silent_until)) =
+            self.silent_until.insert(protocol_addr, silent_until)
+        {
+            let oldest = *self
+                .silent_until
+                .iter()
+                .min_by_key(|(_, silent_until)| *silent_until)
+                .expect("empty neighbor discovery rate-limit map")
+                .0;
+            self.silent_until.remove(&oldest);
             self.silent_until
-        } else {
-            timestamp + Self::SILENT_TIME
+                .insert(protocol_addr, silent_until)
+                .expect("evicting one rate-limit entry makes room");
         }
     }
 
+    /// Return the earliest time at which another discovery request may be sent.
+    pub(crate) fn discovery_retry_at(
+        &self,
+        protocol_addr: &IpAddress,
+        timestamp: Instant,
+    ) -> Instant {
+        self.silent_until
+            .get(protocol_addr)
+            .copied()
+            .filter(|silent_until| *silent_until > timestamp)
+            .unwrap_or(timestamp + Self::SILENT_TIME)
+    }
+
     pub fn flush(&mut self) {
-        self.storage.clear()
+        self.storage.clear();
+        self.silent_until.clear();
     }
 
     /// 获取ARP缓存条目的迭代器
@@ -315,13 +343,17 @@ mod test {
             Answer::NotFound
         );
 
-        cache.limit_rate(Instant::from_millis(0));
+        cache.limit_rate(MOCK_IP_ADDR_1.into(), Instant::from_millis(0));
         assert_eq!(
             cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(100)),
             Answer::RateLimited
         );
         assert_eq!(
             cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(2000)),
+            Answer::NotFound
+        );
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_2.into(), Instant::from_millis(100)),
             Answer::NotFound
         );
     }

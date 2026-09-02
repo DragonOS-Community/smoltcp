@@ -400,15 +400,19 @@ pub trait TxToken {
         Ok(None)
     }
 
-    /// Apply egress properties saved while an earlier fragment was emitted.
+    /// Re-admit the backend selected while an earlier fragment was emitted.
     ///
     /// The default implementation is a no-op. Integrations that attach an
-    /// opaque routing decision to [`TxEgressOverride`] can use this callback to
-    /// restore that decision on the transmit tokens for later fragments.
+    /// This is called for every continuation fragment. `None` identifies the
+    /// device's native egress path; integrations that attach an opaque routing
+    /// decision to [`TxEgressOverride`] can restore it from `Some`.
     /// Return [`TxEgressError::Exhausted`] when the token cannot currently
     /// honor the saved properties. The stack retains the remaining fragments
     /// for a later poll without calling `consume`.
-    fn apply_egress_override(&mut self, egress: TxEgressOverride) -> Result<(), TxEgressError> {
+    fn apply_egress_override(
+        &mut self,
+        egress: Option<TxEgressOverride>,
+    ) -> Result<(), TxEgressError> {
         let _ = egress;
         Ok(())
     }

@@ -493,6 +493,24 @@ impl Interface {
         }
     }
 
+    /// Return whether dynamic neighbor discovery currently has a usable
+    /// link-layer address for `protocol_addr`.
+    ///
+    /// External FIB integrations can use this to release packets queued after
+    /// [`Ipv4PacketDispatchError::NeighborPending`] as soon as an ARP reply is
+    /// processed, without waiting for the discovery retry deadline.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn is_neighbor_resolved(&mut self, timestamp: Instant, protocol_addr: IpAddress) -> bool {
+        if !protocol_addr.is_unicast() {
+            return false;
+        }
+        self.inner.now = timestamp;
+        self.inner
+            .neighbor_cache
+            .lookup(&protocol_addr, timestamp)
+            .found()
+    }
+
     /// Enable or disable the AnyIP capability.
     ///
     /// AnyIP allowins packets to be received

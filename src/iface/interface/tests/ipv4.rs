@@ -103,6 +103,14 @@ fn explicit_ipv4_dispatch_emits_rate_limited_arp_for_missing_neighbor() {
         })
     );
     assert!(suppressed.borrow().is_empty());
+
+    assert!(!iface.is_neighbor_resolved(Instant::from_millis(20), IpAddress::Ipv4(next_hop)));
+    iface.inner.neighbor_cache.fill(
+        IpAddress::Ipv4(next_hop),
+        HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[0x02, 0, 0, 0, 0, 99])),
+        Instant::from_millis(20),
+    );
+    assert!(iface.is_neighbor_resolved(Instant::from_millis(20), IpAddress::Ipv4(next_hop)));
 }
 
 #[test]

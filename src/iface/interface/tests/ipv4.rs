@@ -1112,9 +1112,12 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
             }))
         }
 
-        fn apply_egress_override(&mut self, egress: crate::phy::TxEgressOverride) -> bool {
+        fn apply_egress_override(
+            &mut self,
+            egress: crate::phy::TxEgressOverride,
+        ) -> Result<(), crate::phy::TxEgressError> {
             self.context = Some(egress.context);
-            true
+            Ok(())
         }
 
         fn consume<R, F>(self, len: usize, f: F) -> R

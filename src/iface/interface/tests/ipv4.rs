@@ -1078,6 +1078,82 @@ fn test_packet_len(#[case] medium: Medium) {
 }
 
 #[test]
+#[cfg(all(feature = "proto-ipv4-fragmentation", feature = "medium-ip"))]
+fn native_continuation_fragment_rechecks_backend_admission() {
+    use core::cell::Cell;
+    use std::rc::Rc;
+
+    struct NativeTxToken;
+
+    impl TxToken for NativeTxToken {
+        fn consume<R, F>(self, len: usize, f: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            let mut buffer = vec![0; len];
+            f(&mut buffer)
+        }
+    }
+
+    struct ExhaustedContinuation {
+        admitted: Rc<Cell<bool>>,
+    }
+
+    impl TxToken for ExhaustedContinuation {
+        fn apply_egress_override(
+            &mut self,
+            egress: Option<crate::phy::TxEgressOverride>,
+        ) -> Result<(), crate::phy::TxEgressError> {
+            assert_eq!(egress, None);
+            self.admitted.set(true);
+            Err(crate::phy::TxEgressError::Exhausted)
+        }
+
+        fn consume<R, F>(self, _len: usize, _f: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            panic!("an exhausted continuation must remain pending")
+        }
+    }
+
+    let (mut iface, _, _) = setup(Medium::Ip);
+    let payload = vec![0xa5; iface.inner.ip_mtu() + 256];
+    let packet = Packet::new_ipv4(
+        Ipv4Repr {
+            src_addr: Ipv4Address::new(192, 0, 2, 1),
+            dst_addr: Ipv4Address::new(198, 51, 100, 1),
+            next_header: IpProtocol::Udp,
+            payload_len: payload.len(),
+            hop_limit: 64,
+        },
+        IpPayload::Raw(&payload),
+    );
+
+    iface
+        .inner
+        .dispatch_ip(
+            NativeTxToken,
+            PacketMeta::default(),
+            packet,
+            &mut iface.fragmenter,
+        )
+        .unwrap();
+    let sent_bytes = iface.fragmenter.sent_bytes;
+    assert!(sent_bytes > 0 && sent_bytes < iface.fragmenter.packet_len);
+
+    let admitted = Rc::new(Cell::new(false));
+    iface.inner.dispatch_ipv4_frag(
+        ExhaustedContinuation {
+            admitted: admitted.clone(),
+        },
+        &mut iface.fragmenter,
+    );
+    assert!(admitted.get());
+    assert_eq!(iface.fragmenter.sent_bytes, sent_bytes);
+}
+
+#[test]
 #[cfg(all(
     feature = "proto-ipv4-fragmentation",
     feature = "medium-ethernet",
@@ -1114,9 +1190,9 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
 
         fn apply_egress_override(
             &mut self,
-            egress: crate::phy::TxEgressOverride,
+            egress: Option<crate::phy::TxEgressOverride>,
         ) -> Result<(), crate::phy::TxEgressError> {
-            self.context = Some(egress.context);
+            self.context = egress.map(|egress| egress.context);
             Ok(())
         }
 

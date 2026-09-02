@@ -113,8 +113,8 @@ pub enum Ipv4PacketDispatchError {
     InvalidHardwareAddress,
     /// The interface cannot select a source address for neighbor discovery.
     NoRoute,
-    /// Neighbor discovery is in progress; the original packet should be retried later.
-    NeighborPending,
+    /// Neighbor discovery is in progress; retry no earlier than `retry_at`.
+    NeighborPending { retry_at: Instant },
 }
 
 /// A  network interface.
@@ -445,23 +445,33 @@ impl Interface {
             }),
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => {
-                let (destination_hardware_addr, tx_token) =
-                    if let Some(destination_hardware_addr) = destination_hardware_addr {
-                        if destination_hardware_addr.medium() != Medium::Ethernet {
-                            return Err(Ipv4PacketDispatchError::InvalidHardwareAddress);
+                let (destination_hardware_addr, tx_token) = if let Some(destination_hardware_addr) =
+                    destination_hardware_addr
+                {
+                    if destination_hardware_addr.medium() != Medium::Ethernet {
+                        return Err(Ipv4PacketDispatchError::InvalidHardwareAddress);
+                    }
+                    (destination_hardware_addr.ethernet_or_panic(), tx_token)
+                } else {
+                    let (hardware_addr, tx_token) = match self
+                        .inner
+                        .lookup_hardware_addr_for_next_hop(
+                            tx_token,
+                            &IpAddress::Ipv4(next_hop),
+                            &mut self.fragmenter,
+                        ) {
+                        Ok(result) => result,
+                        Err(DispatchError::NeighborPending) => {
+                            return Err(Ipv4PacketDispatchError::NeighborPending {
+                                retry_at: self.inner.neighbor_cache.discovery_retry_at(timestamp),
+                            });
                         }
-                        (destination_hardware_addr.ethernet_or_panic(), tx_token)
-                    } else {
-                        let (hardware_addr, tx_token) = self
-                            .inner
-                            .lookup_hardware_addr_for_next_hop(
-                                tx_token,
-                                &IpAddress::Ipv4(next_hop),
-                                &mut self.fragmenter,
-                            )
-                            .map_err(Ipv4PacketDispatchError::from)?;
-                        (hardware_addr.ethernet_or_panic(), tx_token)
+                        Err(DispatchError::NoRoute) => {
+                            return Err(Ipv4PacketDispatchError::NoRoute);
+                        }
                     };
+                    (hardware_addr.ethernet_or_panic(), tx_token)
+                };
 
                 self.inner
                     .dispatch_ethernet(tx_token, packet_len, |mut frame| {
@@ -469,7 +479,14 @@ impl Interface {
                         frame.set_ethertype(EthernetProtocol::Ipv4);
                         frame.payload_mut().copy_from_slice(ip_packet);
                     })
-                    .map_err(Ipv4PacketDispatchError::from)
+                    .map_err(|error| match error {
+                        DispatchError::NoRoute => Ipv4PacketDispatchError::NoRoute,
+                        DispatchError::NeighborPending => {
+                            Ipv4PacketDispatchError::NeighborPending {
+                                retry_at: self.inner.neighbor_cache.discovery_retry_at(timestamp),
+                            }
+                        }
+                    })
             }
             #[allow(unreachable_patterns)]
             _ => Err(Ipv4PacketDispatchError::NoRoute),
@@ -1474,13 +1491,4 @@ enum DispatchError {
     /// the neighbor for it yet. Discovery has been initiated, dispatch
     /// should be retried later.
     NeighborPending,
-}
-
-impl From<DispatchError> for Ipv4PacketDispatchError {
-    fn from(value: DispatchError) -> Self {
-        match value {
-            DispatchError::NoRoute => Self::NoRoute,
-            DispatchError::NeighborPending => Self::NeighborPending,
-        }
-    }
 }

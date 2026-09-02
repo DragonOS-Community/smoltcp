@@ -76,7 +76,9 @@ fn explicit_ipv4_dispatch_emits_rate_limited_arp_for_missing_neighbor() {
             None,
             &packet,
         ),
-        Err(Ipv4PacketDispatchError::NeighborPending)
+        Err(Ipv4PacketDispatchError::NeighborPending {
+            retry_at: Instant::from_millis(1_010),
+        })
     );
     {
         let frames = frames.borrow();
@@ -96,7 +98,9 @@ fn explicit_ipv4_dispatch_emits_rate_limited_arp_for_missing_neighbor() {
             None,
             &packet,
         ),
-        Err(Ipv4PacketDispatchError::NeighborPending)
+        Err(Ipv4PacketDispatchError::NeighborPending {
+            retry_at: Instant::from_millis(1_010),
+        })
     );
     assert!(suppressed.borrow().is_empty());
 }

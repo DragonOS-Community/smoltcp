@@ -171,6 +171,15 @@ impl Cache {
         self.silent_until = timestamp + Self::SILENT_TIME;
     }
 
+    /// Return the earliest time at which another discovery request may be sent.
+    pub(crate) fn discovery_retry_at(&self, timestamp: Instant) -> Instant {
+        if self.silent_until > timestamp {
+            self.silent_until
+        } else {
+            timestamp + Self::SILENT_TIME
+        }
+    }
+
     pub fn flush(&mut self) {
         self.storage.clear()
     }

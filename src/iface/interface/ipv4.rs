@@ -428,8 +428,7 @@ impl InterfaceInner {
         let caps = self.caps.clone();
         let tx_medium = frag.ipv4.egress.map_or(caps.medium, |egress| egress.medium);
         if let Some(egress) = frag.ipv4.egress {
-            if !tx_token.apply_egress_override(egress) {
-                frag.sent_bytes = frag.packet_len;
+            if tx_token.apply_egress_override(egress).is_err() {
                 return;
             }
         }

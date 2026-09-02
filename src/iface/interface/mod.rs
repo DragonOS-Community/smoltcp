@@ -445,33 +445,34 @@ impl Interface {
             }),
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => {
-                let (destination_hardware_addr, tx_token) = if let Some(destination_hardware_addr) =
-                    destination_hardware_addr
-                {
-                    if destination_hardware_addr.medium() != Medium::Ethernet {
-                        return Err(Ipv4PacketDispatchError::InvalidHardwareAddress);
-                    }
-                    (destination_hardware_addr.ethernet_or_panic(), tx_token)
-                } else {
-                    let (hardware_addr, tx_token) = match self
-                        .inner
-                        .lookup_hardware_addr_for_next_hop(
-                            tx_token,
-                            &IpAddress::Ipv4(next_hop),
-                            &mut self.fragmenter,
-                        ) {
-                        Ok(result) => result,
-                        Err(DispatchError::NeighborPending) => {
-                            return Err(Ipv4PacketDispatchError::NeighborPending {
-                                retry_at: self.inner.neighbor_cache.discovery_retry_at(timestamp),
-                            });
+                let (destination_hardware_addr, tx_token) =
+                    if let Some(destination_hardware_addr) = destination_hardware_addr {
+                        if destination_hardware_addr.medium() != Medium::Ethernet {
+                            return Err(Ipv4PacketDispatchError::InvalidHardwareAddress);
                         }
-                        Err(DispatchError::NoRoute) => {
-                            return Err(Ipv4PacketDispatchError::NoRoute);
-                        }
+                        (destination_hardware_addr.ethernet_or_panic(), tx_token)
+                    } else {
+                        let (hardware_addr, tx_token) =
+                            match self.inner.lookup_hardware_addr_for_next_hop(
+                                tx_token,
+                                &IpAddress::Ipv4(next_hop),
+                                &mut self.fragmenter,
+                            ) {
+                                Ok(result) => result,
+                                Err(DispatchError::NeighborPending) => {
+                                    return Err(Ipv4PacketDispatchError::NeighborPending {
+                                        retry_at: self.inner.neighbor_cache.discovery_retry_at(
+                                            &IpAddress::Ipv4(next_hop),
+                                            timestamp,
+                                        ),
+                                    });
+                                }
+                                Err(DispatchError::NoRoute) => {
+                                    return Err(Ipv4PacketDispatchError::NoRoute);
+                                }
+                            };
+                        (hardware_addr.ethernet_or_panic(), tx_token)
                     };
-                    (hardware_addr.ethernet_or_panic(), tx_token)
-                };
 
                 self.inner
                     .dispatch_ethernet(tx_token, packet_len, |mut frame| {
@@ -483,7 +484,10 @@ impl Interface {
                         DispatchError::NoRoute => Ipv4PacketDispatchError::NoRoute,
                         DispatchError::NeighborPending => {
                             Ipv4PacketDispatchError::NeighborPending {
-                                retry_at: self.inner.neighbor_cache.discovery_retry_at(timestamp),
+                                retry_at: self
+                                    .inner
+                                    .neighbor_cache
+                                    .discovery_retry_at(&IpAddress::Ipv4(next_hop), timestamp),
                             }
                         }
                     })
@@ -1273,7 +1277,7 @@ impl InterfaceInner {
         }
 
         // The request got dispatched, limit the rate on the cache.
-        self.neighbor_cache.limit_rate(self.now);
+        self.neighbor_cache.limit_rate(*next_hop, self.now);
         Err(DispatchError::NeighborPending)
     }
 

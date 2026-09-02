@@ -103,6 +103,20 @@ pub enum PollIngressSingleResult {
     SocketStateChanged,
 }
 
+/// Error returned by [`Interface::dispatch_ipv4_packet`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Ipv4PacketDispatchError {
+    /// The supplied packet is not a complete, well-formed IPv4 packet.
+    Malformed,
+    /// A permanent neighbor address does not match the interface medium.
+    InvalidHardwareAddress,
+    /// The interface cannot select a source address for neighbor discovery.
+    NoRoute,
+    /// Neighbor discovery is in progress; the original packet should be retried later.
+    NeighborPending,
+}
+
 /// A  network interface.
 ///
 /// The network interface logically owns a number of other data structures; to avoid
@@ -393,6 +407,73 @@ impl Interface {
     /// route removal will then make that subnet unreachable as expected.
     pub fn set_route_table_includes_connected_prefixes(&mut self, enabled: bool) {
         self.inner.route_table_includes_connected_prefixes = enabled;
+    }
+
+    /// Serialize an already-constructed IPv4 packet for an explicit next hop.
+    ///
+    /// This is intended for integrations whose authoritative FIB lives outside
+    /// smoltcp. The supplied next hop is used directly for Ethernet neighbor
+    /// resolution instead of consulting this interface's route table. When
+    /// `destination_hardware_addr` is present, it represents an externally
+    /// configured permanent neighbor and bypasses dynamic discovery.
+    ///
+    /// The transmit token may be consumed to emit either the IPv4 frame or an
+    /// ARP request. On [`Ipv4PacketDispatchError::NeighborPending`], callers
+    /// must retain the original IPv4 packet and retry it later.
+    #[cfg(feature = "proto-ipv4")]
+    pub fn dispatch_ipv4_packet<Tx: TxToken>(
+        &mut self,
+        timestamp: Instant,
+        tx_token: Tx,
+        next_hop: Ipv4Address,
+        destination_hardware_addr: Option<HardwareAddress>,
+        ip_packet: &[u8],
+    ) -> Result<(), Ipv4PacketDispatchError> {
+        let packet =
+            Ipv4Packet::new_checked(ip_packet).map_err(|_| Ipv4PacketDispatchError::Malformed)?;
+        let packet_len = packet.total_len() as usize;
+        if packet_len != ip_packet.len() {
+            return Err(Ipv4PacketDispatchError::Malformed);
+        }
+
+        self.inner.now = timestamp;
+        match self.inner.caps.medium {
+            #[cfg(feature = "medium-ip")]
+            Medium::Ip => tx_token.consume(packet_len, |buffer| {
+                buffer.copy_from_slice(ip_packet);
+                Ok(())
+            }),
+            #[cfg(feature = "medium-ethernet")]
+            Medium::Ethernet => {
+                let (destination_hardware_addr, tx_token) =
+                    if let Some(destination_hardware_addr) = destination_hardware_addr {
+                        if destination_hardware_addr.medium() != Medium::Ethernet {
+                            return Err(Ipv4PacketDispatchError::InvalidHardwareAddress);
+                        }
+                        (destination_hardware_addr.ethernet_or_panic(), tx_token)
+                    } else {
+                        let (hardware_addr, tx_token) = self
+                            .inner
+                            .lookup_hardware_addr_for_next_hop(
+                                tx_token,
+                                &IpAddress::Ipv4(next_hop),
+                                &mut self.fragmenter,
+                            )
+                            .map_err(Ipv4PacketDispatchError::from)?;
+                        (hardware_addr.ethernet_or_panic(), tx_token)
+                    };
+
+                self.inner
+                    .dispatch_ethernet(tx_token, packet_len, |mut frame| {
+                        frame.set_dst_addr(destination_hardware_addr);
+                        frame.set_ethertype(EthernetProtocol::Ipv4);
+                        frame.payload_mut().copy_from_slice(ip_packet);
+                    })
+                    .map_err(Ipv4PacketDispatchError::from)
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(Ipv4PacketDispatchError::NoRoute),
+        }
     }
 
     /// Enable or disable the AnyIP capability.
@@ -1008,7 +1089,26 @@ impl InterfaceInner {
     where
         Tx: TxToken,
     {
-        if self.is_broadcast(dst_addr) {
+        let next_hop = if self.is_broadcast(dst_addr) || dst_addr.is_multicast() {
+            *dst_addr
+        } else {
+            self.route(dst_addr, self.now)
+                .ok_or(DispatchError::NoRoute)?
+        };
+        self.lookup_hardware_addr_for_next_hop(tx_token, &next_hop, fragmenter)
+    }
+
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    fn lookup_hardware_addr_for_next_hop<Tx>(
+        &mut self,
+        tx_token: Tx,
+        next_hop: &IpAddress,
+        fragmenter: &mut Fragmenter,
+    ) -> Result<(HardwareAddress, Tx), DispatchError>
+    where
+        Tx: TxToken,
+    {
+        if self.is_broadcast(next_hop) {
             let hardware_addr = match self.caps.medium {
                 #[cfg(feature = "medium-ethernet")]
                 Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress::BROADCAST),
@@ -1021,8 +1121,8 @@ impl InterfaceInner {
             return Ok((hardware_addr, tx_token));
         }
 
-        if dst_addr.is_multicast() {
-            let hardware_addr = match *dst_addr {
+        if next_hop.is_multicast() {
+            let hardware_addr = match *next_hop {
                 #[cfg(feature = "proto-ipv4")]
                 IpAddress::Ipv4(addr) => match self.caps.medium {
                     #[cfg(feature = "medium-ethernet")]
@@ -1064,17 +1164,13 @@ impl InterfaceInner {
             return Ok((hardware_addr, tx_token));
         }
 
-        let dst_addr = self
-            .route(dst_addr, self.now)
-            .ok_or(DispatchError::NoRoute)?;
-
-        match self.neighbor_cache.lookup(&dst_addr, self.now) {
+        match self.neighbor_cache.lookup(next_hop, self.now) {
             NeighborAnswer::Found(hardware_addr) => return Ok((hardware_addr, tx_token)),
             NeighborAnswer::RateLimited => return Err(DispatchError::NeighborPending),
             _ => (), // XXX
         }
 
-        match dst_addr {
+        match *next_hop {
             #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
             IpAddress::Ipv4(dst_addr) if matches!(self.caps.medium, Medium::Ethernet) => {
                 net_debug!(
@@ -1378,4 +1474,13 @@ enum DispatchError {
     /// the neighbor for it yet. Discovery has been initiated, dispatch
     /// should be retried later.
     NeighborPending,
+}
+
+impl From<DispatchError> for Ipv4PacketDispatchError {
+    fn from(value: DispatchError) -> Self {
+        match value {
+            DispatchError::NoRoute => Self::NoRoute,
+            DispatchError::NeighborPending => Self::NeighborPending,
+        }
+    }
 }

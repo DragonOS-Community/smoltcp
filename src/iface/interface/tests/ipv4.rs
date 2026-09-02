@@ -1,5 +1,125 @@
 use super::*;
 
+fn serialized_ipv4_packet(dst_addr: Ipv4Address) -> Vec<u8> {
+    let payload = [0xde, 0xad, 0xbe, 0xef];
+    let repr = Ipv4Repr {
+        src_addr: Ipv4Address::new(192, 168, 1, 1),
+        dst_addr,
+        next_header: IpProtocol::Udp,
+        payload_len: payload.len(),
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0; repr.buffer_len() + payload.len()];
+    repr.emit(
+        &mut Ipv4Packet::new_unchecked(&mut bytes),
+        &ChecksumCapabilities::default(),
+    );
+    bytes[repr.buffer_len()..].copy_from_slice(&payload);
+    bytes
+}
+
+#[derive(Clone)]
+struct CapturingTxToken(std::rc::Rc<core::cell::RefCell<Vec<Vec<u8>>>>);
+
+impl TxToken for CapturingTxToken {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buffer = vec![0; len];
+        let result = f(&mut buffer);
+        self.0.borrow_mut().push(buffer);
+        result
+    }
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn explicit_ipv4_dispatch_uses_supplied_next_hop_neighbor() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    let destination_mac = EthernetAddress::from_bytes(&[0x02, 0, 0, 0, 0, 9]);
+    let packet = serialized_ipv4_packet(Ipv4Address::new(198, 51, 100, 7));
+
+    assert_eq!(
+        iface.dispatch_ipv4_packet(
+            Instant::from_millis(10),
+            CapturingTxToken(frames.clone()),
+            Ipv4Address::new(192, 0, 2, 1),
+            Some(HardwareAddress::Ethernet(destination_mac)),
+            &packet,
+        ),
+        Ok(())
+    );
+
+    let frames = frames.borrow();
+    assert_eq!(frames.len(), 1);
+    let frame = EthernetFrame::new_checked(&frames[0]).unwrap();
+    assert_eq!(frame.dst_addr(), destination_mac);
+    assert_eq!(frame.ethertype(), EthernetProtocol::Ipv4);
+    assert_eq!(frame.payload(), packet);
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn explicit_ipv4_dispatch_emits_rate_limited_arp_for_missing_neighbor() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    let next_hop = Ipv4Address::new(192, 168, 1, 99);
+    let packet = serialized_ipv4_packet(Ipv4Address::new(198, 51, 100, 7));
+
+    assert_eq!(
+        iface.dispatch_ipv4_packet(
+            Instant::from_millis(10),
+            CapturingTxToken(frames.clone()),
+            next_hop,
+            None,
+            &packet,
+        ),
+        Err(Ipv4PacketDispatchError::NeighborPending)
+    );
+    {
+        let frames = frames.borrow();
+        assert_eq!(frames.len(), 1);
+        let frame = EthernetFrame::new_checked(&frames[0]).unwrap();
+        assert_eq!(frame.ethertype(), EthernetProtocol::Arp);
+        let arp = ArpPacket::new_checked(frame.payload()).unwrap();
+        assert_eq!(arp.target_protocol_addr(), next_hop.octets());
+    }
+
+    let suppressed = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    assert_eq!(
+        iface.dispatch_ipv4_packet(
+            Instant::from_millis(10),
+            CapturingTxToken(suppressed.clone()),
+            next_hop,
+            None,
+            &packet,
+        ),
+        Err(Ipv4PacketDispatchError::NeighborPending)
+    );
+    assert!(suppressed.borrow().is_empty());
+}
+
+#[test]
+#[cfg(feature = "medium-ip")]
+fn explicit_ipv4_dispatch_preserves_packet_on_ip_medium() {
+    let (mut iface, _, _) = setup(Medium::Ip);
+    let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    let packet = serialized_ipv4_packet(Ipv4Address::new(127, 0, 0, 1));
+    assert_eq!(
+        iface.dispatch_ipv4_packet(
+            Instant::from_millis(10),
+            CapturingTxToken(frames.clone()),
+            Ipv4Address::new(127, 0, 0, 1),
+            None,
+            &packet,
+        ),
+        Ok(())
+    );
+    assert_eq!(frames.borrow().as_slice(), &[packet]);
+}
+
 #[rstest]
 #[case(Medium::Ip)]
 #[cfg(feature = "medium-ip")]

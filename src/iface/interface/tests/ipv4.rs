@@ -132,6 +132,53 @@ fn explicit_ipv4_dispatch_preserves_packet_on_ip_medium() {
     assert_eq!(frames.borrow().as_slice(), &[packet]);
 }
 
+#[test]
+#[cfg(all(feature = "proto-ipv4", feature = "medium-ip"))]
+fn egress_admission_failure_does_not_consume_token() {
+    struct ExhaustedTxToken;
+
+    impl TxToken for ExhaustedTxToken {
+        fn egress_override(
+            &mut self,
+            _version: IpVersion,
+            _destination: IpAddress,
+            _meta: PacketMeta,
+        ) -> Result<Option<crate::phy::TxEgressOverride>, crate::phy::TxEgressError> {
+            Err(crate::phy::TxEgressError::Exhausted)
+        }
+
+        fn consume<R, F>(self, _len: usize, _f: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            panic!("an exhausted backend must not consume its token")
+        }
+    }
+
+    let (mut iface, _, _) = setup(Medium::Ip);
+    let payload = [1, 2, 3, 4];
+    let packet = Packet::new_ipv4(
+        Ipv4Repr {
+            src_addr: Ipv4Address::new(192, 0, 2, 1),
+            dst_addr: Ipv4Address::new(198, 51, 100, 7),
+            next_header: IpProtocol::Udp,
+            payload_len: payload.len(),
+            hop_limit: 64,
+        },
+        IpPayload::Raw(&payload),
+    );
+
+    assert_eq!(
+        iface.inner.dispatch_ip(
+            ExhaustedTxToken,
+            PacketMeta::default(),
+            packet,
+            &mut iface.fragmenter,
+        ),
+        Err(DispatchError::Exhausted)
+    );
+}
+
 #[rstest]
 #[case(Medium::Ip)]
 #[cfg(feature = "medium-ip")]
@@ -1057,12 +1104,12 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
             _version: IpVersion,
             _destination: IpAddress,
             _meta: PacketMeta,
-        ) -> Option<crate::phy::TxEgressOverride> {
-            Some(crate::phy::TxEgressOverride {
+        ) -> Result<Option<crate::phy::TxEgressOverride>, crate::phy::TxEgressError> {
+            Ok(Some(crate::phy::TxEgressOverride {
                 medium: Medium::Ip,
                 ip_mtu: ROUTED_IP_MTU,
                 context: ROUTE_CONTEXT,
-            })
+            }))
         }
 
         fn apply_egress_override(&mut self, egress: crate::phy::TxEgressOverride) -> bool {

@@ -113,6 +113,9 @@ pub enum Ipv4PacketDispatchError {
     InvalidHardwareAddress,
     /// The interface cannot select a source address for neighbor discovery.
     NoRoute,
+    /// The selected transmit backend has no capacity; retry after it becomes
+    /// writable again.
+    Exhausted,
     /// Neighbor discovery is in progress; retry no earlier than `retry_at`.
     NeighborPending { retry_at: Instant },
 }
@@ -470,6 +473,9 @@ impl Interface {
                                 Err(DispatchError::NoRoute) => {
                                     return Err(Ipv4PacketDispatchError::NoRoute);
                                 }
+                                Err(DispatchError::Exhausted) => {
+                                    return Err(Ipv4PacketDispatchError::Exhausted);
+                                }
                             };
                         (hardware_addr.ethernet_or_panic(), tx_token)
                     };
@@ -482,6 +488,7 @@ impl Interface {
                     })
                     .map_err(|error| match error {
                         DispatchError::NoRoute => Ipv4PacketDispatchError::NoRoute,
+                        DispatchError::Exhausted => Ipv4PacketDispatchError::Exhausted,
                         DispatchError::NeighborPending => {
                             Ipv4PacketDispatchError::NeighborPending {
                                 retry_at: self
@@ -820,7 +827,12 @@ impl Interface {
 
                 inner
                     .dispatch_ip(t, meta, response, &mut self.fragmenter)
-                    .map_err(|_| EgressError::Dispatch)?;
+                    .map_err(|error| match error {
+                        DispatchError::Exhausted => EgressError::Exhausted,
+                        DispatchError::NoRoute | DispatchError::NeighborPending => {
+                            EgressError::Dispatch
+                        }
+                    })?;
 
                 result = PollResult::SocketStateChanged;
 
@@ -1303,7 +1315,9 @@ impl InterfaceInner {
     ) -> Result<(), DispatchError> {
         let mut ip_repr = packet.ip_repr();
         assert!(!ip_repr.dst_addr().is_unspecified());
-        let egress = tx_token.egress_override(ip_repr.version(), ip_repr.dst_addr(), meta);
+        let egress = tx_token
+            .egress_override(ip_repr.version(), ip_repr.dst_addr(), meta)
+            .map_err(|_| DispatchError::Exhausted)?;
         let tx_medium = egress.map_or(self.caps.medium, |egress| egress.medium);
         let ip_mtu = egress.map_or(self.caps.ip_mtu(), |egress| egress.ip_mtu);
 
@@ -1506,6 +1520,9 @@ impl InterfaceInner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum DispatchError {
+    /// The selected transmit backend has no capacity. The socket should retain
+    /// the packet and retry after the device is polled again.
+    Exhausted,
     /// No route to dispatch this packet. Retrying won't help unless
     /// configuration is changed.
     NoRoute,

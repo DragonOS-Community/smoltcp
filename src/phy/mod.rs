@@ -395,9 +395,9 @@ pub trait TxToken {
         version: crate::wire::IpVersion,
         destination: crate::wire::IpAddress,
         meta: PacketMeta,
-    ) -> Option<TxEgressOverride> {
+    ) -> Result<Option<TxEgressOverride>, TxEgressError> {
         let _ = (version, destination, meta);
-        None
+        Ok(None)
     }
 
     /// Apply egress properties saved while an earlier fragment was emitted.
@@ -425,6 +425,14 @@ pub trait TxToken {
     /// The Packet ID to be associated with the frame to be transmitted by this [`TxToken`].
     #[allow(unused_variables)]
     fn set_meta(&mut self, meta: PacketMeta) {}
+}
+
+/// A transmit backend could not admit the packet selected by
+/// [`TxToken::egress_override`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum TxEgressError {
+    Exhausted,
 }
 
 /// Route-selected properties for a packet emitted through a transmit token.

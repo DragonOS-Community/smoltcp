@@ -1,8 +1,46 @@
 use core::fmt;
 use managed::ManagedSlice;
 
+#[cfg(all(feature = "alloc", feature = "socket-udp"))]
+use alloc::sync::Arc;
+
 use super::socket_meta::Meta;
+#[cfg(all(feature = "alloc", feature = "socket-udp"))]
+use crate::phy::PacketMeta;
 use crate::socket::{AnySocket, Socket};
+#[cfg(all(feature = "alloc", feature = "socket-udp"))]
+use crate::wire::{IpRepr, UdpRepr};
+
+/// Result of offering a validated UDP datagram to an external ingress handler.
+#[cfg(all(feature = "alloc", feature = "socket-udp"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpIngressResult {
+    /// Continue with smoltcp's UDP and DNS socket demultiplexing.
+    NotHandled,
+    /// The handler consumed or deliberately dropped the datagram.
+    ///
+    /// smoltcp will not offer it to UDP/DNS sockets and will not emit an ICMP
+    /// port-unreachable response.
+    Consumed,
+}
+
+/// Optional external consumer for validated UDP ingress.
+///
+/// The callback runs after IP reassembly and UDP length/checksum validation,
+/// but before smoltcp UDP and DNS socket demultiplexing.
+/// `is_broadcast` reports limited or interface-directed IPv4 broadcast; it is
+/// always false for IPv6.
+#[cfg(all(feature = "alloc", feature = "socket-udp"))]
+pub trait UdpIngressHandler: fmt::Debug + Send + Sync {
+    fn handle_udp_ingress(
+        &self,
+        meta: PacketMeta,
+        ip_repr: &IpRepr,
+        udp_repr: &UdpRepr,
+        is_broadcast: bool,
+        payload: &[u8],
+    ) -> UdpIngressResult;
+}
 
 /// Opaque struct with space for storing one socket.
 ///
@@ -43,6 +81,8 @@ impl fmt::Display for SocketHandle {
 #[derive(Debug)]
 pub struct SocketSet<'a> {
     sockets: ManagedSlice<'a, SocketStorage<'a>>,
+    #[cfg(all(feature = "alloc", feature = "socket-udp"))]
+    udp_ingress_handler: Option<Arc<dyn UdpIngressHandler>>,
 }
 
 impl<'a> SocketSet<'a> {
@@ -52,7 +92,36 @@ impl<'a> SocketSet<'a> {
         SocketsT: Into<ManagedSlice<'a, SocketStorage<'a>>>,
     {
         let sockets = sockets.into();
-        SocketSet { sockets }
+        SocketSet {
+            sockets,
+            #[cfg(all(feature = "alloc", feature = "socket-udp"))]
+            udp_ingress_handler: None,
+        }
+    }
+
+    /// Install or remove the external UDP ingress handler.
+    #[cfg(all(feature = "alloc", feature = "socket-udp"))]
+    pub fn set_udp_ingress_handler(
+        &mut self,
+        handler: Option<Arc<dyn UdpIngressHandler>>,
+    ) -> Option<Arc<dyn UdpIngressHandler>> {
+        core::mem::replace(&mut self.udp_ingress_handler, handler)
+    }
+
+    #[cfg(all(feature = "alloc", feature = "socket-udp"))]
+    pub(crate) fn handle_udp_ingress(
+        &self,
+        meta: PacketMeta,
+        ip_repr: &IpRepr,
+        udp_repr: &UdpRepr,
+        is_broadcast: bool,
+        payload: &[u8],
+    ) -> UdpIngressResult {
+        self.udp_ingress_handler
+            .as_ref()
+            .map_or(UdpIngressResult::NotHandled, |handler| {
+                handler.handle_udp_ingress(meta, ip_repr, udp_repr, is_broadcast, payload)
+            })
     }
 
     /// Add a socket to the set, and return its handle.

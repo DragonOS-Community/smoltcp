@@ -156,6 +156,155 @@ fn test_handle_udp_broadcast(#[case] medium: Medium) {
     );
 }
 
+#[cfg(all(
+    feature = "alloc",
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "socket-udp"
+))]
+#[derive(Debug)]
+struct TestUdpIngressHandler {
+    result: crate::iface::UdpIngressResult,
+    calls: core::sync::atomic::AtomicUsize,
+}
+
+#[cfg(all(
+    feature = "alloc",
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "socket-udp"
+))]
+impl crate::iface::UdpIngressHandler for TestUdpIngressHandler {
+    fn handle_udp_ingress(
+        &self,
+        _meta: PacketMeta,
+        ip_repr: &IpRepr,
+        udp_repr: &UdpRepr,
+        is_broadcast: bool,
+        payload: &[u8],
+    ) -> crate::iface::UdpIngressResult {
+        assert_eq!(ip_repr.src_addr(), Ipv4Address::new(127, 0, 0, 2).into());
+        assert_eq!(ip_repr.dst_addr(), Ipv4Address::new(127, 0, 0, 1).into());
+        assert_eq!(udp_repr.src_port, 67);
+        assert_eq!(udp_repr.dst_port, 68);
+        assert!(!is_broadcast);
+        assert_eq!(payload, b"hello");
+        self.calls
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.result
+    }
+}
+
+#[cfg(all(
+    feature = "alloc",
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "socket-udp"
+))]
+fn udp_ingress_test_packet() -> (IpRepr, Vec<u8>) {
+    let udp_repr = UdpRepr {
+        src_port: 67,
+        dst_port: 68,
+    };
+    let ip_repr = IpRepr::Ipv4(Ipv4Repr {
+        src_addr: Ipv4Address::new(127, 0, 0, 2),
+        dst_addr: Ipv4Address::new(127, 0, 0, 1),
+        next_header: IpProtocol::Udp,
+        payload_len: udp_repr.header_len() + 5,
+        hop_limit: 64,
+    });
+    let mut bytes = vec![0; udp_repr.header_len() + 5];
+    udp_repr.emit(
+        &mut UdpPacket::new_unchecked(&mut bytes),
+        &ip_repr.src_addr(),
+        &ip_repr.dst_addr(),
+        5,
+        |payload| payload.copy_from_slice(b"hello"),
+        &ChecksumCapabilities::default(),
+    );
+    (ip_repr, bytes)
+}
+
+#[test]
+#[cfg(all(
+    feature = "alloc",
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "socket-udp"
+))]
+fn udp_ingress_handler_consumed_bypasses_socket_and_icmp() {
+    use crate::socket::udp;
+    use alloc::sync::Arc;
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let handler = Arc::new(TestUdpIngressHandler {
+        result: crate::iface::UdpIngressResult::Consumed,
+        calls: core::sync::atomic::AtomicUsize::new(0),
+    });
+    sockets.set_udp_ingress_handler(Some(handler.clone()));
+
+    let rx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 15]);
+    let tx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 15]);
+    let handle = sockets.add(udp::Socket::new(rx_buffer, tx_buffer));
+    sockets.get_mut::<udp::Socket>(handle).bind(68).unwrap();
+
+    let (ip_repr, packet) = udp_ingress_test_packet();
+    assert_eq!(
+        iface
+            .inner
+            .process_udp(&mut sockets, PacketMeta::default(), false, ip_repr, &packet,),
+        None
+    );
+    assert!(!sockets.get::<udp::Socket>(handle).can_recv());
+
+    sockets.remove(handle);
+    let (ip_repr, packet) = udp_ingress_test_packet();
+    assert_eq!(
+        iface
+            .inner
+            .process_udp(&mut sockets, PacketMeta::default(), false, ip_repr, &packet,),
+        None
+    );
+    assert_eq!(handler.calls.load(core::sync::atomic::Ordering::Relaxed), 2);
+}
+
+#[test]
+#[cfg(all(
+    feature = "alloc",
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "socket-udp"
+))]
+fn udp_ingress_handler_not_handled_falls_back_to_socket() {
+    use crate::socket::udp;
+    use alloc::sync::Arc;
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let handler = Arc::new(TestUdpIngressHandler {
+        result: crate::iface::UdpIngressResult::NotHandled,
+        calls: core::sync::atomic::AtomicUsize::new(0),
+    });
+    sockets.set_udp_ingress_handler(Some(handler.clone()));
+
+    let rx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 15]);
+    let tx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 15]);
+    let handle = sockets.add(udp::Socket::new(rx_buffer, tx_buffer));
+    sockets.get_mut::<udp::Socket>(handle).bind(68).unwrap();
+
+    let (ip_repr, packet) = udp_ingress_test_packet();
+    assert_eq!(
+        iface
+            .inner
+            .process_udp(&mut sockets, PacketMeta::default(), false, ip_repr, &packet,),
+        None
+    );
+    assert_eq!(handler.calls.load(core::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        sockets.get_mut::<udp::Socket>(handle).recv().unwrap().0,
+        b"hello"
+    );
+}
+
 #[test]
 #[cfg(all(feature = "medium-ip", feature = "socket-tcp", feature = "proto-ipv6"))]
 pub fn tcp_not_accepted() {

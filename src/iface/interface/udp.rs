@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(all(feature = "alloc", feature = "socket-udp"))]
+use crate::iface::UdpIngressResult;
+
 #[cfg(feature = "socket-dns")]
 use crate::socket::dns::Socket as DnsSocket;
 
@@ -23,6 +26,26 @@ impl InterfaceInner {
             &dst_addr,
             &self.caps.checksum
         ));
+
+        #[cfg(all(feature = "alloc", feature = "socket-udp"))]
+        {
+            let is_broadcast = match &ip_repr {
+                #[cfg(feature = "proto-ipv4")]
+                IpRepr::Ipv4(repr) => self.is_broadcast_v4(repr.dst_addr),
+                #[cfg(feature = "proto-ipv6")]
+                IpRepr::Ipv6(_) => false,
+            };
+            if sockets.handle_udp_ingress(
+                meta,
+                &ip_repr,
+                &udp_repr,
+                is_broadcast,
+                udp_packet.payload(),
+            ) == UdpIngressResult::Consumed
+            {
+                return None;
+            }
+        }
 
         #[cfg(feature = "socket-udp")]
         for udp_socket in sockets

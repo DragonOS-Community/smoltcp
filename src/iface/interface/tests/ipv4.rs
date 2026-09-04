@@ -163,6 +163,44 @@ fn disabled_neighbor_discovery_flushes_cache_and_uses_direct_hardware_address() 
 }
 
 #[test]
+#[cfg(feature = "medium-ethernet")]
+fn flushing_neighbor_cache_clears_mappings_and_rate_limits_without_changing_policy() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let learned_addr = IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 10));
+    let rate_limited_addr = IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 11));
+    iface.inner.neighbor_cache.fill(
+        learned_addr,
+        HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[0x02, 0, 0, 0, 0, 10])),
+        Instant::ZERO,
+    );
+    iface
+        .inner
+        .neighbor_cache
+        .limit_rate(rate_limited_addr, Instant::ZERO);
+
+    iface.flush_neighbor_cache();
+
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&learned_addr, Instant::ZERO),
+        NeighborAnswer::NotFound
+    );
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&rate_limited_addr, Instant::ZERO),
+        NeighborAnswer::NotFound
+    );
+    assert!(iface.neighbor_discovery_enabled());
+
+    // An empty cache is a valid state and flushing it again is harmless.
+    iface.flush_neighbor_cache();
+}
+
+#[test]
 #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4-fragmentation"))]
 fn disabling_neighbor_discovery_drops_pending_fragment_with_cached_hardware_address() {
     let (mut iface, _, _) = setup(Medium::Ethernet);

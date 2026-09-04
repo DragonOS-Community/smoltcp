@@ -411,7 +411,7 @@ impl Interface {
         }
         self.inner.neighbor_discovery_enabled = enabled;
         if !enabled {
-            self.inner.neighbor_cache.flush();
+            self.flush_neighbor_cache();
         }
         #[cfg(feature = "_proto-fragmentation")]
         self.fragmenter.reset();
@@ -614,6 +614,17 @@ impl Interface {
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     pub fn invalidate_neighbor(&mut self, protocol_addr: IpAddress) {
         self.inner.neighbor_cache.remove(&protocol_addr);
+    }
+
+    /// Remove every dynamically learned neighbor mapping and discovery
+    /// rate-limit entry.
+    ///
+    /// This is a no-op when the cache is already empty. Link-state integrations
+    /// can use it when a link goes down so stale mappings are not reused after
+    /// the link comes back up, without changing neighbor discovery policy.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn flush_neighbor_cache(&mut self) {
+        self.inner.neighbor_cache.flush();
     }
 
     /// Enable or disable the AnyIP capability.

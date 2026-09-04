@@ -260,6 +260,10 @@ impl InterfaceInner {
         timestamp: Instant,
         eth_frame: &EthernetFrame<&'frame [u8]>,
     ) -> Option<EthernetPacket<'frame>> {
+        if !self.neighbor_discovery_enabled {
+            return None;
+        }
+
         let arp_packet = check!(ArpPacket::new_checked(eth_frame.payload()));
         let arp_repr = check!(ArpRepr::parse(&arp_packet));
 

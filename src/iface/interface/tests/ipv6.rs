@@ -636,6 +636,25 @@ fn ndisc_neighbor_advertisement_ethernet(#[case] medium: Medium) {
 
     let (mut iface, mut sockets, _device) = setup(medium);
 
+    iface.set_neighbor_discovery_enabled(false);
+    assert_eq!(
+        iface.inner.process_ipv6(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::default(),
+            &Ipv6Packet::new_checked(&data[..]).unwrap()
+        ),
+        None
+    );
+    iface.set_neighbor_discovery_enabled(true);
+    assert_eq!(
+        iface.inner.neighbor_cache.lookup(
+            &IpAddress::Ipv6(Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002)),
+            iface.inner.now,
+        ),
+        NeighborAnswer::NotFound,
+    );
+
     assert_eq!(
         iface.inner.process_ipv6(
             &mut sockets,
@@ -804,6 +823,51 @@ fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
         &ChecksumCapabilities::default(),
     );
 
+    iface.set_neighbor_discovery_enabled(false);
+    assert_eq!(
+        iface.inner.lookup_hardware_addr(
+            MockTxToken,
+            &IpAddress::Ipv6(remote_ip_addr),
+            &mut iface.fragmenter,
+        ),
+        Ok((HardwareAddress::Ethernet(local_hw_addr), MockTxToken))
+    );
+    let icmpv6_expected = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+        flags: NdiscNeighborFlags::SOLICITED,
+        target_addr: local_ip_addr,
+        lladdr: Some(local_hw_addr.into()),
+    });
+    let ipv6_expected = Ipv6Repr {
+        src_addr: local_ip_addr,
+        dst_addr: remote_ip_addr,
+        next_header: IpProtocol::Icmpv6,
+        hop_limit: 0xff,
+        payload_len: icmpv6_expected.buffer_len(),
+    };
+    assert_eq!(
+        iface.inner.process_ethernet(
+            &mut sockets,
+            PacketMeta::default(),
+            frame.into_inner(),
+            &mut iface.fragments
+        ),
+        Some(EthernetPacket::Ip(Packet::new_ipv6(
+            ipv6_expected,
+            IpPayload::Icmpv6(icmpv6_expected)
+        )))
+    );
+    iface.set_neighbor_discovery_enabled(true);
+    assert_eq!(
+        iface.inner.lookup_hardware_addr(
+            MockTxToken,
+            &IpAddress::Ipv6(remote_ip_addr),
+            &mut iface.fragmenter,
+        ),
+        Err(DispatchError::NeighborPending)
+    );
+
+    let frame = EthernetFrame::new_unchecked(&mut eth_bytes);
+
     let icmpv6_expected = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
         flags: NdiscNeighborFlags::SOLICITED,
         target_addr: local_ip_addr,
@@ -840,6 +904,36 @@ fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
             &mut iface.fragmenter,
         ),
         Ok((HardwareAddress::Ethernet(remote_hw_addr), MockTxToken))
+    );
+}
+
+#[rstest]
+#[case::malformed(RawHardwareAddress::from_bytes(&[0x02]))]
+#[case::non_unicast(RawHardwareAddress::from_bytes(&[0xff; 6]))]
+#[cfg(feature = "medium-ethernet")]
+fn disabled_neighbor_discovery_rejects_invalid_ns_source_lladdr(
+    #[case] source_lladdr: RawHardwareAddress,
+) {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let local_ip_addr = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 1);
+    let remote_ip_addr = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 2);
+    iface.set_neighbor_discovery_enabled(false);
+
+    assert_eq!(
+        iface.inner.process_ndisc(
+            Ipv6Repr {
+                src_addr: remote_ip_addr,
+                dst_addr: local_ip_addr.solicited_node(),
+                next_header: IpProtocol::Icmpv6,
+                hop_limit: 0xff,
+                payload_len: 0,
+            },
+            NdiscRepr::NeighborSolicit {
+                target_addr: local_ip_addr,
+                lladdr: Some(source_lladdr),
+            },
+        ),
+        None
     );
 }
 

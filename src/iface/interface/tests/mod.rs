@@ -59,6 +59,69 @@ fn test_new_panic() {
     Interface::new(config, &mut device, Instant::ZERO);
 }
 
+#[rstest]
+#[case::ip(Medium::Ip, 1200)]
+#[cfg(feature = "medium-ip")]
+#[case::ethernet(Medium::Ethernet, 1214)]
+#[cfg(feature = "medium-ethernet")]
+fn runtime_ip_mtu_updates_cached_capabilities(
+    #[case] medium: Medium,
+    #[case] expected_frame_mtu: usize,
+) {
+    let (mut iface, _, _) = setup(medium);
+
+    iface.set_ip_mtu(1200).unwrap();
+
+    assert_eq!(iface.inner.ip_mtu(), 1200);
+    assert_eq!(iface.inner.caps.max_transmission_unit, expected_frame_mtu);
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn runtime_ip_mtu_rejects_frame_size_overflow_without_mutation() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let before = iface.inner.caps.max_transmission_unit;
+
+    assert_eq!(
+        iface.set_ip_mtu(usize::MAX),
+        Err(IpMtuError::FrameSizeOverflow)
+    );
+    assert_eq!(iface.inner.caps.max_transmission_unit, before);
+}
+
+#[rstest]
+#[case::ip(Medium::Ip)]
+#[cfg(feature = "medium-ip")]
+#[case::ethernet(Medium::Ethernet)]
+#[cfg(feature = "medium-ethernet")]
+#[case::ieee802154(Medium::Ieee802154)]
+#[cfg(feature = "medium-ieee802154")]
+fn runtime_ip_mtu_rejects_unsafe_small_values_without_mutation(#[case] medium: Medium) {
+    let (mut iface, _, _) = setup(medium);
+    let before = iface.inner.caps.max_transmission_unit;
+
+    assert_eq!(iface.set_ip_mtu(67), Err(IpMtuError::TooSmall));
+    assert_eq!(iface.inner.caps.max_transmission_unit, before);
+    assert_eq!(iface.set_ip_mtu(68), Ok(()));
+    assert_eq!(iface.inner.ip_mtu(), 68);
+}
+
+#[rstest]
+#[case::ip(Medium::Ip)]
+#[cfg(feature = "medium-ip")]
+#[case::ethernet(Medium::Ethernet)]
+#[cfg(feature = "medium-ethernet")]
+#[case::ieee802154(Medium::Ieee802154)]
+#[cfg(feature = "medium-ieee802154")]
+fn runtime_ip_mtu_rejects_values_above_device_capability_without_mutation(#[case] medium: Medium) {
+    let (mut iface, _, _) = setup(medium);
+    let frame_mtu = iface.inner.caps.max_transmission_unit;
+    let max_ip_mtu = iface.inner.ip_mtu();
+
+    assert_eq!(iface.set_ip_mtu(max_ip_mtu + 1), Err(IpMtuError::TooLarge));
+    assert_eq!(iface.inner.caps.max_transmission_unit, frame_mtu);
+}
+
 #[cfg(feature = "socket-udp")]
 #[rstest]
 #[case::ip(Medium::Ip)]

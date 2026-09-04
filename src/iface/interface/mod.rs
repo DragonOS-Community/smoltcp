@@ -120,6 +120,23 @@ pub enum Ipv4PacketDispatchError {
     NeighborPending { retry_at: Instant },
 }
 
+/// Error returned when an IP MTU cannot be used by the interface.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum IpMtuError {
+    /// The IP MTU is below the minimum supported by the stack.
+    TooSmall,
+    /// The requested MTU exceeds the device capability captured at creation.
+    TooLarge,
+    /// Adding the link-layer header to the IP MTU overflowed `usize`.
+    FrameSizeOverflow,
+}
+
+// IPv4 requires hosts to accept datagrams of at least 68 bytes. This also keeps
+// every currently supported transport/header calculation non-negative (the
+// largest one is DHCPv4's 60-byte IPv4 header plus its 8-byte UDP header).
+const MIN_IP_MTU: usize = 68;
+
 /// A  network interface.
 ///
 /// The network interface logically owns a number of other data structures; to avoid
@@ -140,11 +157,14 @@ pub struct Interface {
 /// exclusively). However, it is still possible to call methods on its `inner` field.
 pub struct InterfaceInner {
     pub caps: DeviceCapabilities,
+    max_frame_mtu: usize,
     pub now: Instant,
     rand: Rand,
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     neighbor_cache: NeighborCache,
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    neighbor_discovery_enabled: bool,
     hardware_addr: HardwareAddress,
     #[cfg(feature = "medium-ieee802154")]
     sequence_no: u8,
@@ -209,6 +229,7 @@ impl Interface {
     /// the medium of the device.
     pub fn new(config: Config, device: &mut (impl Device + ?Sized), now: Instant) -> Self {
         let caps = device.capabilities();
+        let max_frame_mtu = caps.max_transmission_unit;
         assert_eq!(
             config.hardware_addr.medium(),
             caps.medium,
@@ -263,6 +284,7 @@ impl Interface {
             inner: InterfaceInner {
                 now,
                 caps,
+                max_frame_mtu,
                 hardware_addr: config.hardware_addr,
                 ip_addrs: Vec::new(),
                 any_ip: false,
@@ -270,6 +292,8 @@ impl Interface {
                 routes: Routes::new(),
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
+                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+                neighbor_discovery_enabled: true,
                 #[cfg(feature = "multicast")]
                 multicast: multicast::State::new(),
                 #[cfg(feature = "medium-ieee802154")]
@@ -334,6 +358,63 @@ impl Interface {
 
         InterfaceInner::check_hardware_addr(&addr);
         self.inner.hardware_addr = addr;
+    }
+
+    /// Set the IP-layer maximum transmission unit used by this interface.
+    ///
+    /// The cached device capabilities are updated immediately, so socket MSS
+    /// calculation and packet fragmentation observe the new value without
+    /// reconstructing the interface. A pending native IPv4 fragmentation
+    /// sequence re-evaluates this value for every continuation fragment.
+    /// Route-selected egress overrides intentionally retain their own MTU.
+    pub fn set_ip_mtu(&mut self, ip_mtu: usize) -> Result<(), IpMtuError> {
+        if ip_mtu < MIN_IP_MTU {
+            return Err(IpMtuError::TooSmall);
+        }
+
+        let frame_mtu = match self.inner.caps.medium {
+            #[cfg(feature = "medium-ethernet")]
+            Medium::Ethernet => ip_mtu
+                .checked_add(EthernetFrame::<&[u8]>::header_len())
+                .ok_or(IpMtuError::FrameSizeOverflow)?,
+            #[cfg(feature = "medium-ip")]
+            Medium::Ip => ip_mtu,
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => ip_mtu,
+        };
+        if frame_mtu > self.inner.max_frame_mtu {
+            return Err(IpMtuError::TooLarge);
+        }
+        self.inner.caps.max_transmission_unit = frame_mtu;
+        Ok(())
+    }
+
+    /// Return whether dynamic link-layer neighbor discovery is enabled.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn neighbor_discovery_enabled(&self) -> bool {
+        self.inner.neighbor_discovery_enabled
+    }
+
+    /// Enable or disable dynamic ARP/NDISC neighbor discovery.
+    ///
+    /// Disabling discovery drops dynamically learned mappings and rate-limit
+    /// state. Unknown unicast neighbors then use the interface hardware address
+    /// directly, matching the Linux `IFF_NOARP` neighbor initialization model,
+    /// without transmitting discovery packets. Explicit hardware addresses
+    /// supplied by an integration remain authoritative.
+    /// Changing modes drops any pending fragmentation sequence because it may
+    /// have cached a link-layer destination selected under the previous mode.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn set_neighbor_discovery_enabled(&mut self, enabled: bool) {
+        if self.inner.neighbor_discovery_enabled == enabled {
+            return;
+        }
+        self.inner.neighbor_discovery_enabled = enabled;
+        if !enabled {
+            self.inner.neighbor_cache.flush();
+        }
+        #[cfg(feature = "_proto-fragmentation")]
+        self.fragmenter.reset();
     }
 
     /// Get the IP addresses of the interface.
@@ -516,10 +597,12 @@ impl Interface {
             return false;
         }
         self.inner.now = timestamp;
-        self.inner
-            .neighbor_cache
-            .lookup(&protocol_addr, timestamp)
-            .found()
+        !self.inner.neighbor_discovery_enabled
+            || self
+                .inner
+                .neighbor_cache
+                .lookup(&protocol_addr, timestamp)
+                .found()
     }
 
     /// Invalidate one dynamically learned neighbor and its discovery
@@ -1131,9 +1214,15 @@ impl InterfaceInner {
         match self.route(addr, self.now) {
             Some(_routed_addr) => match self.caps.medium {
                 #[cfg(feature = "medium-ethernet")]
-                Medium::Ethernet => self.neighbor_cache.lookup(&_routed_addr, self.now).found(),
+                Medium::Ethernet => {
+                    !self.neighbor_discovery_enabled
+                        || self.neighbor_cache.lookup(&_routed_addr, self.now).found()
+                }
                 #[cfg(feature = "medium-ieee802154")]
-                Medium::Ieee802154 => self.neighbor_cache.lookup(&_routed_addr, self.now).found(),
+                Medium::Ieee802154 => {
+                    !self.neighbor_discovery_enabled
+                        || self.neighbor_cache.lookup(&_routed_addr, self.now).found()
+                }
                 #[cfg(feature = "medium-ip")]
                 Medium::Ip => true,
             },
@@ -1224,6 +1313,10 @@ impl InterfaceInner {
             };
 
             return Ok((hardware_addr, tx_token));
+        }
+
+        if !self.neighbor_discovery_enabled {
+            return Ok((self.hardware_addr, tx_token));
         }
 
         match self.neighbor_cache.lookup(next_hop, self.now) {

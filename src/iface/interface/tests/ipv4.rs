@@ -202,6 +202,24 @@ fn flushing_neighbor_cache_clears_mappings_and_rate_limits_without_changing_poli
 
 #[test]
 #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4-fragmentation"))]
+fn flushing_neighbor_cache_drops_fragment_with_stale_link_layer_destination() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    iface.fragmenter.packet_len = 100;
+    iface.fragmenter.sent_bytes = 40;
+    iface.fragmenter.ipv4.dst_hardware_addr = EthernetAddress::from_bytes(&[0x02, 0, 0, 0, 0, 99]);
+
+    iface.flush_neighbor_cache();
+
+    assert!(iface.fragmenter.is_empty());
+    assert_eq!(
+        iface.fragmenter.ipv4.dst_hardware_addr,
+        EthernetAddress::default()
+    );
+    assert!(iface.neighbor_discovery_enabled());
+}
+
+#[test]
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4-fragmentation"))]
 fn disabling_neighbor_discovery_drops_pending_fragment_with_cached_hardware_address() {
     let (mut iface, _, _) = setup(Medium::Ethernet);
     iface.fragmenter.packet_len = 100;

@@ -37,6 +37,7 @@ impl TxToken for CapturingTxToken {
 #[cfg(feature = "medium-ethernet")]
 fn explicit_ipv4_dispatch_uses_supplied_next_hop_neighbor() {
     let (mut iface, _, _) = setup(Medium::Ethernet);
+    iface.set_neighbor_discovery_enabled(false);
     let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
     let destination_mac = EthernetAddress::from_bytes(&[0x02, 0, 0, 0, 0, 9]);
     let packet = serialized_ipv4_packet(Ipv4Address::new(198, 51, 100, 7));
@@ -111,6 +112,89 @@ fn explicit_ipv4_dispatch_emits_rate_limited_arp_for_missing_neighbor() {
         Instant::from_millis(20),
     );
     assert!(iface.is_neighbor_resolved(Instant::from_millis(20), IpAddress::Ipv4(next_hop)));
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn disabled_neighbor_discovery_flushes_cache_and_uses_direct_hardware_address() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    let next_hop = Ipv4Address::new(192, 168, 1, 99);
+    let learned_mac = EthernetAddress::from_bytes(&[0x02, 0, 0, 0, 0, 99]);
+    let local_mac = iface.hardware_addr().ethernet_or_panic();
+    let packet = serialized_ipv4_packet(Ipv4Address::new(198, 51, 100, 7));
+    iface.inner.neighbor_cache.fill(
+        IpAddress::Ipv4(next_hop),
+        HardwareAddress::Ethernet(learned_mac),
+        Instant::from_millis(1),
+    );
+
+    iface.set_neighbor_discovery_enabled(false);
+    assert!(!iface.neighbor_discovery_enabled());
+    assert!(iface.inner.has_neighbor(&IpAddress::Ipv4(next_hop)));
+    assert!(iface.is_neighbor_resolved(Instant::from_millis(10), IpAddress::Ipv4(next_hop)));
+    assert_eq!(
+        iface.dispatch_ipv4_packet(
+            Instant::from_millis(10),
+            CapturingTxToken(frames.clone()),
+            next_hop,
+            None,
+            &packet,
+        ),
+        Ok(())
+    );
+
+    let frames = frames.borrow();
+    assert_eq!(frames.len(), 1);
+    let frame = EthernetFrame::new_checked(&frames[0]).unwrap();
+    assert_eq!(frame.ethertype(), EthernetProtocol::Ipv4);
+    assert_eq!(frame.dst_addr(), local_mac);
+    drop(frames);
+
+    iface.set_neighbor_discovery_enabled(true);
+    assert_eq!(
+        iface.inner.lookup_hardware_addr(
+            MockTxToken,
+            &IpAddress::Ipv4(next_hop),
+            &mut iface.fragmenter,
+        ),
+        Err(DispatchError::NeighborPending)
+    );
+}
+
+#[test]
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4-fragmentation"))]
+fn disabling_neighbor_discovery_drops_pending_fragment_with_cached_hardware_address() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    iface.fragmenter.packet_len = 100;
+    iface.fragmenter.sent_bytes = 40;
+    iface.fragmenter.ipv4.dst_hardware_addr = EthernetAddress::from_bytes(&[0x02, 0, 0, 0, 0, 99]);
+
+    iface.set_neighbor_discovery_enabled(false);
+
+    assert!(iface.fragmenter.is_empty());
+    assert_eq!(
+        iface.fragmenter.ipv4.dst_hardware_addr,
+        EthernetAddress::default()
+    );
+}
+
+#[test]
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4-fragmentation"))]
+fn enabling_neighbor_discovery_drops_pending_direct_fragment() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    iface.set_neighbor_discovery_enabled(false);
+    iface.fragmenter.packet_len = 100;
+    iface.fragmenter.sent_bytes = 40;
+    iface.fragmenter.ipv4.dst_hardware_addr = iface.hardware_addr().ethernet_or_panic();
+
+    iface.set_neighbor_discovery_enabled(true);
+
+    assert!(iface.fragmenter.is_empty());
+    assert_eq!(
+        iface.fragmenter.ipv4.dst_hardware_addr,
+        EthernetAddress::default()
+    );
 }
 
 #[test]
@@ -685,6 +769,28 @@ fn test_handle_valid_arp_request(#[case] medium: Medium) {
     let mut packet = ArpPacket::new_unchecked(frame.payload_mut());
     repr.emit(&mut packet);
 
+    iface.set_neighbor_discovery_enabled(false);
+    assert_eq!(
+        iface.inner.process_ethernet(
+            &mut sockets,
+            PacketMeta::default(),
+            frame.into_inner(),
+            &mut iface.fragments
+        ),
+        None
+    );
+    iface.set_neighbor_discovery_enabled(true);
+    assert_eq!(
+        iface.inner.lookup_hardware_addr(
+            MockTxToken,
+            &IpAddress::Ipv4(remote_ip_addr),
+            &mut iface.fragmenter,
+        ),
+        Err(DispatchError::NeighborPending)
+    );
+
+    let frame = EthernetFrame::new_unchecked(&mut eth_bytes);
+
     // Ensure an ARP Request for us triggers an ARP Reply
     assert_eq!(
         iface.inner.process_ethernet(
@@ -711,6 +817,74 @@ fn test_handle_valid_arp_request(#[case] medium: Medium) {
         ),
         Ok((HardwareAddress::Ethernet(remote_hw_addr), MockTxToken))
     );
+}
+
+#[test]
+#[cfg(all(feature = "proto-ipv4-fragmentation", feature = "medium-ip"))]
+fn pending_native_fragments_observe_runtime_mtu_change() {
+    use core::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Clone)]
+    struct BoundedTxToken {
+        limit: usize,
+        lengths: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl TxToken for BoundedTxToken {
+        fn consume<R, F>(self, len: usize, f: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            assert!(len <= self.limit);
+            self.lengths.borrow_mut().push(len);
+            let mut buffer = vec![0; len];
+            f(&mut buffer)
+        }
+    }
+
+    let (mut iface, _, _) = setup(Medium::Ip);
+    iface.set_ip_mtu(1200).unwrap();
+    let lengths = Rc::new(RefCell::new(Vec::new()));
+    let payload = vec![0xa5; 1800];
+    let packet = Packet::new_ipv4(
+        Ipv4Repr {
+            src_addr: Ipv4Address::new(192, 0, 2, 1),
+            dst_addr: Ipv4Address::new(198, 51, 100, 1),
+            next_header: IpProtocol::Udp,
+            payload_len: payload.len(),
+            hop_limit: 64,
+        },
+        IpPayload::Raw(&payload),
+    );
+
+    iface
+        .inner
+        .dispatch_ip(
+            BoundedTxToken {
+                limit: 1200,
+                lengths: lengths.clone(),
+            },
+            PacketMeta::default(),
+            packet,
+            &mut iface.fragmenter,
+        )
+        .unwrap();
+    assert!(!iface.fragmenter.finished());
+
+    iface.set_ip_mtu(576).unwrap();
+    iface.inner.dispatch_ipv4_frag(
+        BoundedTxToken {
+            limit: 576,
+            lengths: lengths.clone(),
+        },
+        &mut iface.fragmenter,
+    );
+
+    let lengths = lengths.borrow();
+    assert_eq!(lengths.len(), 2);
+    assert!(lengths[0] <= 1200);
+    assert!(lengths[1] <= 576);
 }
 
 #[rstest]

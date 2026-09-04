@@ -455,6 +455,10 @@ impl InterfaceInner {
                 target_addr,
                 flags,
             } => {
+                if !self.neighbor_discovery_enabled {
+                    return None;
+                }
+
                 let ip_addr = ip_repr.src_addr.into();
                 if let Some(lladdr) = lladdr {
                     let lladdr = check!(lladdr.parse(self.caps.medium));
@@ -474,13 +478,19 @@ impl InterfaceInner {
                 lladdr,
                 ..
             } => {
+                if !target_addr.x_is_unicast() {
+                    return None;
+                }
+
                 if let Some(lladdr) = lladdr {
                     let lladdr = check!(lladdr.parse(self.caps.medium));
-                    if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
+                    if !lladdr.is_unicast() {
                         return None;
                     }
-                    self.neighbor_cache
-                        .fill(ip_repr.src_addr.into(), lladdr, self.now);
+                    if self.neighbor_discovery_enabled {
+                        self.neighbor_cache
+                            .fill(ip_repr.src_addr.into(), lladdr, self.now);
+                    }
                 }
 
                 if self.has_solicited_node(ip_repr.dst_addr) && self.has_ip_addr(target_addr) {

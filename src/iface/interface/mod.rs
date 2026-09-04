@@ -522,6 +522,17 @@ impl Interface {
             .found()
     }
 
+    /// Invalidate one dynamically learned neighbor and its discovery
+    /// rate-limit state without disturbing unrelated cache entries.
+    ///
+    /// Control planes that temporarily override dynamic resolution can use
+    /// this when removing the override, ensuring the next packet performs
+    /// fresh neighbor discovery instead of reviving a stale mapping.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn invalidate_neighbor(&mut self, protocol_addr: IpAddress) {
+        self.inner.neighbor_cache.remove(&protocol_addr);
+    }
+
     /// Enable or disable the AnyIP capability.
     ///
     /// AnyIP allowins packets to be received

@@ -212,6 +212,12 @@ impl Cache {
         self.silent_until.clear();
     }
 
+    /// Remove one cached mapping and its discovery rate-limit state.
+    pub(crate) fn remove(&mut self, protocol_addr: &IpAddress) {
+        self.storage.remove(protocol_addr);
+        self.silent_until.remove(protocol_addr);
+    }
+
     /// 获取ARP缓存条目的迭代器
     pub fn iter(&self) -> impl Iterator<Item = (&IpAddress, &Neighbor)> {
         self.storage.iter()
@@ -378,5 +384,27 @@ mod test {
         assert!(!cache
             .lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0))
             .found());
+    }
+
+    #[test]
+    fn test_remove_one_mapping_and_rate_limit() {
+        let mut cache = Cache::new();
+        let first = IpAddress::from(MOCK_IP_ADDR_1);
+        let second = IpAddress::from(MOCK_IP_ADDR_2);
+
+        cache.fill(first, HADDR_A, Instant::from_millis(0));
+        cache.fill(second, HADDR_B, Instant::from_millis(0));
+        cache.limit_rate(first, Instant::from_millis(0));
+
+        cache.remove(&first);
+
+        assert_eq!(
+            cache.lookup(&first, Instant::from_millis(100)),
+            Answer::NotFound
+        );
+        assert_eq!(
+            cache.lookup(&second, Instant::from_millis(100)),
+            Answer::Found(HADDR_B)
+        );
     }
 }

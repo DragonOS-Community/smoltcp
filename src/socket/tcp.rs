@@ -949,6 +949,15 @@ impl<'a> Socket<'a> {
         self.set_state(State::Listen);
     }
 
+    pub(crate) fn accepts_listener_endpoint(&self, address: IpAddress, port: u16) -> bool {
+        let address_matches = match self.listen_endpoint.addr {
+            Some(addr) if addr.is_unspecified() => addr.version() == address.version(),
+            Some(addr) => addr == address,
+            None => true,
+        };
+        address_matches && port != 0 && port == self.listen_endpoint.port
+    }
+
     fn reset(&mut self) {
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
@@ -986,6 +995,9 @@ impl<'a> Socket<'a> {
     }
 
     /// Start listening on the given endpoint.
+    ///
+    /// An unspecified address matches all addresses of that address family.
+    /// An endpoint with no address matches both enabled IP families.
     ///
     /// This function returns `Err(Error::InvalidState)` if the socket was already open
     /// (see [is_open](#method.is_open)), and `Err(Error::Unaddressable)`
@@ -1638,11 +1650,7 @@ impl<'a> Socket<'a> {
                 && repr.src_port == tuple.remote.port
         } else {
             // We're listening, reject packets not matching the listen endpoint.
-            let addr_ok = match self.listen_endpoint.addr {
-                Some(addr) => ip_repr.dst_addr() == addr,
-                None => true,
-            };
-            addr_ok && repr.dst_port != 0 && repr.dst_port == self.listen_endpoint.port
+            self.accepts_listener_endpoint(ip_repr.dst_addr(), repr.dst_port)
         }
     }
 

@@ -43,3 +43,34 @@ impl InterfaceInner {
         }
     }
 }
+
+#[cfg(all(test, feature = "medium-ip"))]
+mod tests {
+    use super::*;
+    use crate::socket::tcp::SocketBuffer;
+
+    fn listener(addr: Option<IpAddress>) -> Socket<'static> {
+        let mut socket = Socket::new(
+            SocketBuffer::new(vec![0; 256]),
+            SocketBuffer::new(vec![0; 256]),
+        );
+        socket.listen(IpListenEndpoint { addr, port: 80 }).unwrap();
+        socket
+    }
+
+    fn identified(addr: Option<IpAddress>, id: u64) -> Socket<'static> {
+        let mut socket = listener(addr);
+        socket.set_listener_id(Some(id));
+        socket
+    }
+
+    #[test]
+    fn listener_identity_close_and_reinitialize() {
+        let mut socket = identified(None, 7);
+        socket.close();
+        assert_eq!(socket.listener_id(), None);
+        socket.set_listener_id(Some(8));
+        socket.listen(80).unwrap();
+        assert_eq!(socket.listener_id(), None);
+    }
+}

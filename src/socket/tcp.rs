@@ -435,6 +435,8 @@ pub struct Socket<'a> {
     /// Address passed to listen(). Listen address is set when listen() is called and
     /// used every time the socket is reset back to the LISTEN state.
     listen_endpoint: IpListenEndpoint,
+    listener_id: Option<u64>,
+    listener_enabled: bool,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
@@ -535,6 +537,8 @@ impl<'a> Socket<'a> {
             keep_alive: None,
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
+            listener_id: None,
+            listener_enabled: true,
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
@@ -895,6 +899,65 @@ impl<'a> Socket<'a> {
         self.remote_has_sack
     }
 
+    /// Opaque identity shared by the slots of one logical listener.
+    ///
+    /// Set this after `listen` succeeds. It survives passive connection establishment
+    /// and a SYN-RECEIVED reset back to LISTEN. Clear it before handing a connection
+    /// to the application. `close`, `abort`, and reinitialization clear the identity.
+    /// Internal connection failures retain it so ingress can rearm the listening
+    /// slot before another packet is selected.
+    pub fn set_listener_id(&mut self, listener_id: Option<u64>) {
+        self.listener_id = listener_id;
+    }
+
+    /// Return the logical listener identity, if registered by the caller.
+    pub fn listener_id(&self) -> Option<u64> {
+        self.listener_id
+    }
+
+    /// Enable or disable selection for new passive connections without changing
+    /// the opaque identity or interfering with an existing connection tuple.
+    /// New, explicitly closed, and reinitialized sockets are enabled by default.
+    pub fn set_listener_enabled(&mut self, enabled: bool) {
+        self.listener_enabled = enabled;
+    }
+
+    /// Whether this slot participates in selection for new passive connections.
+    pub fn listener_enabled(&self) -> bool {
+        self.listener_enabled
+    }
+
+    /// Recover a failed pending connection before ingress selects another packet.
+    /// Explicit close/abort and accepted connections have no listener identity,
+    /// so they cannot be revived here. Preserve activation across internal failure.
+    pub(crate) fn rearm_listener(&mut self) {
+        if self.state != State::Closed
+            || self.listener_id.is_none()
+            || self.listen_endpoint.port == 0
+        {
+            return;
+        }
+        let (endpoint, id, enabled) = (
+            self.listen_endpoint,
+            self.listener_id,
+            self.listener_enabled,
+        );
+        self.reset();
+        self.listen_endpoint = endpoint;
+        self.listener_id = id;
+        self.listener_enabled = enabled;
+        self.set_state(State::Listen);
+    }
+
+    pub(crate) fn accepts_listener_endpoint(&self, address: IpAddress, port: u16) -> bool {
+        let address_matches = match self.listen_endpoint.addr {
+            Some(addr) if addr.is_unspecified() => addr.version() == address.version(),
+            Some(addr) => addr == address,
+            None => true,
+        };
+        address_matches && port != 0 && port == self.listen_endpoint.port
+    }
+
     fn reset(&mut self) {
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
@@ -908,6 +971,8 @@ impl<'a> Socket<'a> {
         self.rx_fin_received = false;
         self.rx_shutdown = false;
         self.listen_endpoint = IpListenEndpoint::default();
+        self.listener_id = None;
+        self.listener_enabled = true;
         self.tuple = None;
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
@@ -930,6 +995,9 @@ impl<'a> Socket<'a> {
     }
 
     /// Start listening on the given endpoint.
+    ///
+    /// An unspecified address matches all addresses of that address family.
+    /// An endpoint with no address matches both enabled IP families.
     ///
     /// This function returns `Err(Error::InvalidState)` if the socket was already open
     /// (see [is_open](#method.is_open)), and `Err(Error::Unaddressable)`
@@ -1077,6 +1145,8 @@ impl<'a> Socket<'a> {
     /// connection; only the remote end can close it. If you no longer wish to receive any
     /// data and would like to reuse the socket right away, use [abort](#method.abort).
     pub fn close(&mut self) {
+        self.listener_id = None;
+        self.listener_enabled = true;
         match self.state {
             // In the LISTEN state there is no established connection.
             State::Listen => self.set_state(State::Closed),
@@ -1107,6 +1177,8 @@ impl<'a> Socket<'a> {
     /// In terms of the TCP state machine, the socket may be in any state and is moved to
     /// the `CLOSED` state.
     pub fn abort(&mut self) {
+        self.listener_id = None;
+        self.listener_enabled = true;
         self.set_state(State::Closed);
     }
 
@@ -1578,11 +1650,7 @@ impl<'a> Socket<'a> {
                 && repr.src_port == tuple.remote.port
         } else {
             // We're listening, reject packets not matching the listen endpoint.
-            let addr_ok = match self.listen_endpoint.addr {
-                Some(addr) => ip_repr.dst_addr() == addr,
-                None => true,
-            };
-            addr_ok && repr.dst_port != 0 && repr.dst_port == self.listen_endpoint.port
+            self.accepts_listener_endpoint(ip_repr.dst_addr(), repr.dst_port)
         }
     }
 
@@ -2441,7 +2509,11 @@ impl<'a> Socket<'a> {
         } else if self.timer.should_close(cx.now()) {
             // If we have spent enough time in the TIME-WAIT state, close the socket.
             tcp_trace!("TIME-WAIT timer expired");
-            self.reset();
+            self.set_state(State::Closed);
+            self.rearm_listener();
+            if self.state == State::Closed {
+                self.reset();
+            }
             return Ok(());
         } else {
             return Ok(());

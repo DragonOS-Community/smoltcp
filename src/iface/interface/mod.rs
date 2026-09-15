@@ -160,6 +160,8 @@ pub struct InterfaceInner {
     max_frame_mtu: usize,
     pub now: Instant,
     rand: Rand,
+    #[cfg(feature = "socket-tcp")]
+    tcp_listener_seed: u64,
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     neighbor_cache: NeighborCache,
@@ -307,6 +309,8 @@ impl Interface {
                 #[cfg(feature = "proto-sixlowpan")]
                 sixlowpan_address_context: Vec::new(),
                 rand,
+                #[cfg(feature = "socket-tcp")]
+                tcp_listener_seed: config.random_seed,
             },
         }
     }

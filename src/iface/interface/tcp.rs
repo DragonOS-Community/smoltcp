@@ -29,6 +29,16 @@ impl InterfaceInner {
             }
         }
 
+        #[cfg(feature = "alloc")]
+        if tcp_repr.control == TcpControl::Syn
+            && tcp_repr.ack_number.is_none()
+            && sockets.tcp_is_listening(IpEndpoint::new(dst_addr, tcp_repr.dst_port))
+        {
+            // A logical listener still exists, but all of its socket slots are
+            // occupied. Let the peer retransmit instead of reporting a closed port.
+            return None;
+        }
+
         if tcp_repr.control == TcpControl::Rst
             || ip_repr.dst_addr().is_unspecified()
             || ip_repr.src_addr().is_unspecified()

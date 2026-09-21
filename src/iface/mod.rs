@@ -24,6 +24,8 @@ pub use self::interface::{
 };
 
 pub use self::route::{Route, RouteTableFull, Routes};
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+pub use self::socket_set::TcpListenRegistry;
 pub use self::socket_set::{SocketHandle, SocketSet, SocketStorage};
 #[cfg(all(feature = "alloc", feature = "socket-udp"))]
 pub use self::socket_set::{UdpIngressHandler, UdpIngressResult};

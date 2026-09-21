@@ -13,8 +13,8 @@ use crate::socket::{Context, PollAt};
 use crate::storage::{Assembler, RingBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
-    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TcpControl, TcpRepr, TcpSeqNumber,
-    TcpTimestampGenerator, TcpTimestampRepr, TCP_HEADER_LEN,
+    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, IpVersion, TcpControl, TcpRepr,
+    TcpSeqNumber, TcpTimestampGenerator, TcpTimestampRepr, TCP_HEADER_LEN,
 };
 
 mod congestion;
@@ -435,6 +435,9 @@ pub struct Socket<'a> {
     /// Address passed to listen(). Listen address is set when listen() is called and
     /// used every time the socket is reset back to the LISTEN state.
     listen_endpoint: IpListenEndpoint,
+    /// Optional IP version constraint for incoming connections. Unlike the listen
+    /// endpoint, this is configuration and survives resetting the connection.
+    listen_ip_version: Option<IpVersion>,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
@@ -535,6 +538,7 @@ impl<'a> Socket<'a> {
             keep_alive: None,
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
+            listen_ip_version: None,
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
@@ -862,6 +866,22 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn listen_endpoint(&self) -> IpListenEndpoint {
         self.listen_endpoint
+    }
+
+    /// Return the IP version constraint for incoming connections.
+    pub fn listen_ip_version(&self) -> Option<IpVersion> {
+        self.listen_ip_version
+    }
+
+    /// Restrict incoming connections to one IP version, or allow either with `None`
+    /// (the default). This also applies to concrete listen addresses, which must
+    /// match both the address and the constraint.
+    ///
+    /// The constraint survives closing, aborting and listening again. It does not
+    /// affect an existing connection, which is matched using its four-tuple, or
+    /// restrict active connections made with [`Self::connect`].
+    pub fn set_listen_ip_version(&mut self, version: Option<IpVersion>) {
+        self.listen_ip_version = version;
     }
 
     /// Return the local endpoint, or None if not connected.
@@ -1578,6 +1598,12 @@ impl<'a> Socket<'a> {
                 && repr.src_port == tuple.remote.port
         } else {
             // We're listening, reject packets not matching the listen endpoint.
+            if self
+                .listen_ip_version
+                .is_some_and(|version| version != ip_repr.version())
+            {
+                return false;
+            }
             let addr_ok = match self.listen_endpoint.addr {
                 Some(addr) => ip_repr.dst_addr() == addr,
                 None => true,
@@ -3260,6 +3286,77 @@ mod test {
         let mut s = socket();
         s.listen(LOCAL_PORT).unwrap();
         sanity!(s, socket_listen());
+    }
+
+    #[test]
+    #[cfg(all(feature = "proto-ipv4", feature = "proto-ipv6"))]
+    fn test_listen_ip_version_matching() {
+        use crate::wire::{Ipv4Address, Ipv4Repr, Ipv6Address, Ipv6Repr};
+
+        let packets = [
+            IpRepr::Ipv4(Ipv4Repr {
+                src_addr: Ipv4Address::new(192, 0, 2, 1),
+                dst_addr: Ipv4Address::new(192, 0, 2, 2),
+                next_header: IpProtocol::Tcp,
+                payload_len: 20,
+                hop_limit: 64,
+            }),
+            IpRepr::Ipv6(Ipv6Repr {
+                src_addr: Ipv6Address::LOCALHOST,
+                dst_addr: Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
+                next_header: IpProtocol::Tcp,
+                payload_len: 20,
+                hop_limit: 64,
+            }),
+        ];
+        let syn = TcpRepr {
+            control: TcpControl::Syn,
+            ack_number: None,
+            ..SEND_TEMPL
+        };
+        for constraint in [None, Some(IpVersion::Ipv4), Some(IpVersion::Ipv6)] {
+            let mut s = socket();
+            assert_eq!(s.listen_ip_version(), None);
+            s.set_listen_ip_version(constraint);
+            s.listen(LOCAL_PORT).unwrap();
+            for packet in &packets {
+                let expected = constraint.map_or(true, |v| v == packet.version());
+                assert_eq!(s.socket.accepts(&mut s.cx, packet, &syn), expected);
+                // Reopening the socket must not clear its configured constraint.
+                s.abort();
+                s.listen(LOCAL_PORT).unwrap();
+                assert_eq!(s.listen_ip_version(), constraint);
+                assert_eq!(s.socket.accepts(&mut s.cx, packet, &syn), expected);
+            }
+            for local in &packets {
+                s.abort();
+                s.listen((local.dst_addr(), LOCAL_PORT)).unwrap();
+                for packet in &packets {
+                    let expected = packet.dst_addr() == local.dst_addr()
+                        && constraint.map_or(true, |v| v == packet.version());
+                    assert_eq!(s.socket.accepts(&mut s.cx, packet, &syn), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "proto-ipv4", feature = "proto-ipv6"))]
+    fn test_listen_ip_version_does_not_filter_existing_tuple() {
+        let mut s = socket_established();
+        let packet = IpReprIpvX(IpvXRepr {
+            src_addr: REMOTE_ADDR,
+            dst_addr: LOCAL_ADDR,
+            next_header: IpProtocol::Tcp,
+            payload_len: 20,
+            hop_limit: 64,
+        });
+        let other = match packet.version() {
+            IpVersion::Ipv4 => IpVersion::Ipv6,
+            IpVersion::Ipv6 => IpVersion::Ipv4,
+        };
+        s.set_listen_ip_version(Some(other));
+        assert!(s.socket.accepts(&mut s.cx, &packet, &SEND_TEMPL));
     }
 
     #[test]

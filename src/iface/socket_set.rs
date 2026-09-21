@@ -1,13 +1,15 @@
 use core::fmt;
 use managed::ManagedSlice;
 
-#[cfg(all(feature = "alloc", feature = "socket-udp"))]
+#[cfg(all(feature = "alloc", any(feature = "socket-udp", feature = "socket-tcp")))]
 use alloc::sync::Arc;
 
 use super::socket_meta::Meta;
 #[cfg(all(feature = "alloc", feature = "socket-udp"))]
 use crate::phy::PacketMeta;
 use crate::socket::{AnySocket, Socket};
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+use crate::wire::IpEndpoint;
 #[cfg(all(feature = "alloc", feature = "socket-udp"))]
 use crate::wire::{IpRepr, UdpRepr};
 
@@ -40,6 +42,17 @@ pub trait UdpIngressHandler: fmt::Debug + Send + Sync {
         is_broadcast: bool,
         payload: &[u8],
     ) -> UdpIngressResult;
+}
+
+/// Optional registry of logical TCP listeners whose socket slots may be exhausted.
+///
+/// Queried only for a validated new SYN that no TCP socket accepts. Returning true
+/// suppresses the closed-port reset so that the peer can retry when a slot is free.
+/// Implementations must reflect listener removal and must not reenter the socket
+/// set or acquire locks held by its caller.
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+pub trait TcpListenRegistry: fmt::Debug + Send + Sync {
+    fn is_listening(&self, local_endpoint: IpEndpoint) -> bool;
 }
 
 /// Opaque struct with space for storing one socket.
@@ -81,6 +94,8 @@ impl fmt::Display for SocketHandle {
 #[derive(Debug)]
 pub struct SocketSet<'a> {
     sockets: ManagedSlice<'a, SocketStorage<'a>>,
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    tcp_listen_registry: Option<Arc<dyn TcpListenRegistry>>,
     #[cfg(all(feature = "alloc", feature = "socket-udp"))]
     udp_ingress_handler: Option<Arc<dyn UdpIngressHandler>>,
 }
@@ -94,9 +109,27 @@ impl<'a> SocketSet<'a> {
         let sockets = sockets.into();
         SocketSet {
             sockets,
+            #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+            tcp_listen_registry: None,
             #[cfg(all(feature = "alloc", feature = "socket-udp"))]
             udp_ingress_handler: None,
         }
+    }
+
+    /// Install or remove the external TCP listener registry, returning the previous one.
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub fn set_tcp_listen_registry(
+        &mut self,
+        registry: Option<Arc<dyn TcpListenRegistry>>,
+    ) -> Option<Arc<dyn TcpListenRegistry>> {
+        core::mem::replace(&mut self.tcp_listen_registry, registry)
+    }
+
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub(crate) fn tcp_is_listening(&self, endpoint: IpEndpoint) -> bool {
+        self.tcp_listen_registry
+            .as_ref()
+            .map_or(false, |registry| registry.is_listening(endpoint))
     }
 
     /// Install or remove the external UDP ingress handler.

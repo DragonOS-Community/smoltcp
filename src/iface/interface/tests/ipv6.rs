@@ -1,5 +1,343 @@
 use super::*;
 
+#[derive(Clone)]
+struct CapturedIpv6(std::rc::Rc<core::cell::RefCell<Vec<Vec<u8>>>>);
+
+impl TxToken for CapturedIpv6 {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        let mut bytes = vec![0; len];
+        let result = f(&mut bytes);
+        self.0.borrow_mut().push(bytes);
+        result
+    }
+}
+
+fn routed_ipv6_bytes() -> Vec<u8> {
+    let repr = Ipv6Repr {
+        src_addr: Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+        dst_addr: Ipv6Address::new(0xfd01, 0, 0, 0, 0, 0, 0, 7),
+        next_header: IpProtocol::Ipv6NoNxt,
+        payload_len: 0,
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0; 40];
+    repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes));
+    bytes
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn global_source_ns_reply_uses_ingress_link_without_source_route() {
+    let (mut iface, mut sockets, _) = setup(Medium::Ethernet);
+    let local = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 1);
+    // Deliberately outside every configured prefix, with no default route.
+    let remote = Ipv6Address::new(0x2001, 0xdb8, 0x1234, 0, 0, 0, 0, 9);
+    let remote_mac = EthernetAddress([2, 0, 0, 0, 0, 9]);
+    let solicitation = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+        target_addr: local,
+        lladdr: Some(remote_mac.into()),
+    });
+    let ip = Ipv6Repr {
+        src_addr: remote,
+        dst_addr: local.solicited_node(),
+        next_header: IpProtocol::Icmpv6,
+        payload_len: solicitation.buffer_len(),
+        hop_limit: 255,
+    };
+    let mut bytes = vec![0; 14 + 40 + solicitation.buffer_len()];
+    let mut frame = EthernetFrame::new_unchecked(&mut bytes);
+    frame.set_src_addr(remote_mac);
+    frame.set_dst_addr(EthernetAddress([0x33, 0x33, 0xff, 0, 0, 1]));
+    frame.set_ethertype(EthernetProtocol::Ipv6);
+    ip.emit(&mut Ipv6Packet::new_unchecked(frame.payload_mut()));
+    solicitation.emit(
+        &remote,
+        &ip.dst_addr,
+        &mut Icmpv6Packet::new_unchecked(&mut frame.payload_mut()[40..]),
+        &ChecksumCapabilities::default(),
+    );
+    let Some(EthernetPacket::Ip(reply)) = iface.inner.process_ethernet(
+        &mut sockets,
+        PacketMeta::default(),
+        frame.into_inner(),
+        &mut iface.fragments,
+    ) else {
+        panic!("valid NS must generate a neighbor advertisement");
+    };
+    // Learning a neighbor is not a route: ordinary IP output still fails.
+    assert_eq!(
+        iface
+            .inner
+            .lookup_hardware_addr(MockTxToken, &remote.into(), &mut iface.fragmenter),
+        Err(DispatchError::NoRoute)
+    );
+    let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    assert_eq!(
+        iface.inner.dispatch_ip(
+            CapturedIpv6(frames.clone()),
+            PacketMeta::default(),
+            reply,
+            &mut iface.fragmenter,
+        ),
+        Ok(())
+    );
+    let captured = frames.borrow();
+    assert_eq!(captured.len(), 1);
+    let frame = EthernetFrame::new_checked(&captured[0]).unwrap();
+    assert_eq!(frame.dst_addr(), remote_mac);
+    let packet = Ipv6Packet::new_checked(frame.payload()).unwrap();
+    assert_eq!(packet.dst_addr(), remote);
+    assert_eq!(packet.hop_limit(), 255);
+    let icmp = Icmpv6Packet::new_checked(packet.payload()).unwrap();
+    assert!(matches!(
+        Icmpv6Repr::parse(&local, &remote, &icmp, &ChecksumCapabilities::default()).unwrap(),
+        Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert { target_addr, .. }) if target_addr == local
+    ));
+    drop(captured);
+    let echo = Icmpv6Repr::EchoReply {
+        ident: 1,
+        seq_no: 1,
+        data: &[],
+    };
+    assert_eq!(
+        iface.inner.dispatch_ip(
+            CapturedIpv6(frames.clone()),
+            PacketMeta::default(),
+            Packet::new_ipv6(
+                Ipv6Repr {
+                    src_addr: local,
+                    dst_addr: remote,
+                    next_header: IpProtocol::Icmpv6,
+                    hop_limit: 64,
+                    payload_len: echo.buffer_len(),
+                },
+                IpPayload::Icmpv6(echo)
+            ),
+            &mut iface.fragmenter,
+        ),
+        Err(DispatchError::NoRoute)
+    );
+    assert_eq!(frames.borrow().len(), 1);
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn explicit_ipv6_dispatch_preserves_packet_and_next_hop() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    let mac = EthernetAddress([2, 0, 0, 0, 0, 9]);
+    let hop = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 9).into();
+    let bytes = routed_ipv6_bytes();
+    assert_eq!(
+        iface.dispatch_ip_packet(
+            Instant::ZERO,
+            CapturedIpv6(frames.clone()),
+            hop,
+            Some(HardwareAddress::Ethernet(mac)),
+            &bytes
+        ),
+        Ok(())
+    );
+    let frames = frames.borrow();
+    let frame = EthernetFrame::new_checked(&frames[0]).unwrap();
+    assert_eq!(frame.ethertype(), EthernetProtocol::Ipv6);
+    assert_eq!(frame.dst_addr(), mac);
+    assert_eq!(frame.payload(), &bytes);
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn explicit_ipv6_dispatch_discovers_and_retries_neighbor() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    let hop = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 9);
+    let bytes = routed_ipv6_bytes();
+    for _ in 0..2 {
+        assert_eq!(
+            iface.dispatch_ip_packet(
+                Instant::ZERO,
+                CapturedIpv6(frames.clone()),
+                hop.into(),
+                None,
+                &bytes
+            ),
+            Err(IpPacketDispatchError::NeighborPending {
+                retry_at: Instant::from_millis(1000)
+            })
+        );
+    }
+    assert_eq!(frames.borrow().len(), 1);
+    {
+        let frames = frames.borrow();
+        let frame = EthernetFrame::new_checked(&frames[0]).unwrap();
+        let ip = Ipv6Packet::new_checked(frame.payload()).unwrap();
+        assert_eq!(ip.hop_limit(), 255);
+        assert_eq!(ip.dst_addr(), hop.solicited_node());
+        assert_eq!(
+            Icmpv6Packet::new_checked(ip.payload()).unwrap().msg_type(),
+            Icmpv6Message::NeighborSolicit
+        );
+    }
+    iface.inner.neighbor_cache.fill(
+        hop.into(),
+        HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 9])),
+        Instant::ZERO,
+    );
+    assert_eq!(
+        iface.dispatch_ip_packet(
+            Instant::ZERO,
+            CapturedIpv6(frames.clone()),
+            hop.into(),
+            None,
+            &bytes
+        ),
+        Ok(())
+    );
+    assert_eq!(frames.borrow().len(), 2);
+}
+
+#[test]
+#[cfg(feature = "medium-ip")]
+fn explicit_ipv6_dispatch_validates_complete_packet() {
+    let (mut iface, _, _) = setup(Medium::Ip);
+    let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    let hop = Ipv6Address::LOCALHOST.into();
+    let mut bytes = routed_ipv6_bytes();
+    assert_eq!(
+        iface.dispatch_ip_packet(
+            Instant::ZERO,
+            CapturedIpv6(frames.clone()),
+            hop,
+            None,
+            &bytes
+        ),
+        Ok(())
+    );
+    assert_eq!(frames.borrow()[0], bytes);
+    bytes.push(0);
+    assert_eq!(
+        iface.dispatch_ip_packet(
+            Instant::ZERO,
+            CapturedIpv6(frames.clone()),
+            hop,
+            None,
+            &bytes
+        ),
+        Err(IpPacketDispatchError::Malformed)
+    );
+    assert_eq!(
+        iface.dispatch_ip_packet(
+            Instant::ZERO,
+            CapturedIpv6(frames.clone()),
+            hop,
+            None,
+            &bytes[..10]
+        ),
+        Err(IpPacketDispatchError::Malformed)
+    );
+    #[cfg(feature = "proto-ipv4")]
+    assert_eq!(
+        iface.dispatch_ip_packet(
+            Instant::ZERO,
+            CapturedIpv6(frames.clone()),
+            Ipv4Address::LOCALHOST.into(),
+            None,
+            &bytes[..40]
+        ),
+        Err(IpPacketDispatchError::Malformed)
+    );
+    assert_eq!(frames.borrow().len(), 1);
+}
+
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-raw"))]
+fn ipv6_rejects_oversized_route_before_consuming_token() {
+    struct SmallRoute;
+    impl TxToken for SmallRoute {
+        fn egress_override(
+            &mut self,
+            _: IpVersion,
+            _: IpAddress,
+            _: PacketMeta,
+        ) -> Result<Option<crate::phy::TxEgressOverride>, crate::phy::TxEgressError> {
+            Ok(Some(crate::phy::TxEgressOverride {
+                medium: Medium::Ip,
+                ip_mtu: 1280,
+                context: [0; 3],
+            }))
+        }
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, _: usize, _: F) -> R {
+            panic!("oversized IPv6 must not consume a device buffer");
+        }
+    }
+    let (mut iface, _, _) = setup(Medium::Ip);
+    let data = [0; 1280];
+    let packet = Packet::new_ipv6(
+        Ipv6Repr {
+            src_addr: Ipv6Address::LOCALHOST,
+            dst_addr: Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 9),
+            next_header: IpProtocol::Udp,
+            payload_len: data.len(),
+            hop_limit: 64,
+        },
+        IpPayload::Raw(&data),
+    );
+    assert_eq!(
+        iface.inner.dispatch_ip(
+            SmallRoute,
+            PacketMeta::default(),
+            packet,
+            &mut iface.fragmenter
+        ),
+        Err(DispatchError::NoRoute)
+    );
+}
+
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "medium-ethernet"))]
+fn ipv6_ndisc_does_not_query_external_egress() {
+    struct LinkOnly;
+    impl TxToken for LinkOnly {
+        fn egress_override(
+            &mut self,
+            _: IpVersion,
+            _: IpAddress,
+            _: PacketMeta,
+        ) -> Result<Option<crate::phy::TxEgressOverride>, crate::phy::TxEgressError> {
+            panic!("NDP must stay on its physical link");
+        }
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+            f(&mut vec![0; len])
+        }
+    }
+    let (mut iface, _, _) = setup(Medium::Ip);
+    let addr = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 9);
+    let icmp = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+        flags: NdiscNeighborFlags::SOLICITED,
+        target_addr: addr,
+        lladdr: None,
+    });
+    let packet = Packet::new_ipv6(
+        Ipv6Repr {
+            src_addr: Ipv6Address::LOCALHOST,
+            dst_addr: addr,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: icmp.buffer_len(),
+            hop_limit: 255,
+        },
+        IpPayload::Icmpv6(icmp),
+    );
+    assert_eq!(
+        iface.inner.dispatch_ip(
+            LinkOnly,
+            PacketMeta::default(),
+            packet,
+            &mut iface.fragmenter
+        ),
+        Ok(())
+    );
+}
+
 fn parse_ipv6(data: &[u8]) -> crate::wire::Result<Packet<'_>> {
     let ipv6_header = Ipv6Packet::new_checked(data)?;
     let ipv6 = Ipv6Repr::parse(&ipv6_header)?;

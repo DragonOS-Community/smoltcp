@@ -818,6 +818,8 @@ impl Interface {
         sockets: &mut SocketSet<'_>,
     ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
+        #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+        sockets.expire_tcp_time_wait(timestamp);
 
         #[cfg(feature = "_proto-fragmentation")]
         self.fragments.assembler.remove_expired(timestamp);
@@ -843,7 +845,7 @@ impl Interface {
 
         let inner = &mut self.inner;
 
-        sockets
+        let active = sockets
             .items()
             .filter_map(move |item| {
                 let socket_poll_at = item.socket.poll_at(inner);
@@ -856,7 +858,18 @@ impl Interface {
                     PollAt::Now => Some(Instant::from_millis(0)),
                 }
             })
-            .min()
+            .min();
+        #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+        {
+            return active
+                .into_iter()
+                .chain(sockets.tcp_time_wait_poll_at())
+                .min();
+        }
+        #[cfg(not(all(feature = "alloc", feature = "socket-tcp")))]
+        {
+            active
+        }
     }
 
     /// Return an _advisory wait time_ for calling [poll] the next time.
@@ -954,6 +967,8 @@ impl Interface {
         sockets: &mut SocketSet<'_>,
     ) -> PollResult {
         let _caps = device.capabilities();
+        #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+        sockets.expire_tcp_time_wait(self.inner.now);
 
         enum EgressError {
             Exhausted,

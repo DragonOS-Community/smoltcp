@@ -19,15 +19,33 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
-        for tcp_socket in sockets
-            .items_mut()
-            .filter_map(|i| Socket::downcast_mut(&mut i.socket))
-        {
-            if tcp_socket.accepts_ingress(meta) && tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
-                let tx_meta = tcp_socket.egress_meta();
-                return tcp_socket
-                    .process(self, &ip_repr, &tcp_repr)
-                    .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)).with_tx_meta(tx_meta));
+        #[cfg(feature = "alloc")]
+        if let Some(result) = sockets.process_tcp_sockets(self, meta, &ip_repr, &tcp_repr) {
+            return result
+                .map(|(tx, ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)).with_tx_meta(tx));
+        }
+
+        for listening in [false, true] {
+            for tcp_socket in sockets
+                .items_mut()
+                .filter_map(|i| Socket::downcast_mut(&mut i.socket))
+            {
+                if tcp_socket.is_listening() != listening {
+                    continue;
+                }
+                #[cfg(feature = "alloc")]
+                if !tcp_socket.is_listening() {
+                    continue;
+                }
+                if tcp_socket.accepts_ingress(meta) && tcp_socket.accepts(self, &ip_repr, &tcp_repr)
+                {
+                    let tx_meta = tcp_socket.egress_meta();
+                    return tcp_socket
+                        .process(self, &ip_repr, &tcp_repr)
+                        .map(|(ip, tcp)| {
+                            Packet::new(ip, IpPayload::Tcp(tcp)).with_tx_meta(tx_meta)
+                        });
+                }
             }
         }
 

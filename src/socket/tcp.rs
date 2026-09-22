@@ -2,6 +2,8 @@
 // the parts of RFC 1122 that discuss TCP, as well as RFC 7323 for some of the TCP options.
 // Consult RFC 7414 when implementing a new feature.
 
+#[cfg(feature = "alloc")]
+use alloc::sync::Arc;
 use core::fmt::Display;
 #[cfg(feature = "packetmeta-id")]
 use core::num::NonZeroU32;
@@ -21,6 +23,38 @@ use crate::wire::{
 };
 
 mod congestion;
+mod time_wait;
+pub(crate) use time_wait::{TimeWaitAction, TimeWaitState};
+
+/// Linux-style active TIME-WAIT reuse selection. Explicitly bound ports and
+/// automatically selected ephemeral ports have different safety policies.
+#[derive(Debug, Clone, Copy)]
+pub enum TimeWaitReuse {
+    Explicit,
+    Automatic { loopback: bool },
+}
+
+/// Optional integration-owned connection identity. Called synchronously while
+/// the socket set is locked; implementations must not reenter that socket set.
+/// `prepare_open` is the final fallible step of opening a connection.
+#[cfg(feature = "alloc")]
+pub trait LifecycleObserver: fmt::Debug + Send + Sync {
+    fn identity(&self) -> u64;
+    fn prepare_open(
+        &self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        device: u32,
+        replacing: Option<u64>,
+    ) -> bool;
+    fn on_state_change(
+        &self,
+        state: State,
+        local: Option<IpEndpoint>,
+        remote: Option<IpEndpoint>,
+        device: u32,
+    );
+}
 
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
@@ -52,6 +86,7 @@ impl std::error::Error for ListenError {}
 pub enum ConnectError {
     InvalidState,
     Unaddressable,
+    AddressInUse,
 }
 
 impl Display for ConnectError {
@@ -59,6 +94,7 @@ impl Display for ConnectError {
         match *self {
             ConnectError::InvalidState => write!(f, "invalid state"),
             ConnectError::Unaddressable => write!(f, "unaddressable destination"),
+            ConnectError::AddressInUse => write!(f, "connection identity already in use"),
         }
     }
 }
@@ -384,9 +420,9 @@ enum AckDelayTimer {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-struct Tuple {
-    local: IpEndpoint,
-    remote: IpEndpoint,
+pub(crate) struct Tuple {
+    pub local: IpEndpoint,
+    pub remote: IpEndpoint,
 }
 
 impl Display for Tuple {
@@ -501,10 +537,19 @@ pub struct Socket<'a> {
     congestion_controller: congestion::AnyController,
 
     /// tsval generator - if some, tcp timestamp is enabled
-    tsval_generator: Option<TcpTimestampGenerator>,
+    pub(crate) tsval_generator: Option<TcpTimestampGenerator>,
+    /// Administrative capability, independent of the current peer's negotiation.
+    configured_tsval_generator: Option<TcpTimestampGenerator>,
 
     /// 0 if not seen or timestamp not enabled
     last_remote_tsval: u32,
+    ts_recent: Option<(u32, Instant)>,
+    time_wait_duration: Duration,
+    pub(crate) time_wait: Option<TimeWaitState>,
+    #[cfg(feature = "alloc")]
+    pub(crate) lifecycle_observer: Option<Arc<dyn LifecycleObserver>>,
+    #[cfg(feature = "alloc")]
+    lifecycle_published: Option<(State, Option<Tuple>, u32)>,
 
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
@@ -515,6 +560,88 @@ pub struct Socket<'a> {
 const DEFAULT_MSS: usize = 536;
 
 impl<'a> Socket<'a> {
+    /// Configure the TIME-WAIT protection duration; existing deadlines are not changed.
+    pub fn set_time_wait_duration(&mut self, duration: Duration) {
+        assert!(duration > Duration::ZERO);
+        self.time_wait_duration = duration;
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn set_lifecycle_observer(&mut self, observer: Option<Arc<dyn LifecycleObserver>>) {
+        self.lifecycle_observer = observer;
+        self.lifecycle_published = None;
+        self.notify_lifecycle();
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn lifecycle_observer(&self) -> Option<&Arc<dyn LifecycleObserver>> {
+        self.lifecycle_observer.as_ref()
+    }
+
+    pub(crate) fn notify_lifecycle(&mut self) {
+        #[cfg(feature = "alloc")]
+        if let Some(observer) = &self.lifecycle_observer {
+            let state = (self.state, self.tuple, self.lifecycle_device());
+            if self.lifecycle_published == Some(state) {
+                return;
+            }
+            observer.on_state_change(
+                self.state,
+                self.local_endpoint(),
+                self.remote_endpoint(),
+                self.lifecycle_device(),
+            );
+            self.lifecycle_published = Some(state);
+        }
+    }
+
+    pub(crate) fn lifecycle_device(&self) -> u32 {
+        #[cfg(feature = "packetmeta-id")]
+        {
+            return self
+                .connection_bound_device
+                .or(self.listen_bound_device)
+                .map_or(0, |d| d.get());
+        }
+        #[cfg(not(feature = "packetmeta-id"))]
+        {
+            0
+        }
+    }
+
+    pub(crate) fn prepare_open(
+        &self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        replacing: Option<u64>,
+    ) -> bool {
+        #[cfg(feature = "alloc")]
+        if let Some(observer) = &self.lifecycle_observer {
+            return observer.prepare_open(local, remote, self.lifecycle_device(), replacing);
+        }
+        let _ = (local, remote, replacing);
+        true
+    }
+
+    pub(crate) fn lifecycle_identity(&self) -> Option<u64> {
+        #[cfg(feature = "alloc")]
+        {
+            return self.lifecycle_observer.as_ref().map(|o| o.identity());
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            None
+        }
+    }
+
+    pub(crate) fn retire_time_wait(&mut self) {
+        self.time_wait = None;
+        self.timer = Timer::new();
+        self.tuple = None;
+        self.set_state(State::Closed);
+        // Do not discard unread data belonging to a still-open application FD.
+        self.notify_lifecycle();
+    }
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
     pub fn new<T>(rx_buffer: T, tx_buffer: T) -> Socket<'a>
@@ -573,7 +700,15 @@ impl<'a> Socket<'a> {
             challenge_ack_timer: Instant::from_secs(0),
             nagle: true,
             tsval_generator: None,
+            configured_tsval_generator: None,
             last_remote_tsval: 0,
+            ts_recent: None,
+            time_wait_duration: CLOSE_DELAY,
+            time_wait: None,
+            #[cfg(feature = "alloc")]
+            lifecycle_observer: None,
+            #[cfg(feature = "alloc")]
+            lifecycle_published: None,
             congestion_controller: congestion::AnyController::new(),
 
             #[cfg(feature = "async")]
@@ -595,12 +730,18 @@ impl<'a> Socket<'a> {
 
     /// Enable or disable TCP Timestamp.
     pub fn set_tsval_generator(&mut self, generator: Option<TcpTimestampGenerator>) {
+        self.configured_tsval_generator = generator;
         self.tsval_generator = generator;
     }
 
     /// Return whether TCP Timestamp is enabled.
     pub fn timestamp_enabled(&self) -> bool {
         self.tsval_generator.is_some()
+    }
+
+    #[cfg(feature = "alloc")]
+    pub(crate) fn timestamp_configured(&self) -> bool {
+        self.configured_tsval_generator.is_some()
     }
 
     /// Set an algorithm for congestion control.
@@ -941,6 +1082,10 @@ impl<'a> Socket<'a> {
         self.rx_buffer.clear();
         self.rx_fin_received = false;
         self.rx_shutdown = false;
+        self.time_wait = None;
+        self.ts_recent = None;
+        self.last_remote_tsval = 0;
+        self.tsval_generator = self.configured_tsval_generator;
         self.listen_endpoint = IpListenEndpoint::default();
         self.tuple = None;
         self.local_seq_no = TcpSeqNumber::default();
@@ -998,6 +1143,7 @@ impl<'a> Socket<'a> {
         self.listen_endpoint = local_endpoint;
         self.tuple = None;
         self.set_state(State::Listen);
+        self.notify_lifecycle();
         Ok(())
     }
 
@@ -1083,6 +1229,20 @@ impl<'a> Socket<'a> {
             return Err(ConnectError::Unaddressable);
         }
 
+        if !self.prepare_open(local_endpoint, remote_endpoint, None) {
+            return Err(ConnectError::AddressInUse);
+        }
+        self.open_connection(cx, local_endpoint, remote_endpoint, None);
+        Ok(())
+    }
+
+    pub(crate) fn open_connection(
+        &mut self,
+        cx: &mut Context,
+        local_endpoint: IpEndpoint,
+        remote_endpoint: IpEndpoint,
+        reuse: Option<&TimeWaitState>,
+    ) {
         self.reset();
         self.tuple = Some(Tuple {
             local: local_endpoint,
@@ -1090,10 +1250,13 @@ impl<'a> Socket<'a> {
         });
         self.set_state(State::SynSent);
 
-        let seq = Self::random_seq_no(cx);
+        let seq = reuse.map_or_else(|| Self::random_seq_no(cx), TimeWaitState::new_isn);
         self.local_seq_no = seq;
         self.remote_last_seq = seq;
-        Ok(())
+        if let Some(old) = reuse {
+            self.ts_recent = old.ts_recent;
+        }
+        self.notify_lifecycle();
     }
 
     #[cfg(test)]
@@ -1132,6 +1295,7 @@ impl<'a> Socket<'a> {
             | State::LastAck
             | State::Closed => (),
         }
+        self.notify_lifecycle();
     }
 
     /// Aborts the connection, if any.
@@ -1143,6 +1307,8 @@ impl<'a> Socket<'a> {
     /// the `CLOSED` state.
     pub fn abort(&mut self) {
         self.set_state(State::Closed);
+        self.time_wait = None;
+        self.notify_lifecycle();
     }
 
     /// Shut down the receive half of the connection.
@@ -1680,6 +1846,83 @@ impl<'a> Socket<'a> {
         ip_repr: &IpRepr,
         repr: &TcpRepr,
     ) -> Option<(IpRepr, TcpRepr<'static>)> {
+        self.process_with_reuse(cx, ip_repr, repr, None)
+    }
+
+    pub(crate) fn process_with_reuse(
+        &mut self,
+        cx: &mut Context,
+        ip_repr: &IpRepr,
+        repr: &TcpRepr,
+        reuse: Option<(&TimeWaitState, Option<u64>)>,
+    ) -> Option<(IpRepr, TcpRepr<'static>)> {
+        if self.state == State::TimeWait {
+            self.ensure_time_wait(cx.now());
+            let tw = self.time_wait.as_mut().unwrap();
+            let result = match tw.process(cx.now(), repr) {
+                TimeWaitAction::Remove => {
+                    self.retire_time_wait();
+                    None
+                }
+                TimeWaitAction::Ack | TimeWaitAction::Reopen => tw.reply(cx.now(), repr),
+                TimeWaitAction::Ignore => None,
+            };
+            if let Some(tw) = &self.time_wait {
+                self.timer = Timer::Close {
+                    expires_at: tw.expires,
+                };
+            }
+            return result;
+        }
+        // Complete all rejecting checks before claiming an integration identity.
+        if self.state != State::Listen && time_wait::paws_reject(self.ts_recent, repr, cx.now()) {
+            return self.challenge_ack_reply(cx, ip_repr, repr);
+        }
+        if self.state == State::Listen
+            && repr.control == TcpControl::Syn
+            && repr.ack_number.is_none()
+        {
+            if repr.max_seg_size == Some(0)
+                || !self.prepare_open(
+                    IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
+                    IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
+                    reuse.and_then(|(_, id)| id),
+                )
+            {
+                return None;
+            }
+        }
+        let was_listen = self.state == State::Listen;
+        let result = self.process_inner(cx, ip_repr, repr);
+        if was_listen && self.state == State::SynReceived {
+            if let Some((old, _)) = reuse {
+                self.local_seq_no = old.new_isn();
+                self.remote_last_seq = self.local_seq_no;
+            }
+        }
+        if self.state == State::TimeWait {
+            self.ensure_time_wait(cx.now());
+        }
+        self.notify_lifecycle();
+        result
+    }
+
+    pub(crate) fn ensure_time_wait(&mut self, now: Instant) {
+        if self.state == State::TimeWait && self.time_wait.is_none() {
+            let mut state = TimeWaitState::from_socket(self, now);
+            // Entering the state establishes the deadline once; subsequent
+            // refreshes belong to TimeWaitState::process.
+            state.expires = now + self.time_wait_duration;
+            self.time_wait = Some(state);
+        }
+    }
+
+    fn process_inner(
+        &mut self,
+        cx: &mut Context,
+        ip_repr: &IpRepr,
+        repr: &TcpRepr,
+    ) -> Option<(IpRepr, TcpRepr<'static>)> {
         debug_assert!(self.accepts(cx, ip_repr, repr));
 
         // Consider how much the sequence number space differs from the transmit buffer space.
@@ -1947,6 +2190,12 @@ impl<'a> Socket<'a> {
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
                 tcp_trace!("received RST");
                 self.tuple = None;
+                // A recycled listen slot has no peer clock or ACK sequence.
+                // These belong to the rejected connection, not the listener.
+                self.ts_recent = None;
+                self.last_remote_tsval = 0;
+                self.tsval_generator = self.configured_tsval_generator;
+                self.remote_last_ack = None;
                 self.set_state(State::Listen);
                 return None;
             }
@@ -2240,6 +2489,13 @@ impl<'a> Socket<'a> {
         // update last remote tsval
         if let Some(timestamp) = repr.timestamp {
             self.last_remote_tsval = timestamp.tsval;
+            if self.tsval_generator.is_some()
+                && self
+                    .remote_last_ack
+                    .map_or(true, |ack| repr.seq_number <= ack)
+            {
+                self.ts_recent = Some((timestamp.tsval, cx.now()));
+            }
         }
 
         let payload_len = payload.len();
@@ -2419,7 +2675,7 @@ impl<'a> Socket<'a> {
         }
     }
 
-    fn ack_to_transmit(&self) -> bool {
+    pub(crate) fn ack_to_transmit(&self) -> bool {
         if let Some(remote_last_ack) = self.remote_last_ack {
             remote_last_ack < self.remote_seq_no + self.rx_buffer.len()
         } else {
@@ -2487,6 +2743,25 @@ impl<'a> Socket<'a> {
     where
         F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
+        let result = self.dispatch_inner(cx, ip_mtu, emit);
+        self.notify_lifecycle();
+        result
+    }
+
+    fn dispatch_inner<F, E>(&mut self, cx: &mut Context, ip_mtu: usize, emit: F) -> Result<(), E>
+    where
+        F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
+    {
+        if self.state == State::TimeWait {
+            self.ensure_time_wait(cx.now());
+            if self.time_wait.as_ref().unwrap().expires <= cx.now() {
+                self.retire_time_wait();
+                return Ok(());
+            }
+            self.timer = Timer::Close {
+                expires_at: self.time_wait.as_ref().unwrap().expires,
+            };
+        }
         if self.tuple.is_none() {
             self.output_ip_mtu = None;
             return Ok(());
@@ -2797,6 +3072,11 @@ impl<'a> Socket<'a> {
 
     #[allow(clippy::if_same_then_else)]
     pub fn poll_at(&self, cx: &mut Context) -> PollAt {
+        if let Some(tw) = &self.time_wait {
+            if !self.ack_to_transmit() {
+                return PollAt::Time(tw.expires);
+            }
+        }
         // The logic here mirrors the beginning of dispatch() closely.
         if self.tuple.is_none() {
             // No one to talk to, nothing to transmit.

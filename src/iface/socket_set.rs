@@ -1,4 +1,7 @@
 use core::fmt;
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+#[path = "tcp_time_wait.rs"]
+mod tcp_time_wait;
 use managed::ManagedSlice;
 
 #[cfg(all(feature = "alloc", any(feature = "socket-udp", feature = "socket-tcp")))]
@@ -96,6 +99,8 @@ impl fmt::Display for SocketHandle {
 pub struct SocketSet<'a> {
     sockets: ManagedSlice<'a, SocketStorage<'a>>,
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    time_wait: tcp_time_wait::TimeWaitTable,
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     tcp_listen_registry: Option<Arc<dyn TcpListenRegistry>>,
     #[cfg(all(feature = "alloc", feature = "socket-udp"))]
     udp_ingress_handler: Option<Arc<dyn UdpIngressHandler>>,
@@ -110,6 +115,8 @@ impl<'a> SocketSet<'a> {
         let sockets = sockets.into();
         SocketSet {
             sockets,
+            #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+            time_wait: tcp_time_wait::TimeWaitTable::default(),
             #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
             tcp_listen_registry: None,
             #[cfg(all(feature = "alloc", feature = "socket-udp"))]

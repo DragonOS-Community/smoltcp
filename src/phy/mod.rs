@@ -143,8 +143,9 @@ pub use self::tuntap_interface::TunTapInterface;
 /// struct becomes zero-sized, which allows the compiler to optimize it out as if
 /// the packet metadata mechanism didn't exist at all.
 ///
-/// Currently only UDP sockets allow setting/retrieving packet metadata. The metadata
-/// for packets emitted with other sockets will be all default values.
+/// UDP sockets allow setting/retrieving packet metadata. TCP sockets can constrain
+/// their ingress and egress device using the `packetmeta-id` field. Other sockets
+/// emit packets with default metadata.
 ///
 /// This struct is marked as `#[non_exhaustive]`. This means it is not possible to
 /// create it directly by specifying all fields. You have to instead create it with

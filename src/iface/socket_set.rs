@@ -52,7 +52,8 @@ pub trait UdpIngressHandler: fmt::Debug + Send + Sync {
 /// set or acquire locks held by its caller.
 #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
 pub trait TcpListenRegistry: fmt::Debug + Send + Sync {
-    fn is_listening(&self, local_endpoint: IpEndpoint) -> bool;
+    /// Match the local endpoint and the ingress device in packet metadata.
+    fn is_listening(&self, local_endpoint: IpEndpoint, meta: crate::phy::PacketMeta) -> bool;
 }
 
 /// Opaque struct with space for storing one socket.
@@ -126,10 +127,14 @@ impl<'a> SocketSet<'a> {
     }
 
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
-    pub(crate) fn tcp_is_listening(&self, endpoint: IpEndpoint) -> bool {
+    pub(crate) fn tcp_is_listening(
+        &self,
+        endpoint: IpEndpoint,
+        meta: crate::phy::PacketMeta,
+    ) -> bool {
         self.tcp_listen_registry
             .as_ref()
-            .map_or(false, |registry| registry.is_listening(endpoint))
+            .map_or(false, |registry| registry.is_listening(endpoint, meta))
     }
 
     /// Install or remove the external UDP ingress handler.

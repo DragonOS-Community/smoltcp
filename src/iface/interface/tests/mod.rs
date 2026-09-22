@@ -401,6 +401,7 @@ pub fn tcp_not_accepted() {
     assert_eq!(
         iface.inner.process_tcp(
             &mut sockets,
+            PacketMeta::default(),
             IpRepr::Ipv6(Ipv6Repr {
                 src_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
                 dst_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
@@ -445,6 +446,7 @@ pub fn tcp_not_accepted() {
     assert_eq!(
         iface.inner.process_tcp(
             &mut sockets,
+            PacketMeta::default(),
             IpRepr::Ipv6(Ipv6Repr {
                 src_addr: Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
                 dst_addr: Ipv6Address::UNSPECIFIED,

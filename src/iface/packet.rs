@@ -1,4 +1,4 @@
-use crate::phy::DeviceCapabilities;
+use crate::phy::{DeviceCapabilities, PacketMeta};
 use crate::wire::*;
 
 #[allow(clippy::large_enum_variant)]
@@ -33,6 +33,7 @@ impl<'p> Packet<'p> {
     #[cfg(feature = "proto-ipv4")]
     pub fn new_ipv4(ip_repr: Ipv4Repr, payload: IpPayload<'p>) -> Self {
         Self::Ipv4(PacketV4 {
+            tx_meta: PacketMeta::default(),
             header: ip_repr,
             payload,
         })
@@ -41,6 +42,7 @@ impl<'p> Packet<'p> {
     #[cfg(feature = "proto-ipv6")]
     pub fn new_ipv6(ip_repr: Ipv6Repr, payload: IpPayload<'p>) -> Self {
         Self::Ipv6(PacketV6 {
+            tx_meta: PacketMeta::default(),
             header: ip_repr,
             #[cfg(feature = "proto-ipv6-hbh")]
             hop_by_hop: None,
@@ -50,6 +52,26 @@ impl<'p> Packet<'p> {
             routing: None,
             payload,
         })
+    }
+
+    /// Explicit output metadata, independent of the packet that elicited a reply.
+    pub fn tx_meta(&self) -> PacketMeta {
+        match self {
+            #[cfg(feature = "proto-ipv4")]
+            Self::Ipv4(p) => p.tx_meta,
+            #[cfg(feature = "proto-ipv6")]
+            Self::Ipv6(p) => p.tx_meta,
+        }
+    }
+
+    pub fn with_tx_meta(mut self, meta: PacketMeta) -> Self {
+        match &mut self {
+            #[cfg(feature = "proto-ipv4")]
+            Self::Ipv4(p) => p.tx_meta = meta,
+            #[cfg(feature = "proto-ipv6")]
+            Self::Ipv6(p) => p.tx_meta = meta,
+        }
+        self
     }
 
     pub fn ip_repr(&self) -> IpRepr {
@@ -179,6 +201,7 @@ impl<'p> Packet<'p> {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg(feature = "proto-ipv4")]
 pub struct PacketV4<'p> {
+    tx_meta: PacketMeta,
     header: Ipv4Repr,
     payload: IpPayload<'p>,
 }
@@ -187,6 +210,7 @@ pub struct PacketV4<'p> {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg(feature = "proto-ipv6")]
 pub struct PacketV6<'p> {
+    pub tx_meta: PacketMeta,
     pub header: Ipv6Repr,
     #[cfg(feature = "proto-ipv6-hbh")]
     pub hop_by_hop: Option<Ipv6HopByHopRepr<'p>>,

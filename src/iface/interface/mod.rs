@@ -871,7 +871,7 @@ impl Interface {
                     {
                         if let Err(err) = self.inner.dispatch_ip(
                             tx_token,
-                            PacketMeta::default(),
+                            packet.tx_meta(),
                             packet,
                             &mut self.fragmenter,
                         ) {
@@ -887,7 +887,7 @@ impl Interface {
                     {
                         if let Err(err) = self.inner.dispatch_ip(
                             tx_token,
-                            PacketMeta::default(),
+                            packet.tx_meta(),
                             packet,
                             &mut self.fragmenter,
                         ) {
@@ -985,13 +985,12 @@ impl Interface {
                     })
                 }
                 #[cfg(feature = "socket-tcp")]
-                Socket::Tcp(socket) => socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
-                    respond(
-                        inner,
-                        PacketMeta::default(),
-                        Packet::new(ip, IpPayload::Tcp(tcp)),
-                    )
-                }),
+                Socket::Tcp(socket) => {
+                    let meta = socket.egress_meta();
+                    socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
+                        respond(inner, meta, Packet::new(ip, IpPayload::Tcp(tcp)))
+                    })
+                }
                 #[cfg(feature = "socket-dhcpv4")]
                 Socket::Dhcpv4(socket) => {
                     socket.dispatch(&mut self.inner, |inner, (ip, udp, dhcp)| {
@@ -1204,7 +1203,7 @@ impl InterfaceInner {
                 })
             }
             EthernetPacket::Ip(packet) => {
-                self.dispatch_ip(tx_token, PacketMeta::default(), packet, frag)
+                self.dispatch_ip(tx_token, packet.tx_meta(), packet, frag)
             }
         }
     }
@@ -1624,16 +1623,19 @@ impl InterfaceInner {
             }
             // We don't support IPv6 fragmentation yet.
             #[cfg(feature = "proto-ipv6")]
-            IpRepr::Ipv6(_) => tx_token.consume(total_len, |mut tx_buffer| {
-                #[cfg(feature = "medium-ethernet")]
-                if matches!(tx_medium, Medium::Ethernet) {
-                    emit_ethernet(&ip_repr, tx_buffer)?;
-                    tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
-                }
+            IpRepr::Ipv6(_) => {
+                tx_token.set_meta(meta);
+                tx_token.consume(total_len, |mut tx_buffer| {
+                    #[cfg(feature = "medium-ethernet")]
+                    if matches!(tx_medium, Medium::Ethernet) {
+                        emit_ethernet(&ip_repr, tx_buffer)?;
+                        tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
+                    }
 
-                emit_ip(&ip_repr, tx_buffer);
-                Ok(())
-            }),
+                    emit_ip(&ip_repr, tx_buffer);
+                    Ok(())
+                })
+            }
         }
     }
 }

@@ -3,10 +3,13 @@
 // Consult RFC 7414 when implementing a new feature.
 
 use core::fmt::Display;
+#[cfg(feature = "packetmeta-id")]
+use core::num::NonZeroU32;
 #[cfg(feature = "async")]
 use core::task::Waker;
 use core::{fmt, mem};
 
+use crate::phy::PacketMeta;
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
 use crate::socket::{Context, PollAt};
@@ -438,6 +441,10 @@ pub struct Socket<'a> {
     /// Optional IP version constraint for incoming connections. Unlike the listen
     /// endpoint, this is configuration and survives resetting the connection.
     listen_ip_version: Option<IpVersion>,
+    #[cfg(feature = "packetmeta-id")]
+    listen_bound_device: Option<NonZeroU32>,
+    #[cfg(feature = "packetmeta-id")]
+    connection_bound_device: Option<NonZeroU32>,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
@@ -539,6 +546,10 @@ impl<'a> Socket<'a> {
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
             listen_ip_version: None,
+            #[cfg(feature = "packetmeta-id")]
+            listen_bound_device: None,
+            #[cfg(feature = "packetmeta-id")]
+            connection_bound_device: None,
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
@@ -1578,6 +1589,53 @@ impl<'a> Socket<'a> {
             && segment_end > window_start
     }
 
+    /// Set the device constraint for future passive connections.
+    ///
+    /// Existing handshakes and connections retain their device. A handshake
+    /// reset back to LISTEN uses the latest setting. Device IDs are supplied by
+    /// the embedding application's RX packet metadata; `None` accepts any device.
+    #[cfg(feature = "packetmeta-id")]
+    pub fn set_listen_bound_device(&mut self, device: Option<NonZeroU32>) {
+        self.listen_bound_device = device;
+    }
+
+    /// Set the device constraint for this connection and future listening.
+    /// The constraint survives connection resets. Outgoing packet metadata uses
+    /// this device ID, or zero when unconstrained.
+    #[cfg(feature = "packetmeta-id")]
+    pub fn set_bound_device(&mut self, device: Option<NonZeroU32>) {
+        self.listen_bound_device = device;
+        self.connection_bound_device = device;
+    }
+
+    /// Return the device constraint currently used for input and output.
+    #[cfg(feature = "packetmeta-id")]
+    pub fn bound_device(&self) -> Option<NonZeroU32> {
+        if self.state == State::Listen {
+            self.listen_bound_device
+        } else {
+            self.connection_bound_device
+        }
+    }
+
+    pub(crate) fn accepts_ingress(&self, _meta: PacketMeta) -> bool {
+        #[cfg(feature = "packetmeta-id")]
+        if let Some(device) = self.bound_device() {
+            return device.get() == _meta.id;
+        }
+        true
+    }
+
+    pub(crate) fn egress_meta(&self) -> PacketMeta {
+        #[allow(unused_mut)]
+        let mut meta = PacketMeta::default();
+        #[cfg(feature = "packetmeta-id")]
+        {
+            meta.id = self.bound_device().map_or(0, NonZeroU32::get);
+        }
+        meta
+    }
+
     pub fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
         if self.state == State::Closed {
             return false;
@@ -1911,6 +1969,10 @@ impl<'a> Socket<'a> {
                     self.remote_mss = max_seg_size as usize
                 }
 
+                #[cfg(feature = "packetmeta-id")]
+                {
+                    self.connection_bound_device = self.listen_bound_device;
+                }
                 self.tuple = Some(Tuple {
                     local: IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
                     remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
@@ -3388,6 +3450,97 @@ mod test {
             }
         );
         sanity!(s, socket_syn_received());
+    }
+
+    #[test]
+    #[cfg(feature = "packetmeta-id")]
+    fn test_device_binding_handshake_snapshot_and_relisten() {
+        let mut s = socket_listen();
+        let a = NonZeroU32::new(7);
+        let b = NonZeroU32::new(8);
+        s.set_listen_bound_device(a);
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::SynReceived);
+        s.set_listen_bound_device(b);
+        assert_eq!(s.bound_device(), a);
+        assert_eq!(s.egress_meta().id, 7);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Listen);
+        assert_eq!(s.bound_device(), b);
+        assert!(!s.accepts_ingress(PacketMeta { id: 7 }));
+        assert!(s.accepts_ingress(PacketMeta { id: 8 }));
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.bound_device(), b);
+    }
+
+    #[test]
+    #[cfg(feature = "packetmeta-id")]
+    fn test_device_binding_reset_and_abort() {
+        let mut s = socket_established();
+        s.set_bound_device(NonZeroU32::new(7));
+        s.set_listen_bound_device(NonZeroU32::new(8));
+        s.abort();
+        assert_eq!(s.egress_meta().id, 7);
+        s.reset();
+        s.listen(80).unwrap();
+        assert_eq!(s.bound_device(), NonZeroU32::new(8));
+        s.set_bound_device(None);
+        assert_eq!(s.egress_meta().id, 0);
+        assert!(s.accepts_ingress(PacketMeta { id: 0 }));
+        assert!(s.accepts_ingress(PacketMeta { id: 7 }));
+    }
+
+    #[test]
+    #[cfg(feature = "packetmeta-id")]
+    fn test_device_binding_simultaneous_open_keeps_active_device() {
+        let mut s = socket_syn_sent();
+        s.set_bound_device(NonZeroU32::new(7));
+        s.set_listen_bound_device(NonZeroU32::new(8));
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::SynReceived);
+        assert_eq!(s.bound_device(), NonZeroU32::new(7));
     }
 
     #[test]

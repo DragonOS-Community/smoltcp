@@ -6,6 +6,7 @@ impl InterfaceInner {
     pub fn process_tcp<'frame>(
         &mut self,
         sockets: &mut SocketSet,
+        meta: PacketMeta,
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
@@ -22,17 +23,18 @@ impl InterfaceInner {
             .items_mut()
             .filter_map(|i| Socket::downcast_mut(&mut i.socket))
         {
-            if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
+            if tcp_socket.accepts_ingress(meta) && tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
+                let tx_meta = tcp_socket.egress_meta();
                 return tcp_socket
                     .process(self, &ip_repr, &tcp_repr)
-                    .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+                    .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)).with_tx_meta(tx_meta));
             }
         }
 
         #[cfg(feature = "alloc")]
         if tcp_repr.control == TcpControl::Syn
             && tcp_repr.ack_number.is_none()
-            && sockets.tcp_is_listening(IpEndpoint::new(dst_addr, tcp_repr.dst_port))
+            && sockets.tcp_is_listening(IpEndpoint::new(dst_addr, tcp_repr.dst_port), meta)
         {
             // A logical listener still exists, but all of its socket slots are
             // occupied. Let the peer retransmit instead of reporting a closed port.

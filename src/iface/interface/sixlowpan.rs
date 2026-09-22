@@ -842,6 +842,7 @@ mod tests {
         };
 
         let mut ip_packet = PacketV6 {
+            tx_meta: PacketMeta::default(),
             header: Ipv6Repr {
                 src_addr: Ipv6Address::from_bytes(&[
                     253, 0, 0, 0, 0, 0, 0, 0, 2, 3, 0, 3, 0, 3, 0, 3,
@@ -925,6 +926,7 @@ mod tests {
             .unwrap();
 
         let mut ip_packet = PacketV6 {
+            tx_meta: PacketMeta::default(),
             header: Ipv6Repr {
                 src_addr: addr,
                 dst_addr: parent_address,

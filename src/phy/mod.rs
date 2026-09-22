@@ -365,6 +365,14 @@ pub trait Device {
 
     /// Get a description of device capabilities.
     fn capabilities(&self) -> DeviceCapabilities;
+
+    /// Read the effective IP MTU without reserving a transmit token.
+    /// Integrations with an external FIB must use the same route snapshot as
+    /// `TxToken::egress_override`. An unavailable route should return the
+    /// native MTU so TCP can still advance its timers; transmission may fail.
+    fn outbound_ip_mtu(&self, _destination: crate::wire::IpAddress, _meta: PacketMeta) -> usize {
+        self.capabilities().ip_mtu()
+    }
 }
 
 /// A token to receive a single network packet.
@@ -449,5 +457,5 @@ pub struct TxEgressOverride {
     /// Maximum IP packet size accepted by the selected egress route.
     pub ip_mtu: usize,
     /// Opaque integration-defined context preserved across IP fragments.
-    pub context: u64,
+    pub context: [u64; 3],
 }

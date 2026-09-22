@@ -1395,13 +1395,13 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
 
     const ROUTED_IP_MTU: usize = 577;
     const META_ID: u32 = 17;
-    const ROUTE_CONTEXT: u64 = 0x1234_5678_9abc_def0;
+    const ROUTE_CONTEXT: [u64; 3] = [0x1234_5678_9abc_def0, 0x1122, 0x3344];
 
     #[derive(Clone)]
     struct RoutedTxToken {
-        observed: Rc<RefCell<Vec<(usize, PacketMeta, Option<u64>, u16, bool, usize)>>>,
+        observed: Rc<RefCell<Vec<(usize, PacketMeta, Option<[u64; 3]>, u16, bool, usize)>>>,
         meta: PacketMeta,
-        context: Option<u64>,
+        context: Option<[u64; 3]>,
     }
 
     impl TxToken for RoutedTxToken {

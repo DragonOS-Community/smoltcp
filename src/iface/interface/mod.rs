@@ -103,11 +103,11 @@ pub enum PollIngressSingleResult {
     SocketStateChanged,
 }
 
-/// Error returned by [`Interface::dispatch_ipv4_packet`].
+/// Error returned by [`Interface::dispatch_ip_packet`].
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum Ipv4PacketDispatchError {
-    /// The supplied packet is not a complete, well-formed IPv4 packet.
+pub enum IpPacketDispatchError {
+    /// The supplied packet is incomplete or does not match the next-hop family.
     Malformed,
     /// A permanent neighbor address does not match the interface medium.
     InvalidHardwareAddress,
@@ -119,6 +119,9 @@ pub enum Ipv4PacketDispatchError {
     /// Neighbor discovery is in progress; retry no earlier than `retry_at`.
     NeighborPending { retry_at: Instant },
 }
+
+/// Compatibility name for the original IPv4-only dispatch API.
+pub type Ipv4PacketDispatchError = IpPacketDispatchError;
 
 /// Error returned when an IP MTU cannot be used by the interface.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -514,9 +517,42 @@ impl Interface {
         destination_hardware_addr: Option<HardwareAddress>,
         ip_packet: &[u8],
     ) -> Result<(), Ipv4PacketDispatchError> {
-        let packet =
-            Ipv4Packet::new_checked(ip_packet).map_err(|_| Ipv4PacketDispatchError::Malformed)?;
-        let packet_len = packet.total_len() as usize;
+        self.dispatch_ip_packet(
+            timestamp,
+            tx_token,
+            next_hop.into(),
+            destination_hardware_addr,
+            ip_packet,
+        )
+    }
+
+    /// Send a complete IP packet using an explicit next hop, without a second
+    /// route lookup. On NeighborPending the caller retains and retries it.
+    pub fn dispatch_ip_packet<Tx: TxToken>(
+        &mut self,
+        timestamp: Instant,
+        tx_token: Tx,
+        next_hop: IpAddress,
+        destination_hardware_addr: Option<HardwareAddress>,
+        ip_packet: &[u8],
+    ) -> Result<(), IpPacketDispatchError> {
+        let version =
+            IpVersion::of_packet(ip_packet).map_err(|_| IpPacketDispatchError::Malformed)?;
+        let packet_len = match (version, next_hop) {
+            #[cfg(feature = "proto-ipv4")]
+            (IpVersion::Ipv4, IpAddress::Ipv4(_)) => Ipv4Packet::new_checked(ip_packet)
+                .map_err(|_| IpPacketDispatchError::Malformed)?
+                .total_len() as usize,
+            #[cfg(feature = "proto-ipv6")]
+            (IpVersion::Ipv6, IpAddress::Ipv6(_)) => {
+                IPV6_HEADER_LEN
+                    + Ipv6Packet::new_checked(ip_packet)
+                        .map_err(|_| IpPacketDispatchError::Malformed)?
+                        .payload_len() as usize
+            }
+            #[allow(unreachable_patterns)]
+            _ => return Err(IpPacketDispatchError::Malformed),
+        };
         if packet_len != ip_packet.len() {
             return Err(Ipv4PacketDispatchError::Malformed);
         }
@@ -540,16 +576,16 @@ impl Interface {
                         let (hardware_addr, tx_token) =
                             match self.inner.lookup_hardware_addr_for_next_hop(
                                 tx_token,
-                                &IpAddress::Ipv4(next_hop),
+                                &next_hop,
                                 &mut self.fragmenter,
                             ) {
                                 Ok(result) => result,
                                 Err(DispatchError::NeighborPending) => {
                                     return Err(Ipv4PacketDispatchError::NeighborPending {
-                                        retry_at: self.inner.neighbor_cache.discovery_retry_at(
-                                            &IpAddress::Ipv4(next_hop),
-                                            timestamp,
-                                        ),
+                                        retry_at: self
+                                            .inner
+                                            .neighbor_cache
+                                            .discovery_retry_at(&next_hop, timestamp),
                                     });
                                 }
                                 Err(DispatchError::NoRoute) => {
@@ -565,7 +601,12 @@ impl Interface {
                 self.inner
                     .dispatch_ethernet(tx_token, packet_len, |mut frame| {
                         frame.set_dst_addr(destination_hardware_addr);
-                        frame.set_ethertype(EthernetProtocol::Ipv4);
+                        frame.set_ethertype(match version {
+                            #[cfg(feature = "proto-ipv4")]
+                            IpVersion::Ipv4 => EthernetProtocol::Ipv4,
+                            #[cfg(feature = "proto-ipv6")]
+                            IpVersion::Ipv6 => EthernetProtocol::Ipv6,
+                        });
                         frame.payload_mut().copy_from_slice(ip_packet);
                     })
                     .map_err(|error| match error {
@@ -576,7 +617,7 @@ impl Interface {
                                 retry_at: self
                                     .inner
                                     .neighbor_cache
-                                    .discovery_retry_at(&IpAddress::Ipv4(next_hop), timestamp),
+                                    .discovery_retry_at(&next_hop, timestamp),
                             }
                         }
                     })
@@ -929,6 +970,14 @@ impl Interface {
             }
 
             let mut neighbor_addr = None;
+            #[cfg(feature = "socket-tcp")]
+            #[allow(unreachable_patterns)]
+            let tcp_mtu = match &item.socket {
+                Socket::Tcp(socket) => socket
+                    .remote_endpoint()
+                    .map(|remote| device.outbound_ip_mtu(remote.addr, socket.egress_meta())),
+                _ => None,
+            };
             let mut respond = |inner: &mut InterfaceInner, meta: PacketMeta, response: Packet| {
                 neighbor_addr = Some(response.ip_repr().dst_addr());
                 let t = device.transmit(inner.now).ok_or_else(|| {
@@ -987,7 +1036,8 @@ impl Interface {
                 #[cfg(feature = "socket-tcp")]
                 Socket::Tcp(socket) => {
                     let meta = socket.egress_meta();
-                    socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
+                    let mtu = tcp_mtu.unwrap_or_else(|| self.inner.ip_mtu());
+                    socket.dispatch_with_mtu(&mut self.inner, mtu, |inner, (ip, tcp)| {
                         respond(inner, meta, Packet::new(ip, IpPayload::Tcp(tcp)))
                     })
                 }
@@ -1435,9 +1485,28 @@ impl InterfaceInner {
     ) -> Result<(), DispatchError> {
         let mut ip_repr = packet.ip_repr();
         assert!(!ip_repr.dst_addr().is_unspecified());
-        let egress = tx_token
-            .egress_override(ip_repr.version(), ip_repr.dst_addr(), meta)
-            .map_err(|_| DispatchError::Exhausted)?;
+        // Neighbor discovery belongs to the current link, including unicast
+        // advertisements. It must not follow an external namespace route.
+        let link_local_control = match &packet {
+            #[cfg(all(
+                feature = "proto-ipv6",
+                any(feature = "medium-ethernet", feature = "medium-ieee802154")
+            ))]
+            Packet::Ipv6(packet) => matches!(
+                packet.payload,
+                IpPayload::Icmpv6(Icmpv6Repr::Ndisc(_))
+                    | IpPayload::HopByHopIcmpv6(_, Icmpv6Repr::Ndisc(_))
+            ),
+            #[allow(unreachable_patterns)]
+            _ => false,
+        };
+        let egress = if link_local_control {
+            None
+        } else {
+            tx_token
+                .egress_override(ip_repr.version(), ip_repr.dst_addr(), meta)
+                .map_err(|_| DispatchError::Exhausted)?
+        };
         let tx_medium = egress.map_or(self.caps.medium, |egress| egress.medium);
         let ip_mtu = egress.map_or(self.caps.ip_mtu(), |egress| egress.ip_mtu);
 
@@ -1445,8 +1514,11 @@ impl InterfaceInner {
 
         #[cfg(feature = "medium-ieee802154")]
         if matches!(tx_medium, Medium::Ieee802154) {
-            let (addr, tx_token) =
-                self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)?;
+            let (addr, tx_token) = if link_local_control {
+                self.lookup_hardware_addr_for_next_hop(tx_token, &ip_repr.dst_addr(), frag)?
+            } else {
+                self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)?
+            };
             let addr = addr.ieee802154_or_panic();
 
             self.dispatch_ieee802154(addr, tx_token, meta, packet, frag);
@@ -1473,7 +1545,12 @@ impl InterfaceInner {
         #[cfg(feature = "medium-ethernet")]
         let (dst_hardware_addr, mut tx_token) = match tx_medium {
             Medium::Ethernet => {
-                match self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)? {
+                let neighbor = if link_local_control {
+                    self.lookup_hardware_addr_for_next_hop(tx_token, &ip_repr.dst_addr(), frag)?
+                } else {
+                    self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)?
+                };
+                match neighbor {
                     (HardwareAddress::Ethernet(addr), tx_token) => (addr, tx_token),
                     (_, _) => unreachable!(),
                 }
@@ -1624,6 +1701,11 @@ impl InterfaceInner {
             // We don't support IPv6 fragmentation yet.
             #[cfg(feature = "proto-ipv6")]
             IpRepr::Ipv6(_) => {
+                if total_ip_len > ip_mtu {
+                    // Source fragmentation is not implemented. Never hand an
+                    // oversized packet to a bounded device buffer.
+                    return Err(DispatchError::NoRoute);
+                }
                 tx_token.set_meta(meta);
                 tx_token.consume(total_len, |mut tx_buffer| {
                     #[cfg(feature = "medium-ethernet")]

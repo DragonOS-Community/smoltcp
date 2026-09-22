@@ -473,6 +473,8 @@ pub struct Socket<'a> {
     remote_has_sack: bool,
     /// The maximum number of data octets that the remote side may receive.
     remote_mss: usize,
+    /// Last route-selected MTU, shared by dispatch and poll/Nagle decisions.
+    output_ip_mtu: Option<usize>,
     /// The timestamp of the last packet received.
     remote_last_ts: Option<Instant>,
     /// The sequence number of the last packet received, used for sACK
@@ -561,6 +563,7 @@ impl<'a> Socket<'a> {
             remote_win_scale: None,
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
+            output_ip_mtu: None,
             remote_last_ts: None,
             local_rx_last_ack: None,
             local_rx_last_seq: None,
@@ -949,6 +952,7 @@ impl<'a> Socket<'a> {
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
+        self.output_ip_mtu = None;
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
@@ -2340,7 +2344,16 @@ impl<'a> Socket<'a> {
         };
 
         // Max segment size we're able to send due to MTU limitations.
-        let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
+        let tcp_header_len = TCP_HEADER_LEN
+            + if self.tsval_generator.is_some() {
+                12
+            } else {
+                0
+            };
+        let local_mss = self
+            .output_ip_mtu
+            .unwrap_or_else(|| cx.ip_mtu())
+            .saturating_sub(ip_header_len + tcp_header_len);
 
         // The effective max segment size, taking into account our and remote's limits.
         let effective_mss = local_mss.min(self.remote_mss);
@@ -2460,9 +2473,25 @@ impl<'a> Socket<'a> {
     where
         F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
+        self.dispatch_with_mtu(cx, cx.ip_mtu(), emit)
+    }
+
+    /// Dispatch using the current output route's IP MTU. This does not reserve
+    /// a device token, so timer-only state transitions remain independent of TX.
+    pub fn dispatch_with_mtu<F, E>(
+        &mut self,
+        cx: &mut Context,
+        ip_mtu: usize,
+        emit: F,
+    ) -> Result<(), E>
+    where
+        F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
+    {
         if self.tuple.is_none() {
+            self.output_ip_mtu = None;
             return Ok(());
         }
+        self.output_ip_mtu = Some(ip_mtu);
 
         if self.remote_last_ts.is_none() {
             // We get here in exactly two cases:
@@ -2635,7 +2664,7 @@ impl<'a> Socket<'a> {
                 // 3. MSS we can send, determined by our MTU.
                 let size = win_limit
                     .min(self.remote_mss)
-                    .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
+                    .min(ip_mtu.saturating_sub(ip_repr.header_len() + repr.header_len()));
 
                 let offset = self.remote_last_seq - self.local_seq_no;
                 repr.payload = self.tx_buffer.get_allocated(offset, size);
@@ -2697,7 +2726,7 @@ impl<'a> Socket<'a> {
 
         if repr.control == TcpControl::Syn {
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
-            let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
+            let max_segment_size = ip_mtu.saturating_sub(ip_repr.header_len() + TCP_HEADER_LEN);
             repr.max_seg_size = Some(max_segment_size as u16);
         }
 
@@ -3128,6 +3157,39 @@ mod test {
 
     fn socket_established() -> TestSocket {
         socket_established_with_buffer_sizes(64, 64)
+    }
+
+    #[test]
+    fn routed_mtu_accounts_for_timestamp_and_nagle() {
+        let mut s = socket_established_with_buffer_sizes(4096, 4096);
+        #[cfg(feature = "proto-ipv6")]
+        {
+            let tuple = s.tuple.as_mut().unwrap();
+            tuple.local.addr = crate::wire::Ipv6Address::LOCALHOST.into();
+            tuple.remote.addr = crate::wire::Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1).into();
+        }
+        s.tsval_generator = Some(|| 123);
+        s.remote_mss = 4000;
+        s.remote_win_len = 4096;
+        s.send_slice(&[7; 3000]).unwrap();
+        let mut emitted = 0;
+        for _ in 0..2 {
+            let TestSocket { socket, cx } = &mut s;
+            socket
+                .dispatch_with_mtu(cx, 1280, |_, (ip, tcp)| {
+                    assert_eq!(ip.header_len() + tcp.buffer_len(), 1280);
+                    assert_eq!(tcp.header_len(), 32);
+                    emitted += tcp.payload.len();
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            if emitted < 2000 {
+                assert_eq!(socket.poll_at(cx), PollAt::Now);
+            }
+        }
+        assert!(emitted > 2000);
+        s.reset();
+        assert_eq!(s.output_ip_mtu, None);
     }
 
     fn socket_fin_wait_1() -> TestSocket {

@@ -453,6 +453,7 @@ pub enum CongestionControl {
 #[derive(Debug)]
 pub struct Socket<'a> {
     state: State,
+    pending_reset: Option<State>,
     timer: Timer,
     rtte: RttEstimator,
     assembler: Assembler,
@@ -663,6 +664,7 @@ impl<'a> Socket<'a> {
 
         Socket {
             state: State::Closed,
+            pending_reset: None,
             timer: Timer::new(),
             rtte: RttEstimator::default(),
             assembler: Assembler::new(),
@@ -1057,6 +1059,20 @@ impl<'a> Socket<'a> {
         self.state
     }
 
+    /// Return the state in which an accepted remote RST closed the connection.
+    ///
+    /// The event remains available until consumed with [`Self::take_reset`] or
+    /// the socket is reused by [`Self::listen`] or [`Self::connect`]. A normal
+    /// FIN, a local abort, and a rejected RST do not create an event.
+    pub fn reset_state(&self) -> Option<State> {
+        self.pending_reset
+    }
+
+    /// Consume the pending remote reset event, returning the pre-reset state.
+    pub fn take_reset(&mut self) -> Option<State> {
+        self.pending_reset.take()
+    }
+
     /// Returns the window scaling factor advertised to the remote.
     /// This is the shift value we use when sending window sizes to the peer.
     #[inline]
@@ -1075,6 +1091,7 @@ impl<'a> Socket<'a> {
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
 
         self.state = State::Closed;
+        self.pending_reset = None;
         self.timer = Timer::new();
         self.rtte = RttEstimator::default();
         self.assembler = Assembler::new();
@@ -2203,6 +2220,7 @@ impl<'a> Socket<'a> {
             // RSTs in any other state close the socket.
             (_, TcpControl::Rst) => {
                 tcp_trace!("received RST");
+                self.pending_reset = Some(self.state);
                 self.set_state(State::Closed);
                 self.tuple = None;
                 return None;
@@ -3913,6 +3931,7 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Listen);
+        assert_eq!(s.take_reset(), None);
     }
 
     #[test]
@@ -4079,6 +4098,7 @@ mod test {
         assert_eq!(s.state, State::Listen);
         assert_eq!(s.listen_endpoint, LISTEN_END);
         assert_eq!(s.tuple, None);
+        assert_eq!(s.take_reset(), None);
     }
 
     #[test]
@@ -4449,6 +4469,7 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Closed);
+        assert_eq!(s.take_reset(), Some(State::SynReceived));
     }
 
     #[test]
@@ -4464,6 +4485,7 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Closed);
+        assert_eq!(s.take_reset(), Some(State::SynSent));
     }
 
     #[test]
@@ -4479,6 +4501,7 @@ mod test {
             }
         );
         assert_eq!(s.state, State::SynSent);
+        assert_eq!(s.take_reset(), None);
     }
 
     #[test]
@@ -4494,6 +4517,7 @@ mod test {
             }
         );
         assert_eq!(s.state, State::SynSent);
+        assert_eq!(s.take_reset(), None);
     }
 
     #[test]
@@ -5346,6 +5370,7 @@ mod test {
             }]
         );
         assert_eq!(s.state, State::CloseWait);
+        assert_eq!(s.take_reset(), None);
         sanity!(s, socket_close_wait());
     }
 
@@ -5424,6 +5449,53 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Closed);
+        assert_eq!(s.reset_state(), Some(State::Established));
+        assert_eq!(s.reset_state(), Some(State::Established));
+        assert_eq!(s.take_reset(), Some(State::Established));
+        assert_eq!(s.reset_state(), None);
+        assert_eq!(s.take_reset(), None);
+    }
+
+    #[test]
+    fn test_reset_event_reuse() {
+        for reconnect in [false, true] {
+            let mut s = socket_established();
+            assert_eq!(s.reset_state(), None);
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Rst,
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: None,
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.reset_state(), Some(State::Established));
+            if reconnect {
+                s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
+                assert_eq!(s.state, State::SynSent);
+            } else {
+                s.listen(LISTEN_END).unwrap();
+                assert_eq!(s.state, State::Listen);
+            }
+            assert_eq!(s.take_reset(), None);
+        }
+    }
+
+    #[test]
+    fn test_close_wait_rst() {
+        let mut s = socket_close_wait();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 2,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.take_reset(), Some(State::CloseWait));
     }
 
     #[test]
@@ -5439,6 +5511,7 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Closed);
+        assert_eq!(s.take_reset(), Some(State::Established));
     }
 
     #[test]
@@ -5485,6 +5558,7 @@ mod test {
         let mut s = socket_established();
         s.abort();
         assert_eq!(s.state, State::Closed);
+        assert_eq!(s.take_reset(), None);
         recv!(
             s,
             [TcpRepr {
@@ -5515,6 +5589,7 @@ mod test {
         );
 
         assert_eq!(s.state, State::Established);
+        assert_eq!(s.take_reset(), None);
 
         // Send something to advance seq by 1
         send!(

@@ -6,6 +6,8 @@ mod ipv6;
 mod sixlowpan;
 #[cfg(all(feature = "alloc", feature = "socket-tcp", feature = "medium-ip"))]
 mod tcp_listener;
+#[cfg(all(feature = "alloc", feature = "socket-tcp", feature = "medium-ip"))]
+mod tcp_transport;
 
 #[allow(unused)]
 use std::vec::Vec;

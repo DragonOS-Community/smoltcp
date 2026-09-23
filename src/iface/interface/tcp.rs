@@ -20,6 +20,25 @@ impl InterfaceInner {
         ));
 
         #[cfg(feature = "alloc")]
+        {
+            // IPv6 extension headers and IP fragments have already been removed.
+            // Describe precisely the validated transport segment handed off.
+            let mut transport_ip = ip_repr.clone();
+            match &mut transport_ip {
+                #[cfg(feature = "proto-ipv4")]
+                IpRepr::Ipv4(ip) => ip.next_header = IpProtocol::Tcp,
+                #[cfg(feature = "proto-ipv6")]
+                IpRepr::Ipv6(ip) => ip.next_header = IpProtocol::Tcp,
+            }
+            transport_ip.set_payload_len(ip_payload.len());
+            if sockets.handle_tcp_ingress(meta, &transport_ip, ip_payload)
+                == crate::iface::TcpIngressResult::Consumed
+            {
+                return None;
+            }
+        }
+
+        #[cfg(feature = "alloc")]
         if let Some(result) = sockets.process_tcp_sockets(self, meta, &ip_repr, &tcp_repr) {
             return result
                 .map(|(tx, ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)).with_tx_meta(tx));
@@ -71,5 +90,47 @@ impl InterfaceInner {
             let (ip, tcp) = tcp::Socket::rst_reply(&ip_repr, &tcp_repr);
             Some(Packet::new(ip, IpPayload::Tcp(tcp)))
         }
+    }
+}
+
+impl Interface {
+    /// Process a TCP segment already classified as local by an external IP layer.
+    ///
+    /// The caller must perform IP validation, reassembly and local destination
+    /// checks. `ip_repr` must describe the TCP segment without extension headers.
+    /// TCP length and checksum are checked here using this interface's checksum
+    /// capabilities. No interface address lookup is performed.
+    ///
+    /// Returns false only when no transmit token is available; no protocol state
+    /// is changed and the caller should retain the input for retry. True includes
+    /// invalid packets deliberately dropped. Reserve sufficient token capacity
+    /// before calling: processing may generate an immediate TCP response.
+    /// The socket set normally has no external ingress handler installed.
+    pub fn process_tcp_ingress(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        meta: PacketMeta,
+        ip_repr: IpRepr,
+        segment: &[u8],
+    ) -> bool {
+        if ip_repr.next_header() != IpProtocol::Tcp || ip_repr.payload_len() != segment.len() {
+            return true;
+        }
+        let Some(token) = device.transmit(timestamp) else {
+            return false;
+        };
+        self.inner.now = timestamp;
+        #[cfg(feature = "alloc")]
+        sockets.expire_tcp_time_wait(timestamp);
+        if let Some(response) = self.inner.process_tcp(sockets, meta, ip_repr, segment) {
+            let tx_meta = response.tx_meta();
+            // Dispatch failure is a network drop, just as in ordinary ingress.
+            let _ = self
+                .inner
+                .dispatch_ip(token, tx_meta, response, &mut self.fragmenter);
+        }
+        true
     }
 }

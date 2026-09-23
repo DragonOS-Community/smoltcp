@@ -8,13 +8,40 @@ use managed::ManagedSlice;
 use alloc::sync::Arc;
 
 use super::socket_meta::Meta;
-#[cfg(all(feature = "alloc", feature = "socket-udp"))]
+#[cfg(all(feature = "alloc", any(feature = "socket-udp", feature = "socket-tcp")))]
 use crate::phy::PacketMeta;
 use crate::socket::{AnySocket, Socket};
 #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
 use crate::wire::IpEndpoint;
+#[cfg(all(feature = "alloc", any(feature = "socket-udp", feature = "socket-tcp")))]
+use crate::wire::IpRepr;
 #[cfg(all(feature = "alloc", feature = "socket-udp"))]
-use crate::wire::{IpRepr, UdpRepr};
+use crate::wire::UdpRepr;
+
+/// Result of offering a validated TCP segment to an external consumer.
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpIngressResult {
+    /// Continue normal TCP socket and TIME_WAIT demultiplexing.
+    NotHandled,
+    /// Consumed or deliberately dropped; do not generate a local reset.
+    Consumed,
+}
+
+/// Optional TCP consumer, called after IP reassembly and TCP validation.
+///
+/// The segment includes the TCP header. The IP representation describes this
+/// segment without extension headers. Metadata identifies the actual ingress
+/// device. Implementations must not reenter this interface or socket set.
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+pub trait TcpIngressHandler: fmt::Debug + Send + Sync {
+    fn handle_tcp_ingress(
+        &self,
+        meta: PacketMeta,
+        ip_repr: &IpRepr,
+        segment: &[u8],
+    ) -> TcpIngressResult;
+}
 
 /// Result of offering a validated UDP datagram to an external ingress handler.
 #[cfg(all(feature = "alloc", feature = "socket-udp"))]
@@ -102,6 +129,8 @@ pub struct SocketSet<'a> {
     time_wait: tcp_time_wait::TimeWaitTable,
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     tcp_listen_registry: Option<Arc<dyn TcpListenRegistry>>,
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    tcp_ingress_handler: Option<Arc<dyn TcpIngressHandler>>,
     #[cfg(all(feature = "alloc", feature = "socket-udp"))]
     udp_ingress_handler: Option<Arc<dyn UdpIngressHandler>>,
 }
@@ -119,9 +148,34 @@ impl<'a> SocketSet<'a> {
             time_wait: tcp_time_wait::TimeWaitTable::default(),
             #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
             tcp_listen_registry: None,
+            #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+            tcp_ingress_handler: None,
             #[cfg(all(feature = "alloc", feature = "socket-udp"))]
             udp_ingress_handler: None,
         }
+    }
+
+    /// Install or remove the external TCP ingress handler.
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub fn set_tcp_ingress_handler(
+        &mut self,
+        handler: Option<Arc<dyn TcpIngressHandler>>,
+    ) -> Option<Arc<dyn TcpIngressHandler>> {
+        core::mem::replace(&mut self.tcp_ingress_handler, handler)
+    }
+
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub(crate) fn handle_tcp_ingress(
+        &self,
+        meta: PacketMeta,
+        ip_repr: &IpRepr,
+        segment: &[u8],
+    ) -> TcpIngressResult {
+        self.tcp_ingress_handler
+            .as_ref()
+            .map_or(TcpIngressResult::NotHandled, |handler| {
+                handler.handle_tcp_ingress(meta, ip_repr, segment)
+            })
     }
 
     /// Install or remove the external TCP listener registry, returning the previous one.

@@ -599,10 +599,9 @@ impl<'a> Socket<'a> {
     pub(crate) fn lifecycle_device(&self) -> u32 {
         #[cfg(feature = "packetmeta-id")]
         {
-            return self
-                .connection_bound_device
+            self.connection_bound_device
                 .or(self.listen_bound_device)
-                .map_or(0, |d| d.get());
+                .map_or(0, |d| d.get())
         }
         #[cfg(not(feature = "packetmeta-id"))]
         {
@@ -1898,16 +1897,14 @@ impl<'a> Socket<'a> {
         if self.state == State::Listen
             && repr.control == TcpControl::Syn
             && repr.ack_number.is_none()
-        {
-            if repr.max_seg_size == Some(0)
+            && (repr.max_seg_size == Some(0)
                 || !self.prepare_open(
                     IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
                     IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
                     reuse.and_then(|(_, id)| id),
-                )
-            {
-                return None;
-            }
+                ))
+        {
+            return None;
         }
         let was_listen = self.state == State::Listen;
         let result = self.process_inner(cx, ip_repr, repr);

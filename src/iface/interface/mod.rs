@@ -861,10 +861,10 @@ impl Interface {
             .min();
         #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
         {
-            return active
+            active
                 .into_iter()
                 .chain(sockets.tcp_time_wait_poll_at())
-                .min();
+                .min()
         }
         #[cfg(not(all(feature = "alloc", feature = "socket-tcp")))]
         {

@@ -273,7 +273,7 @@ fn explicit_ipv4_dispatch_preserves_packet_on_ip_medium() {
 }
 
 #[test]
-#[cfg(all(feature = "proto-ipv4", feature = "medium-ip"))]
+#[cfg(all(feature = "proto-ipv4", feature = "medium-ip", feature = "socket-raw"))]
 fn egress_admission_failure_does_not_consume_token() {
     struct ExhaustedTxToken;
 
@@ -1397,9 +1397,11 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
     const META_ID: u32 = 17;
     const ROUTE_CONTEXT: [u64; 3] = [0x1234_5678_9abc_def0, 0x1122, 0x3344];
 
+    type FragmentObservation = (usize, PacketMeta, Option<[u64; 3]>, u16, bool, usize);
+
     #[derive(Clone)]
     struct RoutedTxToken {
-        observed: Rc<RefCell<Vec<(usize, PacketMeta, Option<[u64; 3]>, u16, bool, usize)>>>,
+        observed: Rc<RefCell<Vec<FragmentObservation>>>,
         meta: PacketMeta,
         context: Option<[u64; 3]>,
     }

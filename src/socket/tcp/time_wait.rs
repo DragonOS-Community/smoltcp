@@ -175,6 +175,7 @@ mod tests {
     use super::*;
     use crate::iface::SocketSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn endpoints() -> (IpEndpoint, IpEndpoint) {
         (

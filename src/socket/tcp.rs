@@ -2,8 +2,10 @@
 // the parts of RFC 1122 that discuss TCP, as well as RFC 7323 for some of the TCP options.
 // Consult RFC 7414 when implementing a new feature.
 
-#[cfg(feature = "alloc")]
-use alloc::sync::Arc;
+#[cfg(all(feature = "alloc", not(target_has_atomic = "ptr")))]
+use alloc::rc::Rc as Shared;
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+use alloc::sync::Arc as Shared;
 use core::fmt::Display;
 #[cfg(feature = "packetmeta-id")]
 use core::num::NonZeroU32;
@@ -548,7 +550,7 @@ pub struct Socket<'a> {
     time_wait_duration: Duration,
     pub(crate) time_wait: Option<TimeWaitState>,
     #[cfg(feature = "alloc")]
-    pub(crate) lifecycle_observer: Option<Arc<dyn LifecycleObserver>>,
+    pub(crate) lifecycle_observer: Option<Shared<dyn LifecycleObserver>>,
     #[cfg(feature = "alloc")]
     lifecycle_published: Option<(State, Option<Tuple>, u32)>,
 
@@ -568,14 +570,14 @@ impl<'a> Socket<'a> {
     }
 
     #[cfg(feature = "alloc")]
-    pub fn set_lifecycle_observer(&mut self, observer: Option<Arc<dyn LifecycleObserver>>) {
+    pub fn set_lifecycle_observer(&mut self, observer: Option<Shared<dyn LifecycleObserver>>) {
         self.lifecycle_observer = observer;
         self.lifecycle_published = None;
         self.notify_lifecycle();
     }
 
     #[cfg(feature = "alloc")]
-    pub fn lifecycle_observer(&self) -> Option<&Arc<dyn LifecycleObserver>> {
+    pub fn lifecycle_observer(&self) -> Option<&Shared<dyn LifecycleObserver>> {
         self.lifecycle_observer.as_ref()
     }
 
@@ -599,10 +601,9 @@ impl<'a> Socket<'a> {
     pub(crate) fn lifecycle_device(&self) -> u32 {
         #[cfg(feature = "packetmeta-id")]
         {
-            return self
-                .connection_bound_device
+            self.connection_bound_device
                 .or(self.listen_bound_device)
-                .map_or(0, |d| d.get());
+                .map_or(0, |d| d.get())
         }
         #[cfg(not(feature = "packetmeta-id"))]
         {
@@ -1898,16 +1899,14 @@ impl<'a> Socket<'a> {
         if self.state == State::Listen
             && repr.control == TcpControl::Syn
             && repr.ack_number.is_none()
-        {
-            if repr.max_seg_size == Some(0)
+            && (repr.max_seg_size == Some(0)
                 || !self.prepare_open(
                     IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
                     IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
                     reuse.and_then(|(_, id)| id),
-                )
-            {
-                return None;
-            }
+                ))
+        {
+            return None;
         }
         let was_listen = self.state == State::Listen;
         let result = self.process_inner(cx, ip_repr, repr);

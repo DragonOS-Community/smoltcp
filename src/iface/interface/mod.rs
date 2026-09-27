@@ -31,6 +31,8 @@ use heapless::Vec;
 
 #[cfg(feature = "_proto-fragmentation")]
 use super::fragmentation::FragKey;
+#[cfg(feature = "proto-ipv4-fragmentation")]
+use super::fragmentation::FragmentRange;
 #[cfg(any(feature = "proto-ipv4", feature = "proto-sixlowpan"))]
 use super::fragmentation::PacketAssemblerSet;
 use super::fragmentation::{Fragmenter, FragmentsBuffer};
@@ -861,10 +863,10 @@ impl Interface {
             .min();
         #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
         {
-            return active
+            active
                 .into_iter()
                 .chain(sockets.tcp_time_wait_poll_at())
-                .min();
+                .min()
         }
         #[cfg(not(all(feature = "alloc", feature = "socket-tcp")))]
         {

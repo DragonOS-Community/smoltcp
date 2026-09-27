@@ -273,7 +273,7 @@ fn explicit_ipv4_dispatch_preserves_packet_on_ip_medium() {
 }
 
 #[test]
-#[cfg(all(feature = "proto-ipv4", feature = "medium-ip"))]
+#[cfg(all(feature = "proto-ipv4", feature = "medium-ip", feature = "socket-raw"))]
 fn egress_admission_failure_does_not_consume_token() {
     struct ExhaustedTxToken;
 
@@ -1397,9 +1397,11 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
     const META_ID: u32 = 17;
     const ROUTE_CONTEXT: [u64; 3] = [0x1234_5678_9abc_def0, 0x1122, 0x3344];
 
+    type FragmentObservation = (usize, PacketMeta, Option<[u64; 3]>, u16, bool, usize);
+
     #[derive(Clone)]
     struct RoutedTxToken {
-        observed: Rc<RefCell<Vec<(usize, PacketMeta, Option<[u64; 3]>, u16, bool, usize)>>>,
+        observed: Rc<RefCell<Vec<FragmentObservation>>>,
         meta: PacketMeta,
         context: Option<[u64; 3]>,
     }
@@ -1587,6 +1589,132 @@ fn test_raw_socket_no_reply(#[case] medium: Medium) {
         ),
         None
     );
+}
+
+#[cfg(all(
+    feature = "proto-ipv4-fragmentation",
+    feature = "socket-raw",
+    feature = "medium-ip"
+))]
+#[test]
+fn reassembled_ipv4_raw_packet_reports_complete_length() {
+    use crate::wire::{IpVersion, UdpPacket, UdpRepr};
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let rx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let tx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let handle = sockets.add(raw::Socket::new(IpVersion::Ipv4, IpProtocol::Udp, rx, tx));
+
+    let src = Ipv4Address::new(127, 0, 0, 2);
+    let dst = Ipv4Address::new(127, 0, 0, 1);
+    let udp_repr = UdpRepr {
+        src_port: 12345,
+        dst_port: 23456,
+    };
+    let mut datagram = [0u8; 24];
+    udp_repr.emit(
+        &mut UdpPacket::new_unchecked(&mut datagram[..]),
+        &src.into(),
+        &dst.into(),
+        16,
+        |payload| payload.fill(0x5a),
+        &ChecksumCapabilities::default(),
+    );
+
+    for (offset, payload) in [(0, &datagram[..16]), (16, &datagram[16..])] {
+        let repr = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Udp,
+            payload_len: payload.len(),
+            hop_limit: if offset == 0 { 64 } else { 1 },
+        };
+        let mut bytes = vec![0; repr.buffer_len() + payload.len()];
+        let mut packet = Ipv4Packet::new_unchecked(&mut bytes[..]);
+        repr.emit(&mut packet, &ChecksumCapabilities::default());
+        packet.set_ident(42);
+        packet.set_frag_offset(offset);
+        packet.set_more_frags(offset == 0);
+        packet.fill_checksum();
+        packet.payload_mut().copy_from_slice(payload);
+        let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+        iface.inner.process_ipv4(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut iface.fragments,
+        );
+    }
+
+    let packet = sockets.get_mut::<raw::Socket>(handle).recv().unwrap();
+    assert_eq!(packet.len(), 20 + datagram.len());
+    let header = Ipv4Packet::new_checked(packet).unwrap();
+    assert_eq!(header.total_len() as usize, packet.len());
+    assert_eq!(header.hop_limit(), 64);
+    assert_eq!(header.payload(), datagram);
+}
+
+#[cfg(all(
+    feature = "proto-ipv4-fragmentation",
+    feature = "socket-raw",
+    feature = "medium-ip"
+))]
+#[test]
+fn duplicate_final_ipv4_fragment_does_not_complete_reassembly() {
+    use crate::wire::{IpVersion, UdpPacket, UdpRepr};
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let rx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let tx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let handle = sockets.add(raw::Socket::new(IpVersion::Ipv4, IpProtocol::Udp, rx, tx));
+
+    let src = Ipv4Address::new(127, 0, 0, 2);
+    let dst = Ipv4Address::new(127, 0, 0, 1);
+    let mut datagram = [0u8; 24];
+    UdpRepr {
+        src_port: 12345,
+        dst_port: 23456,
+    }
+    .emit(
+        &mut UdpPacket::new_unchecked(&mut datagram[..]),
+        &src.into(),
+        &dst.into(),
+        16,
+        |payload| payload.fill(0x5a),
+        &ChecksumCapabilities::default(),
+    );
+
+    for (offset, payload, more_fragments) in [
+        (0, &datagram[..16], true),
+        (16, &datagram[16..], true),
+        (16, &datagram[16..], false),
+    ] {
+        let repr = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Udp,
+            payload_len: payload.len(),
+            hop_limit: 64,
+        };
+        let mut bytes = vec![0; repr.buffer_len() + payload.len()];
+        let mut packet = Ipv4Packet::new_unchecked(&mut bytes[..]);
+        repr.emit(&mut packet, &ChecksumCapabilities::default());
+        packet.set_ident(43);
+        packet.set_frag_offset(offset);
+        packet.set_more_frags(more_fragments);
+        packet.fill_checksum();
+        packet.payload_mut().copy_from_slice(payload);
+        let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+        iface.inner.process_ipv4(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut iface.fragments,
+        );
+        assert!(!sockets.get_mut::<raw::Socket>(handle).can_recv());
+    }
 }
 
 #[rstest]

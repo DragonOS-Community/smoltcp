@@ -91,6 +91,8 @@ impl InterfaceInner {
         frag: &'a mut FragmentsBuffer,
     ) -> Option<Packet<'a>> {
         let ipv4_repr = check!(Ipv4Repr::parse(ipv4_packet, &self.caps.checksum));
+        #[cfg(feature = "proto-ipv4-fragmentation")]
+        let mut ipv4_repr = ipv4_repr;
         if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {
             // Discard packets with non-unicast source addresses but allow unspecified
             net_debug!("non-unicast or unspecified source address");
@@ -122,21 +124,65 @@ impl InterfaceInner {
                     }
                 };
 
-                if !ipv4_packet.more_frags() {
-                    // This is the last fragment, so we know the total size
-                    check!(f.set_total_size(fragment_end));
+                if fragment_payload.is_empty() {
+                    f.reset();
+                    return None;
                 }
-
-                if let Err(e) = f.add(fragment_payload, fragment_offset) {
-                    net_debug!("fragmentation error: {:?}", e);
+                if f.total_size().is_some_and(|total| {
+                    fragment_end > total || (!ipv4_packet.more_frags() && fragment_end != total)
+                }) || (!ipv4_packet.more_frags() && f.last_received_end() > fragment_end)
+                {
+                    f.reset();
                     return None;
                 }
 
-                // NOTE: according to the standard, the total length needs to be
-                // recomputed, as well as the checksum. However, we don't really use
-                // the IPv4 header after the packet is reassembled.
+                if !ipv4_packet.more_frags() {
+                    // A valid last length is recorded even if all of this
+                    // fragment's bytes were previously received.
+                    if f.set_total_size(fragment_end).is_err() {
+                        f.reset();
+                        return None;
+                    }
+                }
+
+                match f.classify_received_range(fragment_offset, fragment_end) {
+                    FragmentRange::New => {
+                        if let Err(e) = f.add(fragment_payload, fragment_offset) {
+                            net_debug!("fragmentation error: {:?}", e);
+                            f.reset();
+                            return None;
+                        }
+
+                        if fragment_offset == 0 {
+                            f.set_first_ipv4_header(
+                                &ipv4_packet.as_ref()[..ipv4_packet.header_len() as usize],
+                            );
+                        }
+                    }
+                    // Linux records a final length but does not reassemble on a
+                    // duplicate: no new bytes have entered the queue.
+                    FragmentRange::Duplicate => return None,
+                    FragmentRange::Overlap => {
+                        f.reset();
+                        net_debug!("overlapping IPv4 fragment discarded");
+                        return None;
+                    }
+                }
+
+                let first_header = f.first_ipv4_header()?;
+                let first_hop_limit = first_header[8];
+                let first_header_len = first_header.len();
                 match f.assemble() {
-                    Some(payload) => payload,
+                    Some(payload) => {
+                        // The parsed header may belong to the last fragment.
+                        // Raw sockets and ICMP replies need the full length.
+                        if payload.len() > u16::MAX as usize - first_header_len {
+                            return None;
+                        }
+                        ipv4_repr.payload_len = payload.len();
+                        ipv4_repr.hop_limit = first_hop_limit;
+                        payload
+                    }
                     None => return None,
                 }
             } else {

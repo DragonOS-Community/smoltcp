@@ -241,8 +241,8 @@ impl<T: AsRef<[u8]>> Packet<T> {
 
     /// Ensure that no accessor method will panic if called.
     /// Returns `Err(Error)` if the buffer is too short.
-    /// Returns `Err(Error)` if the header length is greater
-    /// than total length.
+    /// Returns `Err(Error)` if the header length is smaller than the
+    /// minimum IPv4 header or greater than total length.
     ///
     /// The result of this check is invalidated by calling [set_header_len]
     /// and [set_total_len].
@@ -253,6 +253,8 @@ impl<T: AsRef<[u8]>> Packet<T> {
     pub fn check_len(&self) -> Result<()> {
         let len = self.buffer.as_ref().len();
         if len < field::DST_ADDR.end {
+            Err(Error)
+        } else if (self.header_len() as usize) < field::DST_ADDR.end {
             Err(Error)
         } else if len < self.header_len() as usize {
             Err(Error)
@@ -850,6 +852,16 @@ pub mod test {
         let mut bytes = vec![0; 40];
         bytes[0] = 0x09;
         assert_eq!(Packet::new_checked(&mut bytes), Err(Error));
+    }
+
+    #[test]
+    fn test_parse_header_len_less_than_minimum() {
+        for ihl_words in 0..5 {
+            let mut bytes = [0u8; 40];
+            bytes[0] = 0x40 | ihl_words;
+            bytes[2..4].copy_from_slice(&40u16.to_be_bytes());
+            assert_eq!(Packet::new_checked(&bytes[..]), Err(Error));
+        }
     }
 
     #[test]

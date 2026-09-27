@@ -31,6 +31,8 @@ use heapless::Vec;
 
 #[cfg(feature = "_proto-fragmentation")]
 use super::fragmentation::FragKey;
+#[cfg(feature = "proto-ipv4-fragmentation")]
+use super::fragmentation::FragmentRange;
 #[cfg(any(feature = "proto-ipv4", feature = "proto-sixlowpan"))]
 use super::fragmentation::PacketAssemblerSet;
 use super::fragmentation::{Fragmenter, FragmentsBuffer};

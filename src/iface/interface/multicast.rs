@@ -194,6 +194,7 @@ impl Interface {
     /// - Send join/leave packets according to the multicast group state.
     /// - Depending on `igmp_report_state` and the therein contained
     ///   timeouts, send IGMP membership reports.
+    ///
     /// A policy or permanent route denial drops this one report, as LOCAL_OUT
     /// does on Linux. Capacity and neighbor discovery are transient: retain
     /// the group/query state so the same report can be retried.

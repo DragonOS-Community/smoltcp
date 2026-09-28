@@ -1813,7 +1813,7 @@ fn routed_link_control_updates_only_the_receiving_interfaces_neighbor_cache() {
     let src = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 2);
     let dst = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 3);
     let advertised_mac = EthernetAddress([2, 0, 0, 0, 0, 9]);
-    let mut data = vec![0; 72];
+    let mut data = [0; 72];
     data[0] = 0x60;
     data[4..6].copy_from_slice(&32u16.to_be_bytes());
     data[6] = u8::from(IpProtocol::Icmpv6);

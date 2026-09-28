@@ -824,7 +824,7 @@ impl Interface {
                 device,
                 sockets,
                 #[cfg(feature = "alloc")]
-                filter.as_mut().map(|filter| &mut **filter),
+                filter.as_deref_mut(),
             ) {
                 PollIngressSingleResult::None => break,
                 PollIngressSingleResult::PacketProcessed => {}

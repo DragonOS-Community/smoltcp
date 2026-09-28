@@ -137,6 +137,7 @@ fn deferred_ipv4_output_serializes_before_neighbor_and_fragmentation() {
     assert_eq!(ipv4.ident(), 0);
     assert_eq!(ipv4.dst_addr(), Ipv4Address::new(198, 51, 100, 1));
     assert_eq!(ipv4.payload(), &payload[..]);
+    #[cfg(feature = "proto-ipv4-fragmentation")]
     assert_eq!(iface.fragmenter.packet_len, 0);
 }
 

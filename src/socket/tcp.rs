@@ -2884,30 +2884,28 @@ impl<'a> Socket<'a> {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
-        } else {
-            if let Some(retransmit_delta) = self.timer.should_retransmit(cx.now()) {
-                // If a retransmit timer expired, we should resend data starting at the last ACK.
-                net_debug!("retransmitting at t+{}", retransmit_delta);
+        } else if let Some(retransmit_delta) = self.timer.should_retransmit(cx.now()) {
+            // If a retransmit timer expired, we should resend data starting at the last ACK.
+            net_debug!("retransmitting at t+{}", retransmit_delta);
 
-                // Rewind "last sequence number sent", as if we never
-                // had sent them. This will cause all data in the queue
-                // to be sent again.
-                self.remote_last_seq = self.local_seq_no;
+            // Rewind "last sequence number sent", as if we never
+            // had sent them. This will cause all data in the queue
+            // to be sent again.
+            self.remote_last_seq = self.local_seq_no;
 
-                // Clear the `should_retransmit` state. If we can't retransmit right
-                // now for whatever reason (like zero window), this avoids an
-                // infinite polling loop where `poll_at` returns `Now` but `dispatch`
-                // can't actually do anything.
-                self.timer.set_for_idle(cx.now(), self.keep_alive);
+            // Clear the `should_retransmit` state. If we can't retransmit right
+            // now for whatever reason (like zero window), this avoids an
+            // infinite polling loop where `poll_at` returns `Now` but `dispatch`
+            // can't actually do anything.
+            self.timer.set_for_idle(cx.now(), self.keep_alive);
 
-                // Inform RTTE, so that it can avoid bogus measurements.
-                self.rtte.on_retransmit();
+            // Inform RTTE, so that it can avoid bogus measurements.
+            self.rtte.on_retransmit();
 
-                // Inform the congestion controller that we're retransmitting.
-                self.congestion_controller
-                    .inner_mut()
-                    .on_retransmit(cx.now());
-            }
+            // Inform the congestion controller that we're retransmitting.
+            self.congestion_controller
+                .inner_mut()
+                .on_retransmit(cx.now());
         }
 
         let defer_unsent_data = self

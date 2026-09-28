@@ -123,6 +123,7 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "alloc")]
+    #[allow(clippy::too_many_arguments)] // Packet parsing inputs plus optional policy state.
     pub(super) fn process_ipv4_filtered<'a>(
         &mut self,
         sockets: &mut SocketSet,
@@ -144,6 +145,7 @@ impl InterfaceInner {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Shared unfiltered and policy-aware packet path.
     fn process_ipv4_inner<'a>(
         &mut self,
         sockets: &mut SocketSet,
@@ -322,16 +324,11 @@ impl InterfaceInner {
         #[cfg(feature = "alloc")]
         let (ip_payload, local_destination, external_raw) = if let Some(scratch) = scratch {
             let filter = filter.as_deref_mut()?;
-            let mut packet = if {
-                #[cfg(feature = "proto-ipv4-fragmentation")]
-                {
-                    first_fragment_header.is_some()
-                }
-                #[cfg(not(feature = "proto-ipv4-fragmentation"))]
-                {
-                    false
-                }
-            } {
+            #[cfg(feature = "proto-ipv4-fragmentation")]
+            let reassembled = first_fragment_header.is_some();
+            #[cfg(not(feature = "proto-ipv4-fragmentation"))]
+            let reassembled = false;
+            let mut packet = if reassembled {
                 #[cfg(feature = "proto-ipv4-fragmentation")]
                 {
                     let (header, header_len) = first_fragment_header?;

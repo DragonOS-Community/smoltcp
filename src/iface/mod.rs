@@ -5,6 +5,8 @@ provides lookup and caching of hardware addresses, and handles management packet
 */
 
 mod fragmentation;
+#[cfg(feature = "alloc")]
+mod ingress_packet;
 mod interface;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 mod neighbor;
@@ -15,6 +17,12 @@ mod socket_meta;
 mod socket_set;
 
 pub mod packet;
+
+#[cfg(feature = "alloc")]
+pub use self::ingress_packet::{
+    IngressPacket, IngressPacketAllocError, IpIngressFilter, LocalInputVerdict, PreRoutingVerdict,
+    RouteInputVerdict, RoutedIngressPacket,
+};
 
 #[cfg(feature = "multicast")]
 pub use self::interface::multicast::MulticastError;

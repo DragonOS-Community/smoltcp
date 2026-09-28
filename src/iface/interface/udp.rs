@@ -14,7 +14,6 @@ impl InterfaceInner {
         &mut self,
         sockets: &mut SocketSet,
         meta: PacketMeta,
-        handled_by_raw_socket: bool,
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
@@ -72,10 +71,6 @@ impl InterfaceInner {
         // The packet wasn't handled by a socket, send an ICMP port unreachable packet.
         match ip_repr {
             #[cfg(feature = "proto-ipv4")]
-            IpRepr::Ipv4(_) if handled_by_raw_socket => None,
-            #[cfg(feature = "proto-ipv6")]
-            IpRepr::Ipv6(_) if handled_by_raw_socket => None,
-            #[cfg(feature = "proto-ipv4")]
             IpRepr::Ipv4(ipv4_repr) => {
                 let payload_len =
                     icmp_reply_payload_len(ip_payload.len(), IPV4_MIN_MTU, ipv4_repr.buffer_len());
@@ -86,6 +81,11 @@ impl InterfaceInner {
                 };
                 self.icmpv4_reply(ipv4_repr, icmpv4_reply_repr)
             }
+            // RFC 4443 / Linux icmp6_send: an unbound UDP port must not
+            // generate Port Unreachable for a multicast destination, even
+            // when a RAW socket also received a copy of the datagram.
+            #[cfg(feature = "proto-ipv6")]
+            IpRepr::Ipv6(ipv6_repr) if ipv6_repr.dst_addr.is_multicast() => None,
             #[cfg(feature = "proto-ipv6")]
             IpRepr::Ipv6(ipv6_repr) => {
                 let payload_len =

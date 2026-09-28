@@ -58,6 +58,7 @@ pub fn setup<'a>(medium: Medium) -> (Interface, SocketSet<'a>, TestingDevice) {
 pub struct TestingDevice {
     pub tx_queue: VecDeque<Vec<u8>>,
     pub rx_queue: VecDeque<Vec<u8>>,
+    pub rx_meta: phy::PacketMeta,
     max_transmission_unit: usize,
     medium: Medium,
 }
@@ -72,6 +73,7 @@ impl TestingDevice {
         TestingDevice {
             tx_queue: VecDeque::new(),
             rx_queue: VecDeque::new(),
+            rx_meta: phy::PacketMeta::default(),
             max_transmission_unit: match medium {
                 #[cfg(feature = "medium-ethernet")]
                 Medium::Ethernet => 1514,
@@ -99,7 +101,10 @@ impl Device for TestingDevice {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         self.rx_queue.pop_front().map(move |buffer| {
-            let rx = RxToken { buffer };
+            let rx = RxToken {
+                buffer,
+                meta: self.rx_meta,
+            };
             let tx = TxToken {
                 queue: &mut self.tx_queue,
             };
@@ -117,9 +122,14 @@ impl Device for TestingDevice {
 #[doc(hidden)]
 pub struct RxToken {
     buffer: Vec<u8>,
+    meta: phy::PacketMeta,
 }
 
 impl phy::RxToken for RxToken {
+    fn meta(&self) -> phy::PacketMeta {
+        self.meta
+    }
+
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,

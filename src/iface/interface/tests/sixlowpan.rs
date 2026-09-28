@@ -1,5 +1,20 @@
 use super::*;
 
+#[cfg(feature = "alloc")]
+struct RejectUnsupportedSixlowpan;
+
+#[cfg(feature = "alloc")]
+impl IpIngressFilter for RejectUnsupportedSixlowpan {
+    fn pre_routing(
+        &mut self,
+        _: &mut IngressPacket<'_>,
+        _: PacketMeta,
+        _: HardwareAddress,
+    ) -> PreRoutingVerdict {
+        panic!("6LoWPAN must fail closed before an IP-level filter is available")
+    }
+}
+
 #[rstest]
 #[case::ieee802154(Medium::Ieee802154)]
 #[cfg(feature = "medium-ieee802154")]
@@ -58,7 +73,7 @@ fn icmp_echo_request(#[case] medium: Medium) {
         }),
     ));
 
-    let (mut iface, mut sockets, _device) = setup(medium);
+    let (mut iface, mut sockets, mut device) = setup(medium);
     iface.update_ip_addrs(|ips| {
         ips.push(IpCidr::Ipv6(Ipv6Cidr::new(
             Ipv6Address::new(0xfe80, 0, 0, 0, 0x180b, 0x4242, 0x4242, 0x4242),
@@ -76,6 +91,17 @@ fn icmp_echo_request(#[case] medium: Medium) {
         ),
         response,
     );
+
+    #[cfg(feature = "alloc")]
+    {
+        device.rx_queue.push_back(data.to_vec());
+        let mut reject = RejectUnsupportedSixlowpan;
+        assert_eq!(
+            iface.poll_filtered(Instant::ZERO, &mut device, &mut sockets, &mut reject),
+            PollResult::None
+        );
+        assert!(device.tx_queue.is_empty());
+    }
 }
 
 #[test]

@@ -80,10 +80,9 @@ impl<'a> Repr<'a> {
         for option in iter {
             let option = option?;
 
-            if let Err(e) = options.push(option) {
-                net_trace!("error when parsing hop-by-hop options: {}", e);
-                break;
-            }
+            // Do not return a partial representation: a later option may
+            // require the receiver to discard the packet.
+            options.push(option).map_err(|_| Error)?;
         }
 
         Ok(Self { options })
@@ -168,6 +167,13 @@ mod tests {
         let mut options = Vec::new();
         options.push(Ipv6OptionRepr::PadN(12)).unwrap();
         assert_eq!(repr, Repr { options });
+    }
+
+    #[test]
+    fn test_repr_parse_rejects_option_overflow() {
+        let bytes = [0u8; config::IPV6_HBH_MAX_OPTIONS + 1];
+        let header = Header::new_checked(&bytes).unwrap();
+        assert_eq!(Repr::parse(&header), Err(Error));
     }
 
     #[test]

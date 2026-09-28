@@ -164,6 +164,21 @@ pub enum State {
     TimeWait,
 }
 
+/// Result of the output integration's complete-packet admission decision.
+/// A policy drop differs from a full queue or a missing route: the transport
+/// must apply packet-type-specific send/retry semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpPacketAdmission {
+    Admitted,
+    PolicyDropped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpDispatchOutcome {
+    Done,
+    PolicyDeferred,
+}
+
 impl fmt::Display for State {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
@@ -192,6 +207,11 @@ const RTTE_MIN_MARGIN: u32 = 5;
 
 const RTTE_MIN_RTO: u32 = 10;
 const RTTE_MAX_RTO: u32 = 10000;
+// An OUTPUT policy denial leaves new data unsent. Linux retries it through
+// the persist probe timer, whose floor and ceiling are separate from the
+// retransmission estimator used for packets already in flight.
+const POLICY_PROBE_MIN_MS: u64 = 200;
+const POLICY_PROBE_MAX_MS: u64 = 120_000;
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -514,6 +534,10 @@ pub struct Socket<'a> {
     remote_mss: usize,
     /// Last route-selected MTU, shared by dispatch and poll/Nagle decisions.
     output_ip_mtu: Option<usize>,
+    /// An unsent data/FIN segment denied by output policy. Unlike a SYN,
+    /// this segment has not advanced the send head and needs a retry deadline.
+    policy_retry_at: Option<Instant>,
+    policy_retry_failures: u8,
     /// The timestamp of the last packet received.
     remote_last_ts: Option<Instant>,
     /// The sequence number of the last packet received, used for sACK
@@ -694,6 +718,8 @@ impl<'a> Socket<'a> {
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
             output_ip_mtu: None,
+            policy_retry_at: None,
+            policy_retry_failures: 0,
             remote_last_ts: None,
             local_rx_last_ack: None,
             local_rx_last_seq: None,
@@ -1116,6 +1142,8 @@ impl<'a> Socket<'a> {
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
         self.output_ip_mtu = None;
+        self.policy_retry_at = None;
+        self.policy_retry_failures = 0;
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
@@ -2760,20 +2788,71 @@ impl<'a> Socket<'a> {
     where
         F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
-        let result = self.dispatch_inner(cx, ip_mtu, emit);
+        self.policy_retry_at = None;
+        self.policy_retry_failures = 0;
+        let result = self.dispatch_inner(cx, ip_mtu, |cx, packet| {
+            emit(cx, packet).map(|_| TcpPacketAdmission::Admitted)
+        });
+        self.notify_lifecycle();
+        result.map(|_| ())
+    }
+
+    /// Like `dispatch_with_mtu`, but report policy denial before treating a
+    /// TCP packet as sent. Only sequence-bearing data/FIN is deferred; SYN and
+    /// one-shot control packets retain their normal timer/state transitions.
+    pub fn dispatch_with_mtu_policy<F, E>(
+        &mut self,
+        cx: &mut Context,
+        ip_mtu: usize,
+        emit: F,
+    ) -> Result<TcpDispatchOutcome, E>
+    where
+        F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<TcpPacketAdmission, E>,
+    {
+        if self.policy_retry_at.is_some_and(|deadline| {
+            cx.now() >= deadline || self.timer.should_retransmit(cx.now()).is_some()
+        }) {
+            self.policy_retry_at = None;
+        }
+        let mut admitted_sequence = false;
+        let result = self.dispatch_inner(cx, ip_mtu, |cx, packet| {
+            let occupies_sequence = packet.1.segment_len() > 0;
+            let admission = emit(cx, packet)?;
+            admitted_sequence = occupies_sequence && admission == TcpPacketAdmission::Admitted;
+            Ok(admission)
+        });
+        if matches!(result.as_ref(), Ok(TcpDispatchOutcome::PolicyDeferred)) {
+            let shift = self.policy_retry_failures.min(10);
+            let delay_ms = self
+                .rto()
+                .total_millis()
+                .max(POLICY_PROBE_MIN_MS)
+                .saturating_mul(1u64 << shift)
+                .min(POLICY_PROBE_MAX_MS);
+            self.policy_retry_at = Some(cx.now() + Duration::from_millis(delay_ms));
+            self.policy_retry_failures = self.policy_retry_failures.saturating_add(1);
+        } else if admitted_sequence {
+            self.policy_retry_at = None;
+            self.policy_retry_failures = 0;
+        }
         self.notify_lifecycle();
         result
     }
 
-    fn dispatch_inner<F, E>(&mut self, cx: &mut Context, ip_mtu: usize, emit: F) -> Result<(), E>
+    fn dispatch_inner<F, E>(
+        &mut self,
+        cx: &mut Context,
+        ip_mtu: usize,
+        emit: F,
+    ) -> Result<TcpDispatchOutcome, E>
     where
-        F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
+        F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<TcpPacketAdmission, E>,
     {
         if self.state == State::TimeWait {
             self.ensure_time_wait(cx.now());
             if self.time_wait.as_ref().unwrap().expires <= cx.now() {
                 self.retire_time_wait();
-                return Ok(());
+                return Ok(TcpDispatchOutcome::Done);
             }
             self.timer = Timer::Close {
                 expires_at: self.time_wait.as_ref().unwrap().expires,
@@ -2781,7 +2860,7 @@ impl<'a> Socket<'a> {
         }
         if self.tuple.is_none() {
             self.output_ip_mtu = None;
-            return Ok(());
+            return Ok(TcpDispatchOutcome::Done);
         }
         self.output_ip_mtu = Some(ip_mtu);
 
@@ -2805,7 +2884,7 @@ impl<'a> Socket<'a> {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
-        } else if !self.seq_to_transmit(cx) {
+        } else {
             if let Some(retransmit_delta) = self.timer.should_retransmit(cx.now()) {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
                 net_debug!("retransmitting at t+{}", retransmit_delta);
@@ -2831,8 +2910,12 @@ impl<'a> Socket<'a> {
             }
         }
 
+        let defer_unsent_data = self
+            .policy_retry_at
+            .is_some_and(|deadline| cx.now() < deadline);
+
         // Decide whether we're sending a packet.
-        if self.seq_to_transmit(cx) {
+        if self.seq_to_transmit(cx) && !defer_unsent_data {
             // If we have data to transmit and it fits into partner's window, do it.
             tcp_trace!("outgoing segment will send data or flags");
         } else if self.ack_to_transmit() && self.delayed_ack_expired(cx.now()) {
@@ -2851,9 +2934,9 @@ impl<'a> Socket<'a> {
             // If we have spent enough time in the TIME-WAIT state, close the socket.
             tcp_trace!("TIME-WAIT timer expired");
             self.reset();
-            return Ok(());
+            return Ok(TcpDispatchOutcome::Done);
         } else {
-            return Ok(());
+            return Ok(TcpDispatchOutcome::Done);
         }
 
         // NOTE(unwrap): we check tuple is not None the first thing in this function.
@@ -2897,7 +2980,7 @@ impl<'a> Socket<'a> {
             }
 
             // We never transmit anything in the LISTEN state.
-            State::Listen => return Ok(()),
+            State::Listen => return Ok(TcpDispatchOutcome::Done),
 
             // We transmit a SYN in the SYN-SENT state.
             // We transmit a SYN|ACK in the SYN-RECEIVED state.
@@ -2959,11 +3042,13 @@ impl<'a> Socket<'a> {
                     .min(ip_mtu.saturating_sub(ip_repr.header_len() + repr.header_len()));
 
                 let offset = self.remote_last_seq - self.local_seq_no;
-                repr.payload = self.tx_buffer.get_allocated(offset, size);
+                if !defer_unsent_data {
+                    repr.payload = self.tx_buffer.get_allocated(offset, size);
+                }
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
-                if offset + repr.payload.len() == self.tx_buffer.len() {
+                if !defer_unsent_data && offset + repr.payload.len() == self.tx_buffer.len() {
                     match self.state {
                         State::FinWait1 | State::LastAck | State::Closing => {
                             repr.control = TcpControl::Fin
@@ -3030,7 +3115,17 @@ impl<'a> Socket<'a> {
         // to not waste time waiting for the retransmit timer on packets that we know
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
-        emit(cx, (ip_repr, repr))?;
+        let admission = emit(cx, (ip_repr, repr))?;
+        if admission == TcpPacketAdmission::PolicyDropped
+            && repr.segment_len() > 0
+            && repr.control != TcpControl::Syn
+            && !is_keep_alive
+        {
+            // An unsent data/FIN segment stays in the transmit buffer. The
+            // integration owns the retry deadline; returning success here
+            // would advance remote_last_seq and hide the packet from it.
+            return Ok(TcpDispatchOutcome::PolicyDeferred);
+        }
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
@@ -3051,7 +3146,7 @@ impl<'a> Socket<'a> {
         // Leave the rest of the state intact if sending a keep-alive packet, since those
         // carry a fake segment.
         if is_keep_alive {
-            return Ok(());
+            return Ok(TcpDispatchOutcome::Done);
         }
 
         // We've sent a packet successfully, so we can update the internal state now.
@@ -3084,7 +3179,7 @@ impl<'a> Socket<'a> {
             }
         }
 
-        Ok(())
+        Ok(TcpDispatchOutcome::Done)
     }
 
     #[allow(clippy::if_same_then_else)]
@@ -3104,7 +3199,7 @@ impl<'a> Socket<'a> {
         } else if self.state == State::Closed {
             // Socket was aborted, we have an RST packet to transmit.
             PollAt::Now
-        } else if self.seq_to_transmit(cx) {
+        } else if self.seq_to_transmit(cx) && self.policy_retry_at.is_none() {
             // We have a data or flag packet to transmit.
             PollAt::Now
         } else if self.window_to_update() {
@@ -3129,10 +3224,22 @@ impl<'a> Socket<'a> {
             };
 
             // We wait for the earliest of our timers to fire.
-            *[self.timer.poll_at(), timeout_poll_at, delayed_ack_poll_at]
-                .iter()
-                .min()
-                .unwrap_or(&PollAt::Ingress)
+            let policy_poll_at = self.policy_retry_at.map_or(PollAt::Ingress, |at| {
+                if self.seq_to_transmit(cx) {
+                    PollAt::Time(at)
+                } else {
+                    PollAt::Ingress
+                }
+            });
+            *[
+                self.timer.poll_at(),
+                timeout_poll_at,
+                delayed_ack_poll_at,
+                policy_poll_at,
+            ]
+            .iter()
+            .min()
+            .unwrap_or(&PollAt::Ingress)
         }
     }
 }
@@ -3487,6 +3594,152 @@ mod test {
         assert!(emitted > 2000);
         s.reset();
         assert_eq!(s.output_ip_mtu, None);
+    }
+
+    #[test]
+    fn policy_drop_does_not_advance_unsent_tcp_data() {
+        let mut s = socket_established();
+        s.send_slice(b"abc").unwrap();
+        let sequence = s.remote_last_seq;
+        let TestSocket { socket, cx } = &mut s;
+        let result = socket.dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+            assert_eq!(tcp.payload, b"abc");
+            Ok::<_, ()>(TcpPacketAdmission::PolicyDropped)
+        });
+        assert_eq!(result, Ok(TcpDispatchOutcome::PolicyDeferred));
+        assert_eq!(s.remote_last_seq, sequence);
+        assert_eq!(s.tx_buffer.len(), 3);
+        let retry_at = s.policy_retry_at.unwrap();
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(retry_at));
+        assert!(retry_at >= s.cx.now() + Duration::from_millis(POLICY_PROBE_MIN_MS));
+        let TestSocket { socket, cx } = &mut s;
+        let result: Result<TcpDispatchOutcome, ()> =
+            socket.dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+                panic!("policy changes must not bypass the persist timer: {tcp:?}")
+            });
+        assert_eq!(result, Ok(TcpDispatchOutcome::Done));
+        s.cx.set_now(retry_at);
+        let TestSocket { socket, cx } = &mut s;
+        let result = socket.dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+            assert_eq!(tcp.payload, b"abc");
+            Ok::<_, ()>(TcpPacketAdmission::Admitted)
+        });
+        assert_eq!(result, Ok(TcpDispatchOutcome::Done));
+        assert_eq!(s.remote_last_seq, sequence + 3);
+    }
+
+    #[test]
+    fn policy_denied_data_uses_persist_floor_and_backoff() {
+        let mut s = socket_established();
+        s.rtte.rtt = 5;
+        s.rtte.deviation = 0;
+        s.send_slice(b"abc").unwrap();
+        let initial = s.cx.now();
+        for (attempt, expected_delay_ms) in [(1, 200), (2, 400), (3, 800)] {
+            let TestSocket { socket, cx } = &mut s;
+            assert_eq!(
+                socket.dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+                    assert_eq!(tcp.payload, b"abc");
+                    Ok::<_, ()>(TcpPacketAdmission::PolicyDropped)
+                }),
+                Ok(TcpDispatchOutcome::PolicyDeferred)
+            );
+            let deadline = s.policy_retry_at.unwrap();
+            assert_eq!(
+                deadline,
+                s.cx.now() + Duration::from_millis(expected_delay_ms)
+            );
+            assert_eq!(s.policy_retry_failures, attempt);
+            s.cx.set_now(deadline);
+        }
+        assert!(s.cx.now() >= initial + Duration::from_millis(1400));
+        let TestSocket { socket, cx } = &mut s;
+        assert_eq!(
+            socket.dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+                assert_eq!(tcp.payload, b"abc");
+                Ok::<_, ()>(TcpPacketAdmission::Admitted)
+            }),
+            Ok(TcpDispatchOutcome::Done)
+        );
+        assert_eq!(s.policy_retry_at, None);
+        assert_eq!(s.policy_retry_failures, 0);
+    }
+
+    #[test]
+    fn policy_drop_of_syn_still_starts_retransmission() {
+        let mut s = socket_syn_sent();
+        let TestSocket { socket, cx } = &mut s;
+        let result = socket.dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+            assert_eq!(tcp.control, TcpControl::Syn);
+            Ok::<_, ()>(TcpPacketAdmission::PolicyDropped)
+        });
+        assert_eq!(result, Ok(TcpDispatchOutcome::Done));
+        assert_eq!(s.remote_last_seq, LOCAL_SEQ + 1);
+        assert!(matches!(s.timer, Timer::Retransmit { .. }));
+    }
+
+    #[test]
+    fn deferred_new_data_does_not_starve_older_retransmission() {
+        let mut s = socket_established();
+        s.set_nagle_enabled(false);
+        s.send_slice(b"a").unwrap();
+        let TestSocket { socket, cx } = &mut s;
+        socket
+            .dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+                assert_eq!(tcp.payload, b"a");
+                Ok::<_, ()>(TcpPacketAdmission::Admitted)
+            })
+            .unwrap();
+        let Timer::Retransmit { expires_at, .. } = s.timer else {
+            panic!("the first sent segment must start retransmission")
+        };
+        s.cx.set_now(expires_at - Duration::from_millis(1));
+        s.send_slice(b"b").unwrap();
+        let TestSocket { socket, cx } = &mut s;
+        assert_eq!(
+            socket.dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+                assert_eq!(tcp.payload, b"b");
+                Ok::<_, ()>(TcpPacketAdmission::PolicyDropped)
+            }),
+            Ok(TcpDispatchOutcome::PolicyDeferred)
+        );
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(expires_at));
+        s.cx.set_now(expires_at);
+        let TestSocket { socket, cx } = &mut s;
+        socket
+            .dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+                assert_eq!(tcp.seq_number, LOCAL_SEQ + 1);
+                assert!(tcp.payload.starts_with(b"a"));
+                Ok::<_, ()>(TcpPacketAdmission::Admitted)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn deferred_data_does_not_suppress_pure_ack() {
+        let mut s = socket_established();
+        s.send_slice(b"data").unwrap();
+        let TestSocket { socket, cx } = &mut s;
+        socket
+            .dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+                assert_eq!(tcp.payload, b"data");
+                Ok::<_, ()>(TcpPacketAdmission::PolicyDropped)
+            })
+            .unwrap();
+        let old_send_head = s.remote_last_seq;
+        s.remote_last_ack = Some(REMOTE_SEQ);
+        s.ack_delay_timer = AckDelayTimer::Immediate;
+        let TestSocket { socket, cx } = &mut s;
+        assert_eq!(
+            socket.dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+                assert!(tcp.payload.is_empty());
+                assert_eq!(tcp.control, TcpControl::None);
+                Ok::<_, ()>(TcpPacketAdmission::Admitted)
+            }),
+            Ok(TcpDispatchOutcome::Done)
+        );
+        assert_eq!(s.remote_last_seq, old_send_head);
+        assert!(s.policy_retry_at.is_some());
     }
 
     fn socket_fin_wait_1() -> TestSocket {

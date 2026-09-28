@@ -1,5 +1,567 @@
 use super::*;
 
+#[cfg(all(feature = "alloc", feature = "medium-ethernet", feature = "socket-raw"))]
+#[test]
+fn deferred_ipv6_output_serializes_without_neighbor_lookup() {
+    use core::cell::RefCell;
+    use std::rc::Rc;
+
+    struct DeferredToken(Rc<RefCell<Vec<u8>>>);
+
+    impl TxToken for DeferredToken {
+        fn deferred_ip_output(&self, _: IpVersion) -> bool {
+            true
+        }
+
+        fn consume_full_ip<F>(
+            self,
+            len: usize,
+            _: PacketMeta,
+            class: crate::phy::IpOutputClass,
+            _: Option<u16>,
+            emit: F,
+        ) -> Result<(), crate::phy::IpOutputError>
+        where
+            F: FnOnce(&mut [u8]),
+        {
+            assert_eq!(class, crate::phy::IpOutputClass::Ordinary);
+            let mut bytes = vec![0; len];
+            emit(&mut bytes);
+            *self.0.borrow_mut() = bytes;
+            Ok(())
+        }
+
+        fn consume<R, F>(self, _: usize, _: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            panic!("deferred output must not use link-layer transmission")
+        }
+    }
+
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let payload = [0x5a; 32];
+    let source = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+    let destination = Ipv6Address::new(0xfd01, 0, 0, 0, 0, 0, 0, 7);
+    let packet = Packet::new_ipv6(
+        Ipv6Repr {
+            src_addr: source,
+            dst_addr: destination,
+            next_header: IpProtocol::Udp,
+            payload_len: payload.len(),
+            hop_limit: 64,
+        },
+        IpPayload::Raw(&payload),
+    );
+    let emitted = Rc::new(RefCell::new(Vec::new()));
+    iface
+        .inner
+        .dispatch_ip(
+            DeferredToken(emitted.clone()),
+            PacketMeta::default(),
+            packet,
+            &mut iface.fragmenter,
+        )
+        .unwrap();
+    let output = emitted.borrow();
+    let ipv6 = Ipv6Packet::new_checked(&output[..]).unwrap();
+    assert_eq!(ipv6.payload_len() as usize + 40, output.len());
+    assert_eq!(ipv6.dst_addr(), destination);
+    assert_eq!(ipv6.payload(), &payload[..]);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+struct RewriteIpv6Destination {
+    calls: usize,
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+struct CountValidatedIpv6 {
+    observed: Vec<Vec<u8>>,
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+impl IpIngressFilter for CountValidatedIpv6 {
+    fn pre_routing(
+        &mut self,
+        packet: &mut IngressPacket<'_>,
+        _: PacketMeta,
+        _: HardwareAddress,
+    ) -> PreRoutingVerdict {
+        self.observed.push(packet.take_owned().unwrap());
+        PreRoutingVerdict::Drop
+    }
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip", feature = "packetmeta-id"))]
+#[test]
+fn ipv6_pre_routing_receives_rx_token_metadata() {
+    struct CaptureMeta(Option<PacketMeta>);
+
+    impl IpIngressFilter for CaptureMeta {
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            meta: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            self.0 = Some(meta);
+            PreRoutingVerdict::Drop
+        }
+    }
+
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    device.rx_queue.push_back(routed_ipv6_bytes());
+    let mut filter = CaptureMeta(None);
+    let meta = PacketMeta { id: 72 };
+    device.rx_meta = meta;
+    assert_eq!(
+        iface.poll_ingress_single_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter),
+        PollIngressSingleResult::SocketStateChanged
+    );
+    assert_eq!(filter.0, Some(meta));
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn ipv6_receive_validation_precedes_filter_callback() {
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let mut scratch = AllocVec::new();
+    let mut filter = CountValidatedIpv6 {
+        observed: Vec::new(),
+    };
+
+    let mut invalid_version = routed_ipv6_bytes();
+    invalid_version[0] = 0x40;
+    let invalid_version = Ipv6Packet::new_checked(&invalid_version[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &invalid_version,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+
+    let mut unsupported_jumbo = routed_ipv6_bytes();
+    unsupported_jumbo[6] = 0; // Hop-by-Hop with zero fixed-header payload length.
+    unsupported_jumbo.extend_from_slice(&[59, 0, 0xc2, 4, 0, 1, 0, 0]);
+    let unsupported_jumbo = Ipv6Packet::new_checked(&unsupported_jumbo[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &unsupported_jumbo,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+
+    let mut discarded_option = routed_ipv6_bytes();
+    discarded_option[5] = 8;
+    discarded_option[6] = 0;
+    discarded_option.extend_from_slice(&[59, 0, 0x40, 0, 0, 0, 0, 0]);
+    let discarded_option = Ipv6Packet::new_checked(&discarded_option[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &discarded_option,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+    assert!(filter.observed.is_empty());
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn ipv6_discard_option_after_four_padding_options_is_not_observed() {
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let mut scratch = AllocVec::new();
+    let mut filter = CountValidatedIpv6 {
+        observed: Vec::new(),
+    };
+    let mut bytes = routed_ipv6_bytes();
+    bytes[5] = 8;
+    bytes[6] = 0;
+    bytes.extend_from_slice(&[59, 0, 0, 0, 0, 0, 0x40, 0]);
+    let packet = Ipv6Packet::new_checked(&bytes[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+    assert!(filter.observed.is_empty());
+
+    let mut valid = routed_ipv6_bytes();
+    valid[5] = 8;
+    valid[6] = 0;
+    valid.extend_from_slice(&[59, 0, 0, 0, 0, 0, 0, 0]);
+    let valid_packet = Ipv6Packet::new_checked(&valid[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &valid_packet,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+    assert_eq!(filter.observed, vec![valid]);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn non_loopback_ip_medium_rejects_ipv6_loopback_and_interface_local() {
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let mut scratch = AllocVec::new();
+    let mut filter = CountValidatedIpv6 {
+        observed: Vec::new(),
+    };
+    for destination in [
+        Ipv6Address::LOCALHOST,
+        Ipv6Address::new(0xff01, 0, 0, 0, 0, 0, 0, 1),
+    ] {
+        let mut bytes = routed_ipv6_bytes();
+        Ipv6Packet::new_unchecked(&mut bytes).set_dst_addr(destination);
+        let packet = Ipv6Packet::new_checked(&bytes[..]).unwrap();
+        assert!(iface
+            .inner
+            .process_ipv6_filtered(
+                &mut sockets,
+                PacketMeta::default(),
+                HardwareAddress::Ip,
+                &packet,
+                &mut scratch,
+                &mut filter,
+            )
+            .is_none());
+    }
+    assert!(filter.observed.is_empty());
+
+    iface.inner.is_loopback = true;
+    let mut bytes = routed_ipv6_bytes();
+    Ipv6Packet::new_unchecked(&mut bytes).set_dst_addr(Ipv6Address::LOCALHOST);
+    let packet = Ipv6Packet::new_checked(&bytes[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+    assert_eq!(filter.observed, vec![bytes]);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip", feature = "medium-ethernet"))]
+#[test]
+fn ethernet_ipv6_invalid_scopes_never_reach_filter_callback() {
+    let (mut iface, mut sockets, _) = setup(Medium::Ethernet);
+    let mut scratch = AllocVec::new();
+    let mut filter = CountValidatedIpv6 {
+        observed: Vec::new(),
+    };
+    let loopback = Ipv6Address::LOCALHOST;
+    let outside = Ipv6Address::new(0xfd01, 0, 0, 0, 0, 0, 0, 7);
+    let cases = [
+        (loopback, outside),
+        (Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1), loopback),
+        (
+            Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Address::new(0xff00, 0, 0, 0, 0, 0, 0, 1),
+        ),
+        (
+            Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Address::new(0xff01, 0, 0, 0, 0, 0, 0, 1),
+        ),
+    ];
+    for (src, dst) in cases {
+        let mut bytes = routed_ipv6_bytes();
+        let mut packet = Ipv6Packet::new_unchecked(&mut bytes);
+        packet.set_src_addr(src);
+        packet.set_dst_addr(dst);
+        let packet = Ipv6Packet::new_checked(&bytes[..]).unwrap();
+        assert!(iface
+            .inner
+            .process_ipv6_filtered(
+                &mut sockets,
+                PacketMeta::default(),
+                HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 9])),
+                &packet,
+                &mut scratch,
+                &mut filter,
+            )
+            .is_none());
+    }
+    assert!(filter.observed.is_empty());
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+impl IpIngressFilter for RewriteIpv6Destination {
+    fn pre_routing(
+        &mut self,
+        packet: &mut IngressPacket<'_>,
+        _: PacketMeta,
+        _: HardwareAddress,
+    ) -> PreRoutingVerdict {
+        self.calls += 1;
+        assert_eq!(packet.bytes().len(), 48);
+        let mut ipv6 = Ipv6Packet::new_unchecked(packet.writable().unwrap());
+        let destination = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 1);
+        let source = ipv6.src_addr();
+        ipv6.set_dst_addr(destination);
+        Icmpv6Packet::new_unchecked(ipv6.payload_mut()).fill_checksum(&source, &destination);
+        PreRoutingVerdict::Pass
+    }
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn full_poll_applies_ipv6_rewrite_before_local_delivery() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let remote = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 2);
+    let original_destination = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 3);
+    let echo = Icmpv6Repr::EchoRequest {
+        ident: 7,
+        seq_no: 1,
+        data: &[],
+    };
+    let repr = Ipv6Repr {
+        src_addr: remote,
+        dst_addr: original_destination,
+        next_header: IpProtocol::Icmpv6,
+        payload_len: echo.buffer_len(),
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0; repr.buffer_len() + echo.buffer_len() + 8];
+    repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes));
+    echo.emit(
+        &remote,
+        &original_destination,
+        &mut Icmpv6Packet::new_unchecked(&mut bytes[40..48]),
+        &ChecksumCapabilities::default(),
+    );
+    device.rx_queue.push_back(bytes);
+    let mut filter = RewriteIpv6Destination { calls: 0 };
+    assert_eq!(
+        iface.poll_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter),
+        PollResult::SocketStateChanged
+    );
+    assert_eq!(filter.calls, 1);
+    let reply = device.tx_queue.pop_front().unwrap();
+    let ip = Ipv6Packet::new_checked(&reply[..]).unwrap();
+    assert_eq!(ip.src_addr(), Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 1));
+    assert_eq!(ip.dst_addr(), remote);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn local_input_ipv6_rewrite_is_validated_before_transport_reply() {
+    struct RewriteSource {
+        calls: usize,
+        repair_checksum: bool,
+    }
+
+    impl IpIngressFilter for RewriteSource {
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            PreRoutingVerdict::Pass
+        }
+
+        fn local_input(
+            &mut self,
+            packet: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+            protocol: IpProtocol,
+            transport_offset: usize,
+        ) -> LocalInputVerdict {
+            self.calls += 1;
+            assert_eq!(protocol, IpProtocol::Icmpv6);
+            assert_eq!(transport_offset, 40);
+            let mut ipv6 = Ipv6Packet::new_unchecked(packet.writable().unwrap());
+            let source = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 9);
+            let destination = ipv6.dst_addr();
+            ipv6.set_src_addr(source);
+            if self.repair_checksum {
+                Icmpv6Packet::new_unchecked(ipv6.payload_mut())
+                    .fill_checksum(&source, &destination);
+            }
+            LocalInputVerdict::Pass
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let old_source = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 2);
+    let new_source = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 9);
+    let destination = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 1);
+    let echo = Icmpv6Repr::EchoRequest {
+        ident: 7,
+        seq_no: 1,
+        data: &[1, 2, 3, 4],
+    };
+    let repr = Ipv6Repr {
+        src_addr: old_source,
+        dst_addr: destination,
+        next_header: IpProtocol::Icmpv6,
+        payload_len: echo.buffer_len(),
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0; repr.buffer_len() + echo.buffer_len()];
+    repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes));
+    echo.emit(
+        &old_source,
+        &destination,
+        &mut Icmpv6Packet::new_unchecked(&mut bytes[40..]),
+        &ChecksumCapabilities::default(),
+    );
+    let original = bytes.clone();
+    let packet = Ipv6Packet::new_checked(&bytes[..]).unwrap();
+    let mut scratch = AllocVec::new();
+    let mut filter = RewriteSource {
+        calls: 0,
+        repair_checksum: true,
+    };
+    let reply = iface.inner.process_ipv6_filtered(
+        &mut sockets,
+        PacketMeta::default(),
+        HardwareAddress::Ip,
+        &packet,
+        &mut scratch,
+        &mut filter,
+    );
+    let expected = Packet::new_ipv6(
+        Ipv6Repr {
+            src_addr: destination,
+            dst_addr: new_source,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: echo.buffer_len(),
+            hop_limit: 64,
+        },
+        IpPayload::Icmpv6(Icmpv6Repr::EchoReply {
+            ident: 7,
+            seq_no: 1,
+            data: &[1, 2, 3, 4],
+        }),
+    );
+    assert_eq!(reply, Some(expected));
+    assert_eq!(filter.calls, 1);
+    assert_eq!(bytes, original);
+    drop(reply);
+    assert_eq!(&scratch[8..24], &new_source.octets());
+
+    let mut malformed = RewriteSource {
+        calls: 0,
+        repair_checksum: false,
+    };
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut scratch,
+            &mut malformed,
+        )
+        .is_none());
+    assert_eq!(malformed.calls, 1);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn local_input_ipv6_cannot_rewrite_destination_to_nonlocal() {
+    struct RewriteDestination;
+
+    impl IpIngressFilter for RewriteDestination {
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            PreRoutingVerdict::Pass
+        }
+
+        fn local_input(
+            &mut self,
+            packet: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+            _: IpProtocol,
+            _: usize,
+        ) -> LocalInputVerdict {
+            let mut ipv6 = Ipv6Packet::new_unchecked(packet.writable().unwrap());
+            let source = ipv6.src_addr();
+            let destination = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9);
+            ipv6.set_dst_addr(destination);
+            Icmpv6Packet::new_unchecked(ipv6.payload_mut()).fill_checksum(&source, &destination);
+            LocalInputVerdict::Pass
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let source = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 2);
+    let destination = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 1);
+    let echo = Icmpv6Repr::EchoRequest {
+        ident: 7,
+        seq_no: 1,
+        data: &[],
+    };
+    let repr = Ipv6Repr {
+        src_addr: source,
+        dst_addr: destination,
+        next_header: IpProtocol::Icmpv6,
+        payload_len: echo.buffer_len(),
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0; repr.buffer_len() + echo.buffer_len()];
+    repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes));
+    echo.emit(
+        &source,
+        &destination,
+        &mut Icmpv6Packet::new_unchecked(&mut bytes[40..]),
+        &ChecksumCapabilities::default(),
+    );
+    let packet = Ipv6Packet::new_checked(&bytes[..]).unwrap();
+    let mut scratch = AllocVec::new();
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut scratch,
+            &mut RewriteDestination,
+        )
+        .is_none());
+}
+
 #[derive(Clone)]
 struct CapturedIpv6(std::rc::Rc<core::cell::RefCell<Vec<Vec<u8>>>>);
 
@@ -23,6 +585,199 @@ fn routed_ipv6_bytes() -> Vec<u8> {
     let mut bytes = vec![0; 40];
     repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes));
     bytes
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn ipv6_packet_aware_filter_selects_fragments_without_slowing_plain_packets() {
+    struct SelectFragments {
+        calls: usize,
+    }
+
+    impl IpIngressFilter for SelectFragments {
+        fn applies_to(&self, _: IpVersion) -> bool {
+            false
+        }
+
+        fn applies_to_packet(&self, version: IpVersion, packet: &[u8]) -> bool {
+            version == IpVersion::Ipv6 && packet.get(6) == Some(&44)
+        }
+
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            self.calls += 1;
+            PreRoutingVerdict::Drop
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let mut scratch = AllocVec::new();
+    let mut filter = SelectFragments { calls: 0 };
+    let normal = routed_ipv6_bytes();
+    let _ = iface.inner.process_ip_filtered(
+        &mut sockets,
+        PacketMeta::default(),
+        &normal,
+        &mut iface.fragments,
+        &mut scratch,
+        &mut filter,
+    );
+    assert_eq!(filter.calls, 0);
+
+    let mut fragment = routed_ipv6_bytes();
+    fragment[6] = 44;
+    fragment[5] = 8;
+    fragment.extend_from_slice(&[59, 0, 0, 0, 0, 0, 0, 1]);
+    let _ = iface.inner.process_ip_filtered(
+        &mut sockets,
+        PacketMeta::default(),
+        &fragment,
+        &mut iface.fragments,
+        &mut scratch,
+        &mut filter,
+    );
+    assert_eq!(filter.calls, 1);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn ipv6_defrag_callback_runs_before_ordinary_pre_routing() {
+    struct Capture {
+        stages: Vec<&'static str>,
+    }
+
+    impl IpIngressFilter for Capture {
+        fn pre_routing_ipv6_defrag(
+            &mut self,
+            packet: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            self.stages.push("defrag");
+            if packet.bytes()[6] == 44 {
+                let owned = packet.take_owned().unwrap();
+                assert_eq!(owned[6], 44);
+                PreRoutingVerdict::Drop
+            } else {
+                PreRoutingVerdict::Pass
+            }
+        }
+
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            self.stages.push("pre_routing");
+            PreRoutingVerdict::Drop
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let mut scratch = AllocVec::new();
+    let mut filter = Capture { stages: Vec::new() };
+    let normal = routed_ipv6_bytes();
+    let normal = Ipv6Packet::new_checked(&normal[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &normal,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+    assert_eq!(filter.stages, ["defrag", "pre_routing"]);
+
+    filter.stages.clear();
+    let mut fragment = routed_ipv6_bytes();
+    fragment[6] = 44;
+    fragment[5] = 8;
+    fragment.extend_from_slice(&[59, 0, 0, 0, 0, 0, 0, 1]);
+    let fragment = Ipv6Packet::new_checked(&fragment[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &fragment,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+    assert_eq!(filter.stages, ["defrag"]);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn ipv6_route_handoff_runs_after_prerouting_and_before_local_fanout() {
+    struct Capture {
+        pre_routing: bool,
+        transferred: Vec<u8>,
+    }
+
+    impl IpIngressFilter for Capture {
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            self.pre_routing = true;
+            PreRoutingVerdict::Pass
+        }
+
+        fn route_input(
+            &mut self,
+            packet: &mut RoutedIngressPacket<'_, '_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> RouteInputVerdict {
+            assert!(self.pre_routing);
+            self.transferred = packet.take_owned().unwrap();
+            RouteInputVerdict::Forward
+        }
+
+        fn local_input(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+            _: IpProtocol,
+            _: usize,
+        ) -> LocalInputVerdict {
+            panic!("forwarded IPv6 must never enter local raw or transport fanout")
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let bytes = routed_ipv6_bytes();
+    let packet = Ipv6Packet::new_checked(&bytes[..]).unwrap();
+    let mut scratch = AllocVec::new();
+    let mut filter = Capture {
+        pre_routing: false,
+        transferred: Vec::new(),
+    };
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+    assert_eq!(filter.transferred, bytes);
 }
 
 #[test]
@@ -1014,6 +1769,117 @@ fn ndisc_neighbor_advertisement_ethernet(#[case] medium: Medium) {
     );
 }
 
+#[cfg(all(feature = "alloc", feature = "medium-ethernet"))]
+#[test]
+fn routed_link_control_updates_only_the_receiving_interfaces_neighbor_cache() {
+    struct KeepOnIngress {
+        local_input_calls: usize,
+    }
+
+    impl IpIngressFilter for KeepOnIngress {
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            PreRoutingVerdict::Pass
+        }
+
+        fn route_input(
+            &mut self,
+            _: &mut RoutedIngressPacket<'_, '_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> RouteInputVerdict {
+            RouteInputVerdict::NeighborDiscovery
+        }
+
+        fn local_input(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+            _: IpProtocol,
+            _: usize,
+        ) -> LocalInputVerdict {
+            self.local_input_calls += 1;
+            LocalInputVerdict::Pass
+        }
+    }
+
+    // The destination is not assigned to this interface. This is the normal
+    // weak-host case where a different interface owns the global address.
+    let src = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 2);
+    let dst = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 3);
+    let advertised_mac = EthernetAddress([2, 0, 0, 0, 0, 9]);
+    let mut data = vec![0; 72];
+    data[0] = 0x60;
+    data[4..6].copy_from_slice(&32u16.to_be_bytes());
+    data[6] = u8::from(IpProtocol::Icmpv6);
+    data[7] = 255;
+    data[40] = 136; // Neighbor Advertisement.
+    data[44] = 0x40; // Solicited.
+    data[48..64].copy_from_slice(&Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2).octets());
+    data[64] = 2; // Target Link-Layer Address option.
+    data[65] = 1; // One eight-byte unit.
+    data[66..72].copy_from_slice(&advertised_mac.0);
+    {
+        let mut ip = Ipv6Packet::new_unchecked(&mut data[..]);
+        ip.set_src_addr(src);
+        ip.set_dst_addr(dst);
+    }
+    Icmpv6Packet::new_unchecked(&mut data[40..]).fill_checksum(&src, &dst);
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ethernet);
+    let mut scratch = AllocVec::new();
+    let mut filter = KeepOnIngress {
+        local_input_calls: 0,
+    };
+    let packet = Ipv6Packet::new_checked(&data[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ethernet(advertised_mac),
+            &packet,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+    assert_eq!(filter.local_input_calls, 1);
+    assert!(
+        scratch.is_empty(),
+        "read-only LOCAL_IN must not copy the packet"
+    );
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&src.into(), iface.inner.now),
+        NeighborAnswer::Found(HardwareAddress::Ethernet(advertised_mac))
+    );
+
+    // An arbitrary ICMPv6 packet may not use NeighborDiscovery to bypass address
+    // ownership, even if an integration returns that verdict by mistake.
+    data[40] = 128; // Echo request rather than neighbor advertisement.
+    Icmpv6Packet::new_unchecked(&mut data[40..]).fill_checksum(&src, &dst);
+    let packet = Ipv6Packet::new_checked(&data[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv6_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ethernet(advertised_mac),
+            &packet,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+    assert_eq!(filter.local_input_calls, 1);
+}
+
 #[rstest]
 #[case::ethernet(Medium::Ethernet)]
 #[cfg(feature = "medium-ethernet")]
@@ -1372,17 +2238,61 @@ fn test_icmp_reply_size(#[case] medium: Medium) {
     );
 
     assert_eq!(
-        iface.inner.process_udp(
-            &mut sockets,
-            PacketMeta::default(),
-            false,
-            ip_repr.into(),
-            payload,
-        ),
+        iface
+            .inner
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr.into(), payload,),
         Some(Packet::new_ipv6(
             expected_ip_repr,
             IpPayload::Icmpv6(expected_icmp_repr)
         ))
+    );
+}
+
+#[cfg(all(feature = "socket-raw", feature = "socket-udp", feature = "medium-ip"))]
+#[test]
+fn raw_udp_multicast_does_not_generate_port_unreachable() {
+    use crate::socket::raw;
+    use crate::wire::IpVersion;
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let raw_socket = raw::Socket::new(
+        IpVersion::Ipv6,
+        IpProtocol::Udp,
+        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 128]),
+        raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 128]),
+    );
+    let raw_handle = sockets.add(raw_socket);
+    let src_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    let dst_addr = Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+    let udp_repr = UdpRepr {
+        src_port: 1234,
+        dst_port: 5678,
+    };
+    let mut bytes = vec![0; udp_repr.header_len() + 1];
+    udp_repr.emit(
+        &mut UdpPacket::new_unchecked(bytes.as_mut_slice()),
+        &src_addr.into(),
+        &dst_addr.into(),
+        1,
+        |payload| payload[0] = 42,
+        &ChecksumCapabilities::default(),
+    );
+    let ip_repr = IpRepr::Ipv6(Ipv6Repr {
+        src_addr,
+        dst_addr,
+        next_header: IpProtocol::Udp,
+        hop_limit: 1,
+        payload_len: bytes.len(),
+    });
+    assert!(iface
+        .inner
+        .raw_socket_filter(&mut sockets, &ip_repr, &bytes));
+    assert!(sockets.get_mut::<raw::Socket>(raw_handle).can_recv());
+    assert_eq!(
+        iface
+            .inner
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &bytes),
+        None
     );
 }
 

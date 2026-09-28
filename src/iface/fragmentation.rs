@@ -69,7 +69,7 @@ pub struct PacketAssembler<K> {
     // IPv4 reassembly must retain the offset-zero header, including options:
     // the fragment completing a datagram need not be the first fragment.
     #[cfg(feature = "proto-ipv4-fragmentation")]
-    first_ipv4_header: Option<([u8; 60], u8)>,
+    first_ipv4_header: Option<([u8; 60], u8, HardwareAddress, u32)>,
 
     assembler: Assembler,
     total_size: Option<usize>,
@@ -107,12 +107,17 @@ impl<K> PacketAssembler<K> {
     }
 
     #[cfg(feature = "proto-ipv4-fragmentation")]
-    pub(crate) fn set_first_ipv4_header(&mut self, header: &[u8]) {
+    pub(crate) fn set_first_ipv4_header(
+        &mut self,
+        header: &[u8],
+        source_hardware_addr: HardwareAddress,
+        mark: u32,
+    ) {
         if self.first_ipv4_header.is_none() {
             debug_assert!((20..=60).contains(&header.len()));
             let mut saved = [0; 60];
             saved[..header.len()].copy_from_slice(header);
-            self.first_ipv4_header = Some((saved, header.len() as u8));
+            self.first_ipv4_header = Some((saved, header.len() as u8, source_hardware_addr, mark));
         }
     }
 
@@ -120,7 +125,19 @@ impl<K> PacketAssembler<K> {
     pub(crate) fn first_ipv4_header(&self) -> Option<&[u8]> {
         self.first_ipv4_header
             .as_ref()
-            .map(|(header, len)| &header[..*len as usize])
+            .map(|(header, len, _, _)| &header[..*len as usize])
+    }
+
+    #[cfg(feature = "proto-ipv4-fragmentation")]
+    pub(crate) fn first_ipv4_source_hardware_addr(&self) -> Option<HardwareAddress> {
+        self.first_ipv4_header
+            .as_ref()
+            .map(|(_, _, source, _)| *source)
+    }
+
+    #[cfg(feature = "proto-ipv4-fragmentation")]
+    pub(crate) fn first_ipv4_mark(&self) -> Option<u32> {
+        self.first_ipv4_header.as_ref().map(|(_, _, _, mark)| *mark)
     }
 
     #[cfg(feature = "proto-ipv4-fragmentation")]
@@ -550,21 +567,45 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv4-fragmentation")]
+    #[cfg(all(feature = "proto-ipv4-fragmentation", feature = "medium-ethernet"))]
     fn packet_assembler_retains_and_clears_first_ipv4_header() {
         let mut assembler = PacketAssembler::<Key>::new();
+        let source_mac =
+            HardwareAddress::Ethernet(crate::wire::EthernetAddress([2, 0, 0, 0, 0, 1]));
         let mut first_header = [0u8; 24];
         first_header[0] = 0x46;
         first_header[8] = 64;
         first_header[20..].copy_from_slice(&[1, 2, 3, 4]);
-        assembler.set_first_ipv4_header(&first_header);
-        assembler.set_first_ipv4_header(&[9; 20]);
+        assembler.set_first_ipv4_header(&first_header, source_mac, 0x1234);
+        assembler.set_first_ipv4_header(&[9; 20], source_mac, 0xabcd);
         assert_eq!(assembler.first_ipv4_header(), Some(&first_header[..]));
+        assert_eq!(assembler.first_ipv4_mark(), Some(0x1234));
+        assert_eq!(
+            assembler.first_ipv4_source_hardware_addr(),
+            Some(source_mac)
+        );
 
         assembler.set_total_size(1).unwrap();
         assembler.add(&[7], 0).unwrap();
         assert_eq!(assembler.assemble(), Some(&[7][..]));
         assert_eq!(assembler.first_ipv4_header(), None);
+        assert_eq!(assembler.first_ipv4_source_hardware_addr(), None);
+        assert_eq!(assembler.first_ipv4_mark(), None);
+    }
+
+    #[test]
+    #[cfg(all(feature = "proto-ipv4-fragmentation", feature = "medium-ethernet"))]
+    fn packet_assembler_keeps_offset_zero_fragment_source_mac() {
+        let mut assembler = PacketAssembler::<Key>::new();
+        let first_mac = HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 1]));
+        let later_mac = HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 2]));
+        assembler.set_first_ipv4_header(&[0x45; 20], first_mac, 7);
+        assembler.set_first_ipv4_header(&[0x45; 20], later_mac, 8);
+        assert_eq!(assembler.first_ipv4_source_hardware_addr(), Some(first_mac));
+        assert_eq!(assembler.first_ipv4_mark(), Some(7));
+        assembler.reset();
+        assert_eq!(assembler.first_ipv4_source_hardware_addr(), None);
+        assert_eq!(assembler.first_ipv4_mark(), None);
     }
 
     #[test]

@@ -8,6 +8,40 @@ impl InterfaceInner {
         frame: &'frame [u8],
         fragments: &'frame mut FragmentsBuffer,
     ) -> Option<EthernetPacket<'frame>> {
+        self.process_ethernet_inner(
+            sockets,
+            meta,
+            frame,
+            fragments,
+            #[cfg(feature = "alloc")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "alloc")]
+    pub(super) fn process_ethernet_filtered<'frame>(
+        &mut self,
+        sockets: &mut SocketSet,
+        meta: crate::phy::PacketMeta,
+        frame: &'frame [u8],
+        fragments: &'frame mut FragmentsBuffer,
+        scratch: &'frame mut AllocVec<u8>,
+        filter: &mut dyn IpIngressFilter,
+    ) -> Option<EthernetPacket<'frame>> {
+        self.process_ethernet_inner(sockets, meta, frame, fragments, Some((scratch, filter)))
+    }
+
+    fn process_ethernet_inner<'frame>(
+        &mut self,
+        sockets: &mut SocketSet,
+        meta: crate::phy::PacketMeta,
+        frame: &'frame [u8],
+        fragments: &'frame mut FragmentsBuffer,
+        #[cfg(feature = "alloc")] filter: Option<(
+            &'frame mut AllocVec<u8>,
+            &mut dyn IpIngressFilter,
+        )>,
+    ) -> Option<EthernetPacket<'frame>> {
         let eth_frame = check!(EthernetFrame::new_checked(frame));
 
         // Ignore any packets not directed to our hardware address or any of the multicast groups.
@@ -24,7 +58,22 @@ impl InterfaceInner {
             #[cfg(feature = "proto-ipv4")]
             EthernetProtocol::Ipv4 => {
                 let ipv4_packet = check!(Ipv4Packet::new_checked(eth_frame.payload()));
-
+                #[cfg(feature = "alloc")]
+                if let Some((scratch, filter)) = filter.filter(|(_, filter)| {
+                    filter.applies_to_packet(IpVersion::Ipv4, ipv4_packet.as_ref())
+                }) {
+                    return self
+                        .process_ipv4_filtered(
+                            sockets,
+                            meta,
+                            eth_frame.src_addr().into(),
+                            &ipv4_packet,
+                            fragments,
+                            scratch,
+                            filter,
+                        )
+                        .map(EthernetPacket::Ip);
+                }
                 self.process_ipv4(
                     sockets,
                     meta,
@@ -37,6 +86,21 @@ impl InterfaceInner {
             #[cfg(feature = "proto-ipv6")]
             EthernetProtocol::Ipv6 => {
                 let ipv6_packet = check!(Ipv6Packet::new_checked(eth_frame.payload()));
+                #[cfg(feature = "alloc")]
+                if let Some((scratch, filter)) = filter.filter(|(_, filter)| {
+                    filter.applies_to_packet(IpVersion::Ipv6, ipv6_packet.as_ref())
+                }) {
+                    return self
+                        .process_ipv6_filtered(
+                            sockets,
+                            meta,
+                            eth_frame.src_addr().into(),
+                            &ipv6_packet,
+                            scratch,
+                            filter,
+                        )
+                        .map(EthernetPacket::Ip);
+                }
                 self.process_ipv6(sockets, meta, eth_frame.src_addr().into(), &ipv6_packet)
                     .map(EthernetPacket::Ip)
             }

@@ -200,7 +200,6 @@ fn test_handle_udp_broadcast(#[case] medium: Medium) {
         iface.inner.process_udp(
             &mut sockets,
             PacketMeta::default(),
-            false,
             ip_repr,
             packet.into_inner(),
         ),
@@ -319,7 +318,7 @@ fn udp_ingress_handler_consumed_bypasses_socket_and_icmp() {
     assert_eq!(
         iface
             .inner
-            .process_udp(&mut sockets, PacketMeta::default(), false, ip_repr, &packet,),
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &packet,),
         None
     );
     assert!(!sockets.get::<udp::Socket>(handle).can_recv());
@@ -329,7 +328,7 @@ fn udp_ingress_handler_consumed_bypasses_socket_and_icmp() {
     assert_eq!(
         iface
             .inner
-            .process_udp(&mut sockets, PacketMeta::default(), false, ip_repr, &packet,),
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &packet,),
         None
     );
     assert_eq!(handler.calls.load(core::sync::atomic::Ordering::Relaxed), 2);
@@ -362,7 +361,7 @@ fn udp_ingress_handler_not_handled_falls_back_to_socket() {
     assert_eq!(
         iface
             .inner
-            .process_udp(&mut sockets, PacketMeta::default(), false, ip_repr, &packet,),
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &packet,),
         None
     );
     assert_eq!(handler.calls.load(core::sync::atomic::Ordering::Relaxed), 1);

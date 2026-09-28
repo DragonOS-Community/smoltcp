@@ -1,5 +1,1032 @@
 use super::*;
 
+#[cfg(all(feature = "medium-ip", feature = "socket-udp"))]
+#[test]
+fn changed_output_policy_keeps_later_socket_packet_queued() {
+    use crate::phy::{Device, DeviceCapabilities};
+    use crate::socket::udp;
+    use core::cell::Cell;
+
+    struct ChangingPolicyDevice {
+        inner: crate::tests::TestingDevice,
+        current: Cell<bool>,
+    }
+
+    impl Device for ChangingPolicyDevice {
+        type RxToken<'a> = crate::tests::RxToken;
+        type TxToken<'a> = crate::tests::TxToken<'a>;
+
+        fn receive(
+            &mut self,
+            timestamp: Instant,
+        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            self.inner.receive(timestamp)
+        }
+
+        fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>> {
+            self.current.set(false);
+            self.inner.transmit(timestamp)
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn policy_current(&self) -> bool {
+            self.current.get()
+        }
+    }
+
+    let (mut iface, mut sockets, inner) = setup(Medium::Ip);
+    let mut handles = Vec::new();
+    for port in [10001, 10002] {
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 8]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 8]);
+        let mut socket = udp::Socket::new(rx, tx);
+        socket.bind(port).unwrap();
+        socket
+            .send_slice(
+                b"one",
+                IpEndpoint::new(IpAddress::v4(192, 168, 1, 2), 20000),
+            )
+            .unwrap();
+        handles.push(sockets.add(socket));
+    }
+    let mut device = ChangingPolicyDevice {
+        inner,
+        current: Cell::new(true),
+    };
+
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    assert_eq!(sockets.get_mut::<udp::Socket>(handles[0]).send_queue(), 0);
+    assert_eq!(sockets.get_mut::<udp::Socket>(handles[1]).send_queue(), 3);
+    device.current.set(true);
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    assert_eq!(sockets.get_mut::<udp::Socket>(handles[1]).send_queue(), 0);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ethernet", feature = "socket-raw"))]
+#[test]
+fn deferred_ipv4_output_serializes_before_neighbor_and_fragmentation() {
+    use core::cell::RefCell;
+    use std::rc::Rc;
+
+    struct DeferredToken(Rc<RefCell<Vec<u8>>>);
+
+    impl TxToken for DeferredToken {
+        fn deferred_ip_output(&self, _: IpVersion) -> bool {
+            true
+        }
+
+        fn consume_full_ip<F>(
+            self,
+            len: usize,
+            _: PacketMeta,
+            class: crate::phy::IpOutputClass,
+            ipv4_fragment_ident: Option<u16>,
+            emit: F,
+        ) -> Result<(), crate::phy::IpOutputError>
+        where
+            F: FnOnce(&mut [u8]),
+        {
+            assert_eq!(class, crate::phy::IpOutputClass::Ordinary);
+            #[cfg(feature = "proto-ipv4-fragmentation")]
+            assert!(ipv4_fragment_ident.is_some());
+            #[cfg(not(feature = "proto-ipv4-fragmentation"))]
+            assert!(ipv4_fragment_ident.is_none());
+            let mut bytes = vec![0; len];
+            emit(&mut bytes);
+            *self.0.borrow_mut() = bytes;
+            Ok(())
+        }
+
+        fn consume<R, F>(self, _: usize, _: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            panic!("deferred output must not use link-layer transmission")
+        }
+    }
+
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let payload = vec![0xa5; iface.inner.ip_mtu() + 256];
+    let packet = Packet::new_ipv4(
+        Ipv4Repr {
+            src_addr: Ipv4Address::new(192, 0, 2, 1),
+            dst_addr: Ipv4Address::new(198, 51, 100, 1),
+            next_header: IpProtocol::Udp,
+            payload_len: payload.len(),
+            hop_limit: 64,
+        },
+        IpPayload::Raw(&payload),
+    );
+    let emitted = Rc::new(RefCell::new(Vec::new()));
+    iface
+        .inner
+        .dispatch_ip(
+            DeferredToken(emitted.clone()),
+            PacketMeta::default(),
+            packet,
+            &mut iface.fragmenter,
+        )
+        .unwrap();
+    let output = emitted.borrow();
+    let ipv4 = Ipv4Packet::new_checked(&output[..]).unwrap();
+    assert_eq!(ipv4.total_len() as usize, output.len());
+    assert!(ipv4.dont_frag());
+    assert_eq!(ipv4.ident(), 0);
+    assert_eq!(ipv4.dst_addr(), Ipv4Address::new(198, 51, 100, 1));
+    assert_eq!(ipv4.payload(), &payload[..]);
+    #[cfg(feature = "proto-ipv4-fragmentation")]
+    assert_eq!(iface.fragmenter.packet_len, 0);
+}
+
+#[cfg(feature = "alloc")]
+struct RewriteIpv4Destination {
+    calls: usize,
+}
+
+#[cfg(feature = "alloc")]
+impl IpIngressFilter for RewriteIpv4Destination {
+    fn pre_routing(
+        &mut self,
+        packet: &mut IngressPacket<'_>,
+        _: PacketMeta,
+        _: HardwareAddress,
+    ) -> PreRoutingVerdict {
+        self.calls += 1;
+        let incoming = Ipv4Packet::new_checked(packet.bytes()).unwrap();
+        assert_eq!(incoming.hop_limit(), 64);
+        assert_eq!(incoming.total_len() as usize, packet.bytes().len());
+        let mut ipv4 = Ipv4Packet::new_unchecked(packet.writable().unwrap());
+        ipv4.set_dst_addr(Ipv4Address::new(127, 0, 0, 1));
+        ipv4.fill_checksum();
+        PreRoutingVerdict::Pass
+    }
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+fn icmp_request_for_rewrite() -> Vec<u8> {
+    use crate::wire::{Icmpv4Packet, Icmpv4Repr};
+
+    let payload = [1, 2, 3, 4];
+    let icmp = Icmpv4Repr::EchoRequest {
+        ident: 42,
+        seq_no: 1,
+        data: &payload,
+    };
+    let repr = Ipv4Repr {
+        src_addr: Ipv4Address::new(127, 0, 0, 2),
+        dst_addr: Ipv4Address::new(127, 0, 0, 3),
+        next_header: IpProtocol::Icmp,
+        payload_len: icmp.buffer_len(),
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0; repr.buffer_len() + icmp.buffer_len()];
+    repr.emit(
+        &mut Ipv4Packet::new_unchecked(&mut bytes),
+        &ChecksumCapabilities::default(),
+    );
+    icmp.emit(
+        &mut Icmpv4Packet::new_unchecked(&mut bytes[repr.buffer_len()..]),
+        &ChecksumCapabilities::default(),
+    );
+    bytes
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+struct TransferIpv4Packet {
+    forwarded: Vec<Vec<u8>>,
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+impl IpIngressFilter for TransferIpv4Packet {
+    fn defragment_ipv4(&self) -> bool {
+        false
+    }
+
+    fn pre_routing(
+        &mut self,
+        _: &mut IngressPacket<'_>,
+        _: PacketMeta,
+        _: HardwareAddress,
+    ) -> PreRoutingVerdict {
+        PreRoutingVerdict::Pass
+    }
+
+    fn route_input(
+        &mut self,
+        packet: &mut RoutedIngressPacket<'_, '_>,
+        _: PacketMeta,
+        _: HardwareAddress,
+    ) -> RouteInputVerdict {
+        self.forwarded.push(packet.take_owned().unwrap());
+        RouteInputVerdict::Forward
+    }
+
+    fn route_fragment(
+        &mut self,
+        packet: &mut RoutedIngressPacket<'_, '_>,
+        meta: PacketMeta,
+        source_hardware_addr: HardwareAddress,
+    ) -> RouteInputVerdict {
+        self.route_input(packet, meta, source_hardware_addr)
+    }
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn forwarded_ipv4_packet_survives_rx_token_without_local_reply() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let mut bytes = icmp_request_for_rewrite();
+    let mut ipv4 = Ipv4Packet::new_unchecked(&mut bytes);
+    ipv4.set_dst_addr(Ipv4Address::new(127, 0, 0, 1));
+    ipv4.fill_checksum();
+    device.rx_queue.push_back(bytes);
+    let mut filter = TransferIpv4Packet {
+        forwarded: Vec::new(),
+    };
+    assert_eq!(
+        iface.poll_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter),
+        PollResult::SocketStateChanged
+    );
+    assert!(device.tx_queue.is_empty());
+    assert_eq!(filter.forwarded.len(), 1);
+    let packet = Ipv4Packet::new_checked(&filter.forwarded[0][..]).unwrap();
+    assert_eq!(packet.dst_addr(), Ipv4Address::new(127, 0, 0, 1));
+}
+
+#[cfg(all(
+    feature = "alloc",
+    feature = "medium-ip",
+    feature = "proto-ipv4-fragmentation"
+))]
+#[test]
+fn forwarded_ipv4_fragments_do_not_use_local_reassembly_slots() {
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let mut scratch = AllocVec::new();
+    let mut filter = TransferIpv4Packet {
+        forwarded: Vec::new(),
+    };
+
+    for (offset, len, more_fragments) in [(0, 1480, true), (1480, 520, false)] {
+        let repr = Ipv4Repr {
+            src_addr: Ipv4Address::new(192, 0, 2, 1),
+            dst_addr: Ipv4Address::new(198, 51, 100, 1),
+            next_header: IpProtocol::Udp,
+            payload_len: len,
+            hop_limit: 64,
+        };
+        let mut bytes = vec![0; repr.buffer_len() + len];
+        let mut fragment = Ipv4Packet::new_unchecked(&mut bytes[..]);
+        repr.emit(&mut fragment, &ChecksumCapabilities::default());
+        fragment.set_ident(123);
+        fragment.set_frag_offset(offset);
+        fragment.set_more_frags(more_fragments);
+        fragment.fill_checksum();
+        let fragment = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+        assert!(iface
+            .inner
+            .process_ipv4_filtered(
+                &mut sockets,
+                PacketMeta::default(),
+                HardwareAddress::Ip,
+                &fragment,
+                &mut iface.fragments,
+                &mut scratch,
+                &mut filter,
+            )
+            .is_none());
+    }
+
+    assert_eq!(filter.forwarded.len(), 2);
+    for (packet, (offset, len, more_fragments)) in filter
+        .forwarded
+        .iter()
+        .zip([(0, 1480, true), (1480, 520, false)])
+    {
+        let fragment = Ipv4Packet::new_checked(packet.as_slice()).unwrap();
+        assert_eq!(fragment.frag_offset(), offset);
+        assert_eq!(fragment.payload().len(), len);
+        assert_eq!(fragment.more_frags(), more_fragments);
+    }
+}
+
+#[cfg(all(
+    feature = "alloc",
+    feature = "medium-ip",
+    feature = "proto-ipv4-fragmentation"
+))]
+#[test]
+fn stateless_fragment_policy_can_drop_local_and_transit_fragments() {
+    struct DropFragments(usize);
+
+    impl IpIngressFilter for DropFragments {
+        fn defragment_ipv4(&self) -> bool {
+            false
+        }
+
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            panic!("dropped transit fragments must not reach local reassembly")
+        }
+
+        fn route_fragment(
+            &mut self,
+            _: &mut RoutedIngressPacket<'_, '_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> RouteInputVerdict {
+            self.0 += 1;
+            RouteInputVerdict::Drop
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let mut scratch = AllocVec::new();
+    let mut filter = DropFragments(0);
+    for destination in [
+        Ipv4Address::new(198, 51, 100, 1),
+        Ipv4Address::new(127, 0, 0, 1),
+    ] {
+        for (offset, len, more_fragments) in [(0, 1480, true), (1480, 520, false)] {
+            let repr = Ipv4Repr {
+                src_addr: Ipv4Address::new(127, 0, 0, 2),
+                dst_addr: destination,
+                next_header: IpProtocol::Udp,
+                payload_len: len,
+                hop_limit: 64,
+            };
+            let mut bytes = vec![0; repr.buffer_len() + len];
+            let mut fragment = Ipv4Packet::new_unchecked(&mut bytes[..]);
+            repr.emit(&mut fragment, &ChecksumCapabilities::default());
+            fragment.set_ident(124);
+            fragment.set_frag_offset(offset);
+            fragment.set_more_frags(more_fragments);
+            fragment.fill_checksum();
+            let fragment = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+            assert!(iface
+                .inner
+                .process_ipv4_filtered(
+                    &mut sockets,
+                    PacketMeta::default(),
+                    HardwareAddress::Ip,
+                    &fragment,
+                    &mut iface.fragments,
+                    &mut scratch,
+                    &mut filter,
+                )
+                .is_none());
+        }
+    }
+    assert_eq!(filter.0, 4);
+}
+
+#[cfg(all(
+    feature = "alloc",
+    feature = "medium-ip",
+    feature = "proto-ipv4-fragmentation"
+))]
+#[test]
+fn local_ipv4_fragments_run_policy_once_per_fragment() {
+    struct AcceptFragments {
+        fragments: usize,
+        assembled: usize,
+        mark: core::cell::Cell<u32>,
+    }
+
+    impl IpIngressFilter for AcceptFragments {
+        fn defragment_ipv4(&self) -> bool {
+            false
+        }
+
+        fn packet_mark(&self) -> u32 {
+            self.mark.get()
+        }
+
+        fn restore_packet_mark(&self, mark: u32) {
+            self.mark.set(mark);
+        }
+
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            panic!("local reassembly must not repeat a fragment verdict")
+        }
+
+        fn route_fragment(
+            &mut self,
+            packet: &mut RoutedIngressPacket<'_, '_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> RouteInputVerdict {
+            self.fragments += 1;
+            let offset = Ipv4Packet::new_checked(packet.bytes())
+                .unwrap()
+                .frag_offset();
+            self.mark.set(if offset == 0 { 0x1234 } else { 0x5678 });
+            RouteInputVerdict::Pass
+        }
+
+        fn route_input(
+            &mut self,
+            _: &mut RoutedIngressPacket<'_, '_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> RouteInputVerdict {
+            self.assembled += 1;
+            assert_eq!(self.mark.get(), 0x1234);
+            RouteInputVerdict::Pass
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let mut scratch = AllocVec::new();
+    let mut filter = AcceptFragments {
+        fragments: 0,
+        assembled: 0,
+        mark: core::cell::Cell::new(0),
+    };
+    for offset in [0, 16] {
+        let repr = Ipv4Repr {
+            src_addr: Ipv4Address::new(127, 0, 0, 2),
+            dst_addr: Ipv4Address::new(127, 0, 0, 1),
+            next_header: IpProtocol::Udp,
+            payload_len: 16,
+            hop_limit: 64,
+        };
+        let mut bytes = vec![0; repr.buffer_len() + 16];
+        let mut fragment = Ipv4Packet::new_unchecked(&mut bytes[..]);
+        repr.emit(&mut fragment, &ChecksumCapabilities::default());
+        fragment.set_ident(125);
+        fragment.set_frag_offset(offset);
+        fragment.set_more_frags(offset == 0);
+        fragment.fill_checksum();
+        let fragment = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+        let _ = iface.inner.process_ipv4_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &fragment,
+            &mut iface.fragments,
+            &mut scratch,
+            &mut filter,
+        );
+    }
+    assert_eq!(filter.fragments, 2);
+    assert_eq!(filter.assembled, 1);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip", feature = "packetmeta-id"))]
+#[test]
+fn ipv4_pre_routing_receives_rx_token_metadata() {
+    struct CaptureMeta(Option<PacketMeta>);
+
+    impl IpIngressFilter for CaptureMeta {
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            meta: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            self.0 = Some(meta);
+            PreRoutingVerdict::Drop
+        }
+    }
+
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    device.rx_queue.push_back(icmp_request_for_rewrite());
+    let mut filter = CaptureMeta(None);
+    let meta = PacketMeta { id: 71 };
+    device.rx_meta = meta;
+    assert_eq!(
+        iface.poll_ingress_single_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter),
+        PollIngressSingleResult::SocketStateChanged
+    );
+    assert_eq!(filter.0, Some(meta));
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn full_poll_rechecks_filter_interest_for_each_ipv4_packet() {
+    use core::cell::Cell;
+
+    struct ActivateOnSecond {
+        checks: Cell<usize>,
+        starts: usize,
+        calls: usize,
+    }
+
+    impl IpIngressFilter for ActivateOnSecond {
+        fn begin_packet(&mut self, _: PacketMeta) {
+            self.starts += 1;
+        }
+
+        fn applies_to(&self, version: IpVersion) -> bool {
+            assert_eq!(version, IpVersion::Ipv4);
+            let checks = self.checks.get();
+            self.checks.set(checks + 1);
+            checks != 0
+        }
+
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            self.calls += 1;
+            PreRoutingVerdict::Drop
+        }
+    }
+
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    device.rx_queue.push_back(icmp_request_for_rewrite());
+    device.rx_queue.push_back(icmp_request_for_rewrite());
+    device.rx_queue.push_back(alloc::vec::Vec::new());
+    let mut filter = ActivateOnSecond {
+        checks: Cell::new(0),
+        starts: 0,
+        calls: 0,
+    };
+    iface.poll_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter);
+    assert_eq!(filter.checks.get(), 2);
+    assert_eq!(filter.starts, 3);
+    assert_eq!(filter.calls, 1);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn paused_filter_keeps_next_rx_token_for_a_fresh_policy_view() {
+    use core::cell::Cell;
+
+    struct PauseAfterPacket {
+        paused: Cell<bool>,
+        calls: usize,
+    }
+
+    impl IpIngressFilter for PauseAfterPacket {
+        fn continue_ingress_poll(&self) -> bool {
+            !self.paused.get()
+        }
+
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            self.calls += 1;
+            self.paused.set(true);
+            PreRoutingVerdict::Drop
+        }
+    }
+
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    device.rx_queue.push_back(icmp_request_for_rewrite());
+    device.rx_queue.push_back(icmp_request_for_rewrite());
+    let mut filter = PauseAfterPacket {
+        paused: Cell::new(false),
+        calls: 0,
+    };
+    iface.poll_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter);
+    assert_eq!(filter.calls, 1);
+    assert_eq!(device.rx_queue.len(), 1);
+
+    assert_eq!(
+        iface.poll_ingress_single_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter),
+        PollIngressSingleResult::None
+    );
+    assert_eq!(device.rx_queue.len(), 1);
+
+    filter.paused.set(false);
+    iface.poll_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter);
+    assert_eq!(filter.calls, 2);
+    assert!(device.rx_queue.is_empty());
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn rewritten_ipv4_packet_keeps_reply_borrow_alive() {
+    use crate::wire::Icmpv4Repr;
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let payload = [1, 2, 3, 4];
+    let src = Ipv4Address::new(127, 0, 0, 2);
+    let bytes = icmp_request_for_rewrite();
+    let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+    let mut scratch = AllocVec::new();
+    let mut filter = RewriteIpv4Destination { calls: 0 };
+    let response = iface.inner.process_ipv4_filtered(
+        &mut sockets,
+        PacketMeta::default(),
+        HardwareAddress::Ip,
+        &packet,
+        &mut iface.fragments,
+        &mut scratch,
+        &mut filter,
+    );
+    let expected = Packet::new_ipv4(
+        Ipv4Repr {
+            src_addr: Ipv4Address::new(127, 0, 0, 1),
+            dst_addr: src,
+            next_header: IpProtocol::Icmp,
+            payload_len: 8 + payload.len(),
+            hop_limit: 64,
+        },
+        IpPayload::Icmpv4(Icmpv4Repr::EchoReply {
+            ident: 42,
+            seq_no: 1,
+            data: &payload,
+        }),
+    );
+    assert_eq!(response, Some(expected));
+    assert_eq!(filter.calls, 1);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn local_input_ipv4_rewrite_is_validated_before_transport_reply() {
+    use crate::wire::Icmpv4Repr;
+
+    struct RewriteSource {
+        calls: usize,
+        repair_checksum: bool,
+    }
+
+    impl IpIngressFilter for RewriteSource {
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            PreRoutingVerdict::Pass
+        }
+
+        fn local_input(
+            &mut self,
+            packet: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+            protocol: IpProtocol,
+            transport_offset: usize,
+        ) -> LocalInputVerdict {
+            self.calls += 1;
+            assert_eq!(protocol, IpProtocol::Icmp);
+            assert_eq!(transport_offset, 20);
+            let mut ipv4 = Ipv4Packet::new_unchecked(packet.writable().unwrap());
+            ipv4.set_src_addr(Ipv4Address::new(127, 0, 0, 9));
+            if self.repair_checksum {
+                ipv4.fill_checksum();
+            }
+            LocalInputVerdict::Pass
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let mut bytes = icmp_request_for_rewrite();
+    let mut ip = Ipv4Packet::new_unchecked(&mut bytes[..]);
+    ip.set_dst_addr(Ipv4Address::new(127, 0, 0, 1));
+    ip.fill_checksum();
+    let original = bytes.clone();
+    let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+    let mut scratch = AllocVec::new();
+    let mut filter = RewriteSource {
+        calls: 0,
+        repair_checksum: true,
+    };
+    let reply = iface.inner.process_ipv4_filtered(
+        &mut sockets,
+        PacketMeta::default(),
+        HardwareAddress::Ip,
+        &packet,
+        &mut iface.fragments,
+        &mut scratch,
+        &mut filter,
+    );
+    let expected = Packet::new_ipv4(
+        Ipv4Repr {
+            src_addr: Ipv4Address::new(127, 0, 0, 1),
+            dst_addr: Ipv4Address::new(127, 0, 0, 9),
+            next_header: IpProtocol::Icmp,
+            payload_len: 12,
+            hop_limit: 64,
+        },
+        IpPayload::Icmpv4(Icmpv4Repr::EchoReply {
+            ident: 42,
+            seq_no: 1,
+            data: &[1, 2, 3, 4],
+        }),
+    );
+    assert_eq!(reply, Some(expected));
+    assert_eq!(filter.calls, 1);
+    assert_eq!(bytes, original);
+    drop(reply);
+    assert_eq!(scratch[12..16], [127, 0, 0, 9]);
+
+    let mut malformed = RewriteSource {
+        calls: 0,
+        repair_checksum: false,
+    };
+    assert!(iface
+        .inner
+        .process_ipv4_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut iface.fragments,
+            &mut scratch,
+            &mut malformed,
+        )
+        .is_none());
+    assert_eq!(malformed.calls, 1);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn local_input_ipv4_cannot_rewrite_destination_to_nonlocal() {
+    struct RewriteDestination;
+
+    impl IpIngressFilter for RewriteDestination {
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            PreRoutingVerdict::Pass
+        }
+
+        fn local_input(
+            &mut self,
+            packet: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+            _: IpProtocol,
+            _: usize,
+        ) -> LocalInputVerdict {
+            let mut ipv4 = Ipv4Packet::new_unchecked(packet.writable().unwrap());
+            ipv4.set_dst_addr(Ipv4Address::new(192, 0, 2, 9));
+            ipv4.fill_checksum();
+            LocalInputVerdict::Pass
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let mut bytes = icmp_request_for_rewrite();
+    let mut ip = Ipv4Packet::new_unchecked(&mut bytes[..]);
+    ip.set_dst_addr(Ipv4Address::new(127, 0, 0, 1));
+    ip.fill_checksum();
+    let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+    let mut scratch = AllocVec::new();
+    assert!(iface
+        .inner
+        .process_ipv4_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut iface.fragments,
+            &mut scratch,
+            &mut RewriteDestination,
+        )
+        .is_none());
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn normal_poll_ingress_applies_ipv4_rewrite_before_reply() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let mut padded = icmp_request_for_rewrite();
+    padded.extend_from_slice(&[0; 8]);
+    device.rx_queue.push_back(padded);
+    let mut filter = RewriteIpv4Destination { calls: 0 };
+    assert_eq!(
+        iface.poll_ingress_single_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter),
+        PollIngressSingleResult::SocketStateChanged
+    );
+    let reply = device.tx_queue.pop_front().unwrap();
+    let packet = Ipv4Packet::new_checked(&reply[..]).unwrap();
+    assert_eq!(packet.src_addr(), Ipv4Address::new(127, 0, 0, 1));
+    assert_eq!(packet.dst_addr(), Ipv4Address::new(127, 0, 0, 2));
+    assert_eq!(packet.next_header(), IpProtocol::Icmp);
+    assert_eq!(filter.calls, 1);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn ipv4_source_policy_runs_after_pre_routing_decision() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let mut bytes = icmp_request_for_rewrite();
+    let mut ipv4 = Ipv4Packet::new_unchecked(&mut bytes);
+    ipv4.set_src_addr(Ipv4Address::new(224, 0, 0, 1));
+    ipv4.fill_checksum();
+    device.rx_queue.push_back(bytes);
+    let mut filter = RewriteIpv4Destination { calls: 0 };
+    iface.poll_ingress_single_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter);
+    assert_eq!(filter.calls, 1);
+    assert!(device.tx_queue.is_empty());
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn ipv4_invalid_source_cannot_reach_route_input() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let mut bytes = icmp_request_for_rewrite();
+    let mut ipv4 = Ipv4Packet::new_unchecked(&mut bytes);
+    ipv4.set_src_addr(Ipv4Address::new(224, 0, 0, 1));
+    ipv4.fill_checksum();
+    device.rx_queue.push_back(bytes);
+    let mut filter = TransferIpv4Packet {
+        forwarded: Vec::new(),
+    };
+    iface.poll_ingress_single_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter);
+    assert!(filter.forwarded.is_empty());
+}
+
+#[cfg(all(feature = "proto-ipv4-fragmentation", feature = "medium-ip"))]
+#[test]
+fn unfiltered_nonunicast_fragment_does_not_consume_reassembly_slot() {
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let repr = Ipv4Repr {
+        src_addr: Ipv4Address::new(224, 0, 0, 1),
+        dst_addr: Ipv4Address::new(127, 0, 0, 1),
+        next_header: IpProtocol::Icmp,
+        payload_len: 8,
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0; repr.buffer_len() + 8];
+    let mut packet = Ipv4Packet::new_unchecked(&mut bytes[..]);
+    repr.emit(&mut packet, &ChecksumCapabilities::default());
+    packet.set_ident(123);
+    packet.set_more_frags(true);
+    packet.fill_checksum();
+    let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv4(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut iface.fragments,
+        )
+        .is_none());
+    let assembler = iface
+        .fragments
+        .assembler
+        .get(&FragKey::Ipv4(packet.get_key()), Instant::from_millis(1000))
+        .unwrap();
+    assert_eq!(assembler.classify_received_range(0, 8), FragmentRange::New);
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ip"))]
+#[test]
+fn full_poll_applies_ipv4_rewrite_to_every_ingress_packet() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    device.rx_queue.push_back(icmp_request_for_rewrite());
+    device.rx_queue.push_back(icmp_request_for_rewrite());
+    let mut filter = RewriteIpv4Destination { calls: 0 };
+    assert_eq!(
+        iface.poll_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter),
+        PollResult::SocketStateChanged
+    );
+    assert_eq!(filter.calls, 2);
+    for _ in 0..2 {
+        let reply = device.tx_queue.pop_front().unwrap();
+        let packet = Ipv4Packet::new_checked(&reply[..]).unwrap();
+        assert_eq!(packet.src_addr(), Ipv4Address::new(127, 0, 0, 1));
+    }
+}
+
+#[cfg(all(
+    feature = "alloc",
+    feature = "medium-ip",
+    feature = "proto-ipv4-fragmentation"
+))]
+#[test]
+fn filtered_ipv4_fragments_are_reassembled_before_rewrite() {
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let original = icmp_request_for_rewrite();
+    let datagram = &original[20..];
+    let mut scratch = AllocVec::new();
+    let mut filter = RewriteIpv4Destination { calls: 0 };
+
+    for (offset, payload, more_fragments) in [(0, &datagram[..8], true), (8, &datagram[8..], false)]
+    {
+        let repr = Ipv4Repr {
+            src_addr: Ipv4Address::new(127, 0, 0, 2),
+            dst_addr: Ipv4Address::new(127, 0, 0, 3),
+            next_header: IpProtocol::Icmp,
+            payload_len: payload.len(),
+            hop_limit: if offset == 0 { 64 } else { 1 },
+        };
+        let mut bytes = vec![0; repr.buffer_len() + payload.len()];
+        let mut packet = Ipv4Packet::new_unchecked(&mut bytes[..]);
+        repr.emit(&mut packet, &ChecksumCapabilities::default());
+        packet.set_ident(77);
+        packet.set_frag_offset(offset);
+        packet.set_more_frags(more_fragments);
+        packet.fill_checksum();
+        packet.payload_mut().copy_from_slice(payload);
+        let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+        let response = iface.inner.process_ipv4_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut iface.fragments,
+            &mut scratch,
+            &mut filter,
+        );
+        if more_fragments {
+            assert!(response.is_none());
+            assert_eq!(filter.calls, 0);
+        } else {
+            assert!(response.is_some());
+            assert_eq!(filter.calls, 1);
+            assert_eq!(
+                response.unwrap().ip_repr().dst_addr(),
+                Ipv4Address::new(127, 0, 0, 2).into()
+            );
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "alloc",
+    feature = "medium-ip",
+    feature = "medium-ethernet",
+    feature = "proto-ipv4-fragmentation"
+))]
+#[test]
+fn filtered_ipv4_reassembly_reports_the_first_fragment_source_mac() {
+    struct CaptureSource(Option<HardwareAddress>);
+    impl IpIngressFilter for CaptureSource {
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            source: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            self.0 = Some(source);
+            PreRoutingVerdict::Drop
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let original = icmp_request_for_rewrite();
+    let datagram = &original[20..];
+    let first_mac = HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 1]));
+    let final_mac = HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 2]));
+    let mut scratch = AllocVec::new();
+    let mut filter = CaptureSource(None);
+
+    for (offset, payload, more_fragments, source) in [
+        (0, &datagram[..8], true, first_mac),
+        (8, &datagram[8..], false, final_mac),
+    ] {
+        let repr = Ipv4Repr {
+            src_addr: Ipv4Address::new(127, 0, 0, 2),
+            dst_addr: Ipv4Address::new(127, 0, 0, 3),
+            next_header: IpProtocol::Icmp,
+            payload_len: payload.len(),
+            hop_limit: 64,
+        };
+        let mut bytes = vec![0; repr.buffer_len() + payload.len()];
+        let mut fragment = Ipv4Packet::new_unchecked(&mut bytes[..]);
+        repr.emit(&mut fragment, &ChecksumCapabilities::default());
+        fragment.set_ident(78);
+        fragment.set_frag_offset(offset);
+        fragment.set_more_frags(more_fragments);
+        fragment.fill_checksum();
+        fragment.payload_mut().copy_from_slice(payload);
+        let fragment = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+        assert!(iface
+            .inner
+            .process_ipv4_filtered(
+                &mut sockets,
+                PacketMeta::default(),
+                source,
+                &fragment,
+                &mut iface.fragments,
+                &mut scratch,
+                &mut filter,
+            )
+            .is_none());
+    }
+    assert_eq!(filter.0, Some(first_mac));
+}
+
 fn serialized_ipv4_packet(dst_addr: Ipv4Address) -> Vec<u8> {
     let payload = [0xde, 0xad, 0xbe, 0xef];
     let repr = Ipv4Repr {
@@ -273,7 +1300,7 @@ fn explicit_ipv4_dispatch_preserves_packet_on_ip_medium() {
 }
 
 #[test]
-#[cfg(all(feature = "proto-ipv4", feature = "medium-ip"))]
+#[cfg(all(feature = "proto-ipv4", feature = "medium-ip", feature = "socket-raw"))]
 fn egress_admission_failure_does_not_consume_token() {
     struct ExhaustedTxToken;
 
@@ -688,7 +1715,7 @@ fn test_icmp_error_port_unreachable(#[case] medium: Medium) {
     assert_eq!(
         iface
             .inner
-            .process_udp(&mut sockets, PacketMeta::default(), false, ip_repr, data),
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, data),
         Some(expected_repr)
     );
 
@@ -717,7 +1744,6 @@ fn test_icmp_error_port_unreachable(#[case] medium: Medium) {
         iface.inner.process_udp(
             &mut sockets,
             PacketMeta::default(),
-            false,
             ip_repr,
             packet_broadcast.into_inner(),
         ),
@@ -1213,7 +2239,12 @@ fn test_handle_igmp(#[case] medium: Medium) {
     // loopback have been processed, including responses to
     // GENERAL_QUERY_BYTES. Therefore `recv_all()` would return 0
     // pkts that could be checked.
-    iface.socket_ingress(&mut device, &mut sockets);
+    iface.socket_ingress(
+        &mut device,
+        &mut sockets,
+        #[cfg(feature = "alloc")]
+        None,
+    );
 
     // Leave multicast groups
     let timestamp = Instant::ZERO;
@@ -1397,9 +2428,11 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
     const META_ID: u32 = 17;
     const ROUTE_CONTEXT: [u64; 3] = [0x1234_5678_9abc_def0, 0x1122, 0x3344];
 
+    type FragmentObservation = (usize, PacketMeta, Option<[u64; 3]>, u16, bool, usize);
+
     #[derive(Clone)]
     struct RoutedTxToken {
-        observed: Rc<RefCell<Vec<(usize, PacketMeta, Option<[u64; 3]>, u16, bool, usize)>>>,
+        observed: Rc<RefCell<Vec<FragmentObservation>>>,
         meta: PacketMeta,
         context: Option<[u64; 3]>,
     }
@@ -1517,7 +2550,7 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
 #[cfg(all(feature = "socket-raw", feature = "medium-ip"))]
 #[case(Medium::Ethernet)]
 #[cfg(all(feature = "socket-raw", feature = "medium-ethernet"))]
-fn test_raw_socket_no_reply(#[case] medium: Medium) {
+fn test_raw_socket_does_not_suppress_udp_port_unreachable(#[case] medium: Medium) {
     use crate::wire::{IpVersion, UdpPacket, UdpRepr};
 
     let (mut iface, mut sockets, _) = setup(medium);
@@ -1530,7 +2563,7 @@ fn test_raw_socket_no_reply(#[case] medium: Medium) {
         vec![0; 48 * packets],
     );
     let raw_socket = raw::Socket::new(IpVersion::Ipv4, IpProtocol::Udp, rx_buffer, tx_buffer);
-    sockets.add(raw_socket);
+    let raw_socket_handle = sockets.add(raw_socket);
 
     let src_addr = Ipv4Address::new(127, 0, 0, 2);
     let dst_addr = Ipv4Address::new(127, 0, 0, 1);
@@ -1577,16 +2610,302 @@ fn test_raw_socket_no_reply(#[case] medium: Medium) {
         Ipv4Packet::new_unchecked(&bytes[..])
     };
 
-    assert_eq!(
-        iface.inner.process_ipv4(
+    assert!(iface
+        .inner
+        .process_ipv4(
             &mut sockets,
             PacketMeta::default(),
             HardwareAddress::default(),
             &frame,
-            &mut iface.fragments
-        ),
-        None
+            &mut iface.fragments,
+        )
+        .is_some());
+    assert!(sockets.get_mut::<raw::Socket>(raw_socket_handle).can_recv());
+}
+
+#[rstest]
+#[case(Medium::Ip)]
+#[cfg(all(feature = "socket-raw", feature = "medium-ip"))]
+#[case(Medium::Ethernet)]
+#[cfg(all(feature = "socket-raw", feature = "medium-ethernet"))]
+fn raw_socket_receives_only_locally_routed_ipv4(#[case] medium: Medium) {
+    use crate::wire::IpVersion;
+
+    let (mut iface, mut sockets, _) = setup(medium);
+    let rx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let tx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let handle = sockets.add(raw::Socket::new(
+        IpVersion::Ipv4,
+        IpProtocol::Unknown(253),
+        rx,
+        tx,
+    ));
+
+    let repr = Ipv4Repr {
+        src_addr: Ipv4Address::new(127, 0, 0, 2),
+        dst_addr: Ipv4Address::new(192, 0, 2, 1),
+        next_header: IpProtocol::Unknown(253),
+        payload_len: 1,
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0u8; repr.buffer_len() + 1];
+    repr.emit(
+        &mut Ipv4Packet::new_unchecked(&mut bytes),
+        &ChecksumCapabilities::default(),
     );
+    bytes[repr.buffer_len()] = 0x42;
+    let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+    assert!(iface
+        .inner
+        .process_ipv4(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::default(),
+            &packet,
+            &mut iface.fragments,
+        )
+        .is_none());
+    assert!(!sockets.get_mut::<raw::Socket>(handle).can_recv());
+
+    // AnyIP alone is not enough: the route must resolve through one of this
+    // interface's own addresses before raw delivery becomes local delivery.
+    iface.set_any_ip(true);
+    assert!(iface
+        .inner
+        .process_ipv4(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::default(),
+            &packet,
+            &mut iface.fragments,
+        )
+        .is_none());
+    assert!(!sockets.get_mut::<raw::Socket>(handle).can_recv());
+
+    iface.routes_mut().update(|routes| {
+        let route = crate::iface::Route {
+            cidr: IpCidr::new(IpAddress::v4(192, 0, 2, 1), 32),
+            via_router: Some(IpAddress::v4(127, 0, 0, 1)),
+            preferred_until: None,
+            expires_at: None,
+        };
+        #[cfg(feature = "alloc")]
+        routes.push(route);
+        #[cfg(not(feature = "alloc"))]
+        routes.push(route).unwrap();
+    });
+    assert!(iface
+        .inner
+        .process_ipv4(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::default(),
+            &packet,
+            &mut iface.fragments,
+        )
+        .is_none());
+    assert!(sockets.get_mut::<raw::Socket>(handle).can_recv());
+}
+
+#[cfg(all(feature = "alloc", feature = "socket-raw", feature = "medium-ip"))]
+#[test]
+fn filtered_local_input_receives_original_ipv4_and_owns_raw_fanout() {
+    struct Capture(Vec<u8>);
+
+    impl IpIngressFilter for Capture {
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            PreRoutingVerdict::Pass
+        }
+
+        fn local_input(
+            &mut self,
+            packet: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+            protocol: IpProtocol,
+            transport_offset: usize,
+        ) -> LocalInputVerdict {
+            assert_eq!(protocol, IpProtocol::Unknown(253));
+            assert_eq!(transport_offset, 20);
+            self.0.extend_from_slice(packet.bytes());
+            LocalInputVerdict::ExternalRaw { matched: true }
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let rx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let tx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let handle = sockets.add(raw::Socket::new(
+        IpVersion::Ipv4,
+        IpProtocol::Unknown(253),
+        rx,
+        tx,
+    ));
+    let repr = Ipv4Repr {
+        src_addr: Ipv4Address::new(127, 0, 0, 2),
+        dst_addr: Ipv4Address::new(127, 0, 0, 1),
+        next_header: IpProtocol::Unknown(253),
+        payload_len: 1,
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0u8; repr.buffer_len() + 1];
+    let mut packet = Ipv4Packet::new_unchecked(&mut bytes[..]);
+    repr.emit(&mut packet, &ChecksumCapabilities::default());
+    packet.set_dont_frag(true);
+    packet.fill_checksum();
+    packet.payload_mut()[0] = 0x42;
+    let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+    let mut scratch = AllocVec::new();
+    let mut filter = Capture(Vec::new());
+    assert!(iface
+        .inner
+        .process_ipv4_filtered(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut iface.fragments,
+            &mut scratch,
+            &mut filter,
+        )
+        .is_none());
+    assert_eq!(filter.0, bytes);
+    assert!(
+        scratch.is_empty(),
+        "read-only LOCAL_IN must not copy the packet"
+    );
+    assert!(!sockets.get_mut::<raw::Socket>(handle).can_recv());
+}
+
+#[cfg(all(
+    feature = "proto-ipv4-fragmentation",
+    feature = "socket-raw",
+    feature = "medium-ip"
+))]
+#[test]
+fn reassembled_ipv4_raw_packet_reports_complete_length() {
+    use crate::wire::{IpVersion, UdpPacket, UdpRepr};
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let rx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let tx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let handle = sockets.add(raw::Socket::new(IpVersion::Ipv4, IpProtocol::Udp, rx, tx));
+
+    let src = Ipv4Address::new(127, 0, 0, 2);
+    let dst = Ipv4Address::new(127, 0, 0, 1);
+    let udp_repr = UdpRepr {
+        src_port: 12345,
+        dst_port: 23456,
+    };
+    let mut datagram = [0u8; 24];
+    udp_repr.emit(
+        &mut UdpPacket::new_unchecked(&mut datagram[..]),
+        &src.into(),
+        &dst.into(),
+        16,
+        |payload| payload.fill(0x5a),
+        &ChecksumCapabilities::default(),
+    );
+
+    for (offset, payload) in [(0, &datagram[..16]), (16, &datagram[16..])] {
+        let repr = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Udp,
+            payload_len: payload.len(),
+            hop_limit: if offset == 0 { 64 } else { 1 },
+        };
+        let mut bytes = vec![0; repr.buffer_len() + payload.len()];
+        let mut packet = Ipv4Packet::new_unchecked(&mut bytes[..]);
+        repr.emit(&mut packet, &ChecksumCapabilities::default());
+        packet.set_ident(42);
+        packet.set_frag_offset(offset);
+        packet.set_more_frags(offset == 0);
+        packet.fill_checksum();
+        packet.payload_mut().copy_from_slice(payload);
+        let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+        iface.inner.process_ipv4(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut iface.fragments,
+        );
+    }
+
+    let packet = sockets.get_mut::<raw::Socket>(handle).recv().unwrap();
+    assert_eq!(packet.len(), 20 + datagram.len());
+    let header = Ipv4Packet::new_checked(packet).unwrap();
+    assert_eq!(header.total_len() as usize, packet.len());
+    assert_eq!(header.hop_limit(), 64);
+    assert_eq!(header.payload(), datagram);
+}
+
+#[cfg(all(
+    feature = "proto-ipv4-fragmentation",
+    feature = "socket-raw",
+    feature = "medium-ip"
+))]
+#[test]
+fn duplicate_final_ipv4_fragment_does_not_complete_reassembly() {
+    use crate::wire::{IpVersion, UdpPacket, UdpRepr};
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let rx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let tx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 64]);
+    let handle = sockets.add(raw::Socket::new(IpVersion::Ipv4, IpProtocol::Udp, rx, tx));
+
+    let src = Ipv4Address::new(127, 0, 0, 2);
+    let dst = Ipv4Address::new(127, 0, 0, 1);
+    let mut datagram = [0u8; 24];
+    UdpRepr {
+        src_port: 12345,
+        dst_port: 23456,
+    }
+    .emit(
+        &mut UdpPacket::new_unchecked(&mut datagram[..]),
+        &src.into(),
+        &dst.into(),
+        16,
+        |payload| payload.fill(0x5a),
+        &ChecksumCapabilities::default(),
+    );
+
+    for (offset, payload, more_fragments) in [
+        (0, &datagram[..16], true),
+        (16, &datagram[16..], true),
+        (16, &datagram[16..], false),
+    ] {
+        let repr = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Udp,
+            payload_len: payload.len(),
+            hop_limit: 64,
+        };
+        let mut bytes = vec![0; repr.buffer_len() + payload.len()];
+        let mut packet = Ipv4Packet::new_unchecked(&mut bytes[..]);
+        repr.emit(&mut packet, &ChecksumCapabilities::default());
+        packet.set_ident(43);
+        packet.set_frag_offset(offset);
+        packet.set_more_frags(more_fragments);
+        packet.fill_checksum();
+        packet.payload_mut().copy_from_slice(payload);
+        let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+        iface.inner.process_ipv4(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::Ip,
+            &packet,
+            &mut iface.fragments,
+        );
+        assert!(!sockets.get_mut::<raw::Socket>(handle).can_recv());
+    }
 }
 
 #[rstest]
@@ -1761,13 +3080,9 @@ fn test_icmp_reply_size(#[case] medium: Medium) {
     );
 
     assert_eq!(
-        iface.inner.process_udp(
-            &mut sockets,
-            PacketMeta::default(),
-            false,
-            ip_repr.into(),
-            payload,
-        ),
+        iface
+            .inner
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr.into(), payload,),
         Some(Packet::new_ipv4(
             expected_ip_repr,
             IpPayload::Icmpv4(expected_icmp_repr)

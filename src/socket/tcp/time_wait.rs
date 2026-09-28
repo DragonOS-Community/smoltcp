@@ -58,7 +58,7 @@ impl TimeWaitState {
     }
 
     pub fn new_isn(&self) -> TcpSeqNumber {
-        let seq = self.snd_nxt + 65537;
+        let seq = TcpSeqNumber(self.snd_nxt.0.wrapping_add(65537));
         if seq == TcpSeqNumber(0) {
             TcpSeqNumber(1)
         } else {
@@ -175,6 +175,7 @@ mod tests {
     use super::*;
     use crate::iface::SocketSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn endpoints() -> (IpEndpoint, IpEndpoint) {
         (
@@ -264,6 +265,15 @@ mod tests {
             tw.process(Instant::from_secs(2), &syn(i32::MIN, 1)),
             TimeWaitAction::Reopen
         );
+    }
+
+    #[test]
+    fn reopened_isn_wraps_independently_of_pointer_width() {
+        let mut tw = old().time_wait.take().unwrap();
+        tw.snd_nxt = TcpSeqNumber(i32::MAX - 65536);
+        assert_eq!(tw.new_isn(), TcpSeqNumber(i32::MIN));
+        tw.snd_nxt = TcpSeqNumber(-65537);
+        assert_eq!(tw.new_isn(), TcpSeqNumber(1));
     }
 
     #[test]

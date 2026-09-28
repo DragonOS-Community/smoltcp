@@ -26,7 +26,7 @@ impl Key {
 #[derive(Debug)]
 struct Entry {
     state: TimeWaitState,
-    observer: Option<Arc<dyn LifecycleObserver>>,
+    observer: Option<Shared<dyn LifecycleObserver>>,
 }
 impl Entry {
     fn retire(self) {

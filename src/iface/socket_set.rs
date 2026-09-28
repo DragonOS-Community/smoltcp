@@ -4,8 +4,18 @@ use core::fmt;
 mod tcp_time_wait;
 use managed::ManagedSlice;
 
-#[cfg(all(feature = "alloc", any(feature = "socket-udp", feature = "socket-tcp")))]
-use alloc::sync::Arc;
+#[cfg(all(
+    feature = "alloc",
+    any(feature = "socket-udp", feature = "socket-tcp"),
+    not(target_has_atomic = "ptr")
+))]
+use alloc::rc::Rc as Shared;
+#[cfg(all(
+    feature = "alloc",
+    any(feature = "socket-udp", feature = "socket-tcp"),
+    target_has_atomic = "ptr"
+))]
+use alloc::sync::Arc as Shared;
 
 use super::socket_meta::Meta;
 #[cfg(all(feature = "alloc", any(feature = "socket-udp", feature = "socket-tcp")))]
@@ -128,11 +138,11 @@ pub struct SocketSet<'a> {
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     time_wait: tcp_time_wait::TimeWaitTable,
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
-    tcp_listen_registry: Option<Arc<dyn TcpListenRegistry>>,
+    tcp_listen_registry: Option<Shared<dyn TcpListenRegistry>>,
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
-    tcp_ingress_handler: Option<Arc<dyn TcpIngressHandler>>,
+    tcp_ingress_handler: Option<Shared<dyn TcpIngressHandler>>,
     #[cfg(all(feature = "alloc", feature = "socket-udp"))]
-    udp_ingress_handler: Option<Arc<dyn UdpIngressHandler>>,
+    udp_ingress_handler: Option<Shared<dyn UdpIngressHandler>>,
 }
 
 impl<'a> SocketSet<'a> {
@@ -159,8 +169,8 @@ impl<'a> SocketSet<'a> {
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     pub fn set_tcp_ingress_handler(
         &mut self,
-        handler: Option<Arc<dyn TcpIngressHandler>>,
-    ) -> Option<Arc<dyn TcpIngressHandler>> {
+        handler: Option<Shared<dyn TcpIngressHandler>>,
+    ) -> Option<Shared<dyn TcpIngressHandler>> {
         core::mem::replace(&mut self.tcp_ingress_handler, handler)
     }
 
@@ -182,8 +192,8 @@ impl<'a> SocketSet<'a> {
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     pub fn set_tcp_listen_registry(
         &mut self,
-        registry: Option<Arc<dyn TcpListenRegistry>>,
-    ) -> Option<Arc<dyn TcpListenRegistry>> {
+        registry: Option<Shared<dyn TcpListenRegistry>>,
+    ) -> Option<Shared<dyn TcpListenRegistry>> {
         core::mem::replace(&mut self.tcp_listen_registry, registry)
     }
 
@@ -202,8 +212,8 @@ impl<'a> SocketSet<'a> {
     #[cfg(all(feature = "alloc", feature = "socket-udp"))]
     pub fn set_udp_ingress_handler(
         &mut self,
-        handler: Option<Arc<dyn UdpIngressHandler>>,
-    ) -> Option<Arc<dyn UdpIngressHandler>> {
+        handler: Option<Shared<dyn UdpIngressHandler>>,
+    ) -> Option<Shared<dyn UdpIngressHandler>> {
         core::mem::replace(&mut self.udp_ingress_handler, handler)
     }
 

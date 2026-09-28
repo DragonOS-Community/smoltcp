@@ -373,6 +373,13 @@ pub trait Device {
     fn outbound_ip_mtu(&self, _destination: crate::wire::IpAddress, _meta: PacketMeta) -> usize {
         self.capabilities().ip_mtu()
     }
+
+    /// Whether the integration's policy view is still current. A poll may
+    /// dispatch several distinct packets; stop before advancing the next
+    /// socket when its pinned policy has been replaced.
+    fn policy_current(&self) -> bool {
+        true
+    }
 }
 
 /// A token to receive a single network packet.
@@ -393,6 +400,33 @@ pub trait RxToken {
 
 /// A token to transmit a single network packet.
 pub trait TxToken {
+    /// Whether this token hands a complete, serialized IP packet to its
+    /// integration before smoltcp performs neighbor lookup or fragmentation.
+    /// The default leaves all output ownership with smoltcp.
+    fn deferred_ip_output(&self, _version: crate::wire::IpVersion) -> bool {
+        false
+    }
+
+    /// Atomically admit a complete IP packet to an integration-owned output
+    /// queue. Called only when [`TxToken::deferred_ip_output`] is true. The
+    /// closure must fill the entire buffer while socket payload borrows are
+    /// still valid; admission may reject the packet without committing it.
+    fn consume_full_ip<F>(
+        self,
+        len: usize,
+        meta: PacketMeta,
+        class: IpOutputClass,
+        ipv4_fragment_ident: Option<u16>,
+        emit: F,
+    ) -> Result<(), IpOutputError>
+    where
+        F: FnOnce(&mut [u8]),
+        Self: Sized,
+    {
+        let _ = (self, len, meta, class, ipv4_fragment_ident, emit);
+        Err(IpOutputError::Unsupported)
+    }
+
     /// Override the egress properties used to serialize this packet.
     ///
     /// Most devices use the interface medium and return `None`. Stack
@@ -439,6 +473,28 @@ pub trait TxToken {
     /// The Packet ID to be associated with the frame to be transmitted by this [`TxToken`].
     #[allow(unused_variables)]
     fn set_meta(&mut self, meta: PacketMeta) {}
+}
+
+/// Routing scope for an integration-owned, locally generated IP packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum IpOutputClass {
+    Ordinary,
+    /// IPv6 neighbor discovery must use the current link, not a namespace
+    /// route, but it still traverses the IPv6 LOCAL_OUT policy.
+    LinkLocalControl,
+}
+
+/// Failure to admit a complete IP packet. Policy denial is distinct from
+/// transient device capacity and from route/MTU failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum IpOutputError {
+    Unsupported,
+    Exhausted,
+    NoRoute,
+    PolicyDrop,
+    MtuExceeded,
 }
 
 /// A transmit backend could not admit the packet selected by

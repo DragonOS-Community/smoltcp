@@ -184,12 +184,145 @@ impl InterfaceInner {
         })
     }
 
+    #[cfg(feature = "alloc")]
+    pub(super) fn process_ipv6_filtered<'frame>(
+        &mut self,
+        sockets: &mut SocketSet,
+        meta: PacketMeta,
+        source_hardware_addr: HardwareAddress,
+        ipv6_packet: &Ipv6Packet<&'frame [u8]>,
+        scratch: &'frame mut AllocVec<u8>,
+        filter: &mut dyn IpIngressFilter,
+    ) -> Option<Packet<'frame>> {
+        // The integration may retain a Forward packet before the local
+        // protocol stack sees it. Apply the receive-core checks that precede
+        // Linux PRE_ROUTING before exposing bytes to the filter.
+        let ipv6_repr = Ipv6Repr::parse(ipv6_packet).ok()?;
+        if ipv6_repr.src_addr.is_multicast() {
+            return None;
+        }
+        if ipv6_repr.dst_addr.is_multicast() {
+            let scope = ipv6_repr.dst_addr.octets()[1] & 0x0f;
+            if scope == 0 || (scope == 1 && !self.is_loopback) {
+                return None;
+            }
+        }
+        if !self.is_loopback
+            && (ipv6_repr.src_addr.is_loopback() || ipv6_repr.dst_addr.is_loopback())
+        {
+            return None;
+        }
+        if ipv6_repr.payload_len == 0 && ipv6_repr.next_header == IpProtocol::HopByHop {
+            // Jumbo Payload options require an effective length wider than
+            // the fixed header's 16-bit field. Do not forward a truncated
+            // forty-byte packet until that receive path exists.
+            return None;
+        }
+        if ipv6_repr.next_header == IpProtocol::HopByHop {
+            if let HopByHopResponse::Discard(reply) =
+                self.process_hopbyhop(ipv6_repr, ipv6_packet.payload())
+            {
+                return reply;
+            }
+        }
+        let original = ipv6_packet.clone().into_inner();
+        let mut packet = IngressPacket::borrowed(&original[..ipv6_packet.total_len()], scratch);
+        match filter.pre_routing_ipv6_defrag(&mut packet, meta, source_hardware_addr) {
+            PreRoutingVerdict::Pass => {}
+            PreRoutingVerdict::Drop => return None,
+        }
+        match filter.pre_routing(&mut packet, meta, source_hardware_addr) {
+            PreRoutingVerdict::Pass => {}
+            PreRoutingVerdict::Drop => return None,
+        }
+        // The callback may retain a routed datagram for work after this
+        // interface's socket and FIB locks are released. Revalidate the
+        // post-PRE_ROUTING packet before handing it to that callback.
+        let post = Ipv6Packet::new_checked(packet.bytes()).ok()?;
+        let post_repr = Ipv6Repr::parse(&post).ok()?;
+        if !post_repr.src_addr.x_is_unicast() {
+            return None;
+        }
+        if post_repr.next_header == IpProtocol::HopByHop {
+            if let HopByHopResponse::Discard(_) = self.process_hopbyhop(post_repr, post.payload()) {
+                return None;
+            }
+        }
+        let link_control = match filter.route_input(
+            &mut RoutedIngressPacket::new(&mut packet),
+            meta,
+            source_hardware_addr,
+        ) {
+            RouteInputVerdict::Pass => false,
+            RouteInputVerdict::NeighborDiscovery => true,
+            RouteInputVerdict::Drop | RouteInputVerdict::Forward => return None,
+        };
+        // LOCAL_IN is after the route/local-address decision. Inspect the
+        // post-PRE_ROUTING bytes before granting a mutable hook access, then
+        // validate its final result again in process_ipv6_inner. This keeps
+        // a destination rewrite from bypassing local delivery eligibility.
+        let post = Ipv6Packet::new_checked(packet.bytes()).ok()?;
+        let post_repr = Ipv6Repr::parse(&post).ok()?;
+        let (next_header, ip_payload) = if post_repr.next_header == IpProtocol::HopByHop {
+            match self.process_hopbyhop(post_repr, post.payload()) {
+                HopByHopResponse::Discard(_) => return None,
+                HopByHopResponse::Continue(next) => next,
+            }
+        } else {
+            (post_repr.next_header, post.payload())
+        };
+        if !self.accepts_local_ipv6_destination(post_repr, next_header, ip_payload, link_control) {
+            return None;
+        }
+        let transport_offset = 40 + post.payload().len() - ip_payload.len();
+        let external_raw = match filter.local_input(
+            &mut packet,
+            meta,
+            source_hardware_addr,
+            next_header,
+            transport_offset,
+        ) {
+            LocalInputVerdict::Pass => None,
+            LocalInputVerdict::Drop => return None,
+            LocalInputVerdict::ExternalRaw { matched } => Some(matched),
+        };
+        let rewritten = Ipv6Packet::new_checked(packet.into_bytes().ok()?).ok()?;
+        self.process_ipv6_inner(
+            sockets,
+            meta,
+            source_hardware_addr,
+            &rewritten,
+            link_control,
+            external_raw,
+        )
+    }
+
     pub(super) fn process_ipv6<'frame>(
         &mut self,
         sockets: &mut SocketSet,
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
+    ) -> Option<Packet<'frame>> {
+        self.process_ipv6_inner(
+            sockets,
+            meta,
+            source_hardware_addr,
+            ipv6_packet,
+            false,
+            #[cfg(feature = "alloc")]
+            None,
+        )
+    }
+
+    fn process_ipv6_inner<'frame>(
+        &mut self,
+        sockets: &mut SocketSet,
+        meta: PacketMeta,
+        source_hardware_addr: HardwareAddress,
+        ipv6_packet: &Ipv6Packet<&'frame [u8]>,
+        link_control: bool,
+        #[cfg(feature = "alloc")] external_raw: Option<bool>,
     ) -> Option<Packet<'frame>> {
         let ipv6_repr = check!(Ipv6Repr::parse(ipv6_packet));
 
@@ -208,36 +341,21 @@ impl InterfaceInner {
             (ipv6_repr.next_header, ipv6_packet.payload())
         };
 
-        if !self.has_ip_addr(ipv6_repr.dst_addr)
-            && !self.has_multicast_group(ipv6_repr.dst_addr)
-            && !ipv6_repr.dst_addr.is_loopback()
-        {
-            if !self.any_ip {
-                net_trace!("Rejecting IPv6 packet; any_ip=false");
-                return None;
-            }
-
-            if !ipv6_repr.dst_addr.x_is_unicast() {
-                net_trace!(
-                    "Rejecting IPv6 packet; {} is not a unicast address",
-                    ipv6_repr.dst_addr
-                );
-                return None;
-            }
-
-            if self
-                .routes
-                .lookup(&IpAddress::Ipv6(ipv6_repr.dst_addr), self.now)
-                .map_or(true, |router_addr| !self.has_ip_addr(router_addr))
-            {
-                net_trace!("Rejecting IPv6 packet; no matching routes");
-
-                return None;
-            }
+        if !self.accepts_local_ipv6_destination(ipv6_repr, next_header, ip_payload, link_control) {
+            return None;
         }
 
         #[cfg(feature = "socket-raw")]
-        let handled_by_raw_socket = self.raw_socket_filter(sockets, &ipv6_repr.into(), ip_payload);
+        let handled_by_raw_socket = {
+            #[cfg(feature = "alloc")]
+            if let Some(matched) = external_raw {
+                matched
+            } else {
+                self.raw_socket_filter(sockets, &ipv6_repr.into(), ip_payload)
+            }
+            #[cfg(not(feature = "alloc"))]
+            self.raw_socket_filter(sockets, &ipv6_repr.into(), ip_payload)
+        };
         #[cfg(not(feature = "socket-raw"))]
         let handled_by_raw_socket = false;
 
@@ -258,6 +376,36 @@ impl InterfaceInner {
             handled_by_raw_socket,
             ip_payload,
         )
+    }
+
+    fn accepts_local_ipv6_destination(
+        &self,
+        ipv6_repr: Ipv6Repr,
+        next_header: IpProtocol,
+        ip_payload: &[u8],
+        link_control: bool,
+    ) -> bool {
+        // The route integration may keep NDISC on its physical ingress link
+        // even when weak-host local routing selected an address owned by a
+        // different interface. Never extend that exception to another packet.
+        let ingress_ndisc = link_control
+            && ipv6_repr.hop_limit == 0xff
+            && next_header == IpProtocol::Icmpv6
+            && Icmpv6Packet::new_checked(ip_payload)
+                .is_ok_and(|packet| packet.msg_type().is_ndisc());
+        if ingress_ndisc
+            || self.has_ip_addr(ipv6_repr.dst_addr)
+            || self.has_multicast_group(ipv6_repr.dst_addr)
+            || ipv6_repr.dst_addr.is_loopback()
+        {
+            return true;
+        }
+        if !self.any_ip || !ipv6_repr.dst_addr.x_is_unicast() {
+            return false;
+        }
+        self.routes
+            .lookup(&IpAddress::Ipv6(ipv6_repr.dst_addr), self.now)
+            .is_some_and(|router_addr| self.has_ip_addr(router_addr))
     }
 
     fn process_hopbyhop<'frame>(
@@ -282,33 +430,33 @@ impl InterfaceInner {
         let ext_hdr = check!(Ipv6ExtHeader::new_checked(ip_payload));
         let ext_repr = check!(Ipv6ExtHeaderRepr::parse(&ext_hdr));
         let hbh_hdr = check!(Ipv6HopByHopHeader::new_checked(ext_repr.data));
-        let hbh_repr = check!(Ipv6HopByHopRepr::parse(&hbh_hdr));
-
-        for opt_repr in &hbh_repr.options {
+        // A received HBH header can carry more options than the fixed-size
+        // Repr used for emission. Inspect every option; stopping at that
+        // representation's capacity could skip a mandatory-discard option.
+        for option in Ipv6OptionsIterator::new(hbh_hdr.options()) {
+            let opt_repr = check!(option);
             match opt_repr {
                 Ipv6OptionRepr::Pad1 | Ipv6OptionRepr::PadN(_) | Ipv6OptionRepr::RouterAlert(_) => {
                 }
                 #[cfg(feature = "proto-rpl")]
                 Ipv6OptionRepr::Rpl(_) => {}
 
-                Ipv6OptionRepr::Unknown { type_, .. } => {
-                    match Ipv6OptionFailureType::from(*type_) {
-                        Ipv6OptionFailureType::Skip => (),
-                        Ipv6OptionFailureType::Discard => {
+                Ipv6OptionRepr::Unknown { type_, .. } => match Ipv6OptionFailureType::from(type_) {
+                    Ipv6OptionFailureType::Skip => (),
+                    Ipv6OptionFailureType::Discard => {
+                        return HopByHopResponse::Discard(None);
+                    }
+                    Ipv6OptionFailureType::DiscardSendAll => {
+                        return HopByHopResponse::Discard(param_problem());
+                    }
+                    Ipv6OptionFailureType::DiscardSendUnicast => {
+                        if !ipv6_repr.dst_addr.is_multicast() {
+                            return HopByHopResponse::Discard(param_problem());
+                        } else {
                             return HopByHopResponse::Discard(None);
                         }
-                        Ipv6OptionFailureType::DiscardSendAll => {
-                            return HopByHopResponse::Discard(param_problem());
-                        }
-                        Ipv6OptionFailureType::DiscardSendUnicast => {
-                            if !ipv6_repr.dst_addr.is_multicast() {
-                                return HopByHopResponse::Discard(param_problem());
-                            } else {
-                                return HopByHopResponse::Discard(None);
-                            }
-                        }
                     }
-                }
+                },
             }
         }
 
@@ -333,13 +481,7 @@ impl InterfaceInner {
             IpProtocol::Icmpv6 => self.process_icmpv6(sockets, ipv6_repr, ip_payload),
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
-            IpProtocol::Udp => self.process_udp(
-                sockets,
-                meta,
-                handled_by_raw_socket,
-                ipv6_repr.into(),
-                ip_payload,
-            ),
+            IpProtocol::Udp => self.process_udp(sockets, meta, ipv6_repr.into(), ip_payload),
 
             #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => self.process_tcp(sockets, meta, ipv6_repr.into(), ip_payload),

@@ -24,13 +24,22 @@ mod tcp;
 #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
 mod udp;
 
+#[cfg(feature = "alloc")]
+use super::ingress_packet::{
+    IngressPacket, IpIngressFilter, LocalInputVerdict, PreRoutingVerdict, RouteInputVerdict,
+    RoutedIngressPacket,
+};
 use super::packet::*;
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec as AllocVec;
 
 use core::result::Result;
 use heapless::Vec;
 
 #[cfg(feature = "_proto-fragmentation")]
 use super::fragmentation::FragKey;
+#[cfg(feature = "proto-ipv4-fragmentation")]
+use super::fragmentation::FragmentRange;
 #[cfg(any(feature = "proto-ipv4", feature = "proto-sixlowpan"))]
 use super::fragmentation::PacketAssemblerSet;
 use super::fragmentation::{Fragmenter, FragmentsBuffer};
@@ -41,7 +50,10 @@ use super::socket_set::SocketSet;
 use crate::config::{IFACE_MAX_ADDR_COUNT, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT};
 use crate::iface::Routes;
 use crate::phy::PacketMeta;
-use crate::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use crate::phy::{
+    ChecksumCapabilities, Device, DeviceCapabilities, IpOutputClass, IpOutputError, Medium,
+    RxToken, TxToken,
+};
 use crate::rand::Rand;
 use crate::socket::*;
 use crate::time::{Duration, Instant};
@@ -149,6 +161,8 @@ pub struct Interface {
     pub inner: InterfaceInner,
     fragments: FragmentsBuffer,
     fragmenter: Fragmenter,
+    #[cfg(feature = "alloc")]
+    ingress_scratch: AllocVec<u8>,
 }
 
 /// The device independent part of an Ethernet network interface.
@@ -169,6 +183,7 @@ pub struct InterfaceInner {
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     neighbor_discovery_enabled: bool,
     hardware_addr: HardwareAddress,
+    is_loopback: bool,
     #[cfg(feature = "medium-ieee802154")]
     sequence_no: u8,
     #[cfg(feature = "medium-ieee802154")]
@@ -206,6 +221,10 @@ pub struct Config {
     /// Creating the interface panics if the address is not unicast.
     pub hardware_addr: HardwareAddress,
 
+    /// Whether this interface is the loopback device (as opposed to a TUN
+    /// device, which also uses `Medium::Ip`).
+    pub is_loopback: bool,
+
     /// Set the IEEE802.15.4 PAN ID the interface will use.
     ///
     /// **NOTE**: we use the same PAN ID for destination and source.
@@ -218,6 +237,7 @@ impl Config {
         Config {
             random_seed: 0,
             hardware_addr,
+            is_loopback: false,
             #[cfg(feature = "medium-ieee802154")]
             pan_id: None,
         }
@@ -284,11 +304,14 @@ impl Interface {
                 reassembly_timeout: Duration::from_secs(60),
             },
             fragmenter: Fragmenter::new(),
+            #[cfg(feature = "alloc")]
+            ingress_scratch: AllocVec::new(),
             inner: InterfaceInner {
                 now,
                 caps,
                 max_frame_mtu,
                 hardware_addr: config.hardware_addr,
+                is_loopback: config.is_loopback,
                 ip_addrs: Vec::new(),
                 any_ip: false,
                 route_table_includes_connected_prefixes: false,
@@ -591,6 +614,9 @@ impl Interface {
                                 Err(DispatchError::NoRoute) => {
                                     return Err(Ipv4PacketDispatchError::NoRoute);
                                 }
+                                Err(DispatchError::PolicyDrop) => {
+                                    return Err(Ipv4PacketDispatchError::NoRoute);
+                                }
                                 Err(DispatchError::Exhausted) => {
                                     return Err(Ipv4PacketDispatchError::Exhausted);
                                 }
@@ -611,6 +637,7 @@ impl Interface {
                     })
                     .map_err(|error| match error {
                         DispatchError::NoRoute => Ipv4PacketDispatchError::NoRoute,
+                        DispatchError::PolicyDrop => Ipv4PacketDispatchError::NoRoute,
                         DispatchError::Exhausted => Ipv4PacketDispatchError::Exhausted,
                         DispatchError::NeighborPending => {
                             Ipv4PacketDispatchError::NeighborPending {
@@ -746,6 +773,37 @@ impl Interface {
         device: &mut (impl Device + ?Sized),
         sockets: &mut SocketSet<'_>,
     ) -> PollResult {
+        self.poll_inner(
+            timestamp,
+            device,
+            sockets,
+            #[cfg(feature = "alloc")]
+            None,
+        )
+    }
+
+    /// Poll all ingress and egress with the same pre-routing decision as
+    /// [`poll_ingress_single_filtered`](Self::poll_ingress_single_filtered).
+    /// An integration that uses both polling styles must use their filtered
+    /// variants for both, or some ingress packets will bypass its policy.
+    #[cfg(feature = "alloc")]
+    pub fn poll_filtered(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        filter: &mut dyn IpIngressFilter,
+    ) -> PollResult {
+        self.poll_inner(timestamp, device, sockets, Some(filter))
+    }
+
+    fn poll_inner(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        #[cfg(feature = "alloc")] mut filter: Option<&mut (dyn IpIngressFilter + '_)>,
+    ) -> PollResult {
         self.inner.now = timestamp;
 
         let mut res = PollResult::None;
@@ -755,7 +813,19 @@ impl Interface {
 
         // Process ingress while there's packets available.
         loop {
-            match self.socket_ingress(device, sockets) {
+            #[cfg(feature = "alloc")]
+            if filter
+                .as_ref()
+                .is_some_and(|filter| !filter.continue_ingress_poll())
+            {
+                return res;
+            }
+            match self.socket_ingress(
+                device,
+                sockets,
+                #[cfg(feature = "alloc")]
+                filter.as_deref_mut(),
+            ) {
                 PollIngressSingleResult::None => break,
                 PollIngressSingleResult::PacketProcessed => {}
                 PollIngressSingleResult::SocketStateChanged => res = PollResult::SocketStateChanged,
@@ -763,6 +833,13 @@ impl Interface {
         }
 
         // Process egress.
+        #[cfg(feature = "alloc")]
+        if filter
+            .as_ref()
+            .is_some_and(|filter| !filter.continue_ingress_poll())
+        {
+            return res;
+        }
         match self.poll_egress(timestamp, device, sockets) {
             PollResult::None => {}
             PollResult::SocketStateChanged => res = PollResult::SocketStateChanged,
@@ -784,6 +861,10 @@ impl Interface {
         sockets: &mut SocketSet<'_>,
     ) -> PollResult {
         self.inner.now = timestamp;
+
+        if !device.policy_current() {
+            return PollResult::None;
+        }
 
         match self.inner.caps.medium {
             #[cfg(feature = "medium-ieee802154")]
@@ -824,7 +905,32 @@ impl Interface {
         #[cfg(feature = "_proto-fragmentation")]
         self.fragments.assembler.remove_expired(timestamp);
 
-        self.socket_ingress(device, sockets)
+        self.socket_ingress(
+            device,
+            sockets,
+            #[cfg(feature = "alloc")]
+            None,
+        )
+    }
+
+    /// Process one packet with an integration-owned pre-routing decision.
+    #[cfg(feature = "alloc")]
+    pub fn poll_ingress_single_filtered(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        filter: &mut dyn IpIngressFilter,
+    ) -> PollIngressSingleResult {
+        self.inner.now = timestamp;
+        #[cfg(feature = "socket-tcp")]
+        sockets.expire_tcp_time_wait(timestamp);
+        #[cfg(feature = "_proto-fragmentation")]
+        self.fragments.assembler.remove_expired(timestamp);
+        if !filter.continue_ingress_poll() {
+            return PollIngressSingleResult::None;
+        }
+        self.socket_ingress(device, sockets, Some(filter))
     }
 
     /// Return a _soft deadline_ for calling [poll] the next time.
@@ -842,6 +948,11 @@ impl Interface {
         if !self.fragmenter.is_empty() {
             return Some(Instant::from_millis(0));
         }
+
+        #[cfg(feature = "multicast")]
+        let multicast_retry_at = self.inner.multicast.retry_at();
+        #[cfg(not(feature = "multicast"))]
+        let multicast_retry_at: Option<Instant> = None;
 
         let inner = &mut self.inner;
 
@@ -861,14 +972,15 @@ impl Interface {
             .min();
         #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
         {
-            return active
+            active
                 .into_iter()
+                .chain(multicast_retry_at)
                 .chain(sockets.tcp_time_wait_poll_at())
-                .min();
+                .min()
         }
         #[cfg(not(all(feature = "alloc", feature = "socket-tcp")))]
         {
-            active
+            active.into_iter().chain(multicast_retry_at).min()
         }
     }
 
@@ -892,6 +1004,7 @@ impl Interface {
         &mut self,
         device: &mut (impl Device + ?Sized),
         sockets: &mut SocketSet<'_>,
+        #[cfg(feature = "alloc")] mut filter: Option<&mut (dyn IpIngressFilter + '_)>,
     ) -> PollIngressSingleResult {
         let Some((rx_token, tx_token)) = device.receive(self.inner.now) else {
             return PollIngressSingleResult::None;
@@ -899,6 +1012,10 @@ impl Interface {
 
         let rx_meta = rx_token.meta();
         rx_token.consume(|frame| {
+            #[cfg(feature = "alloc")]
+            if let Some(filter) = filter.as_deref_mut() {
+                filter.begin_packet(rx_meta);
+            }
             if frame.is_empty() {
                 return PollIngressSingleResult::PacketProcessed;
             }
@@ -906,10 +1023,25 @@ impl Interface {
             match self.inner.caps.medium {
                 #[cfg(feature = "medium-ethernet")]
                 Medium::Ethernet => {
-                    if let Some(packet) =
+                    #[cfg(feature = "alloc")]
+                    let response = if let Some(filter) = filter {
+                        self.inner.process_ethernet_filtered(
+                            sockets,
+                            rx_meta,
+                            frame,
+                            &mut self.fragments,
+                            &mut self.ingress_scratch,
+                            filter,
+                        )
+                    } else {
                         self.inner
                             .process_ethernet(sockets, rx_meta, frame, &mut self.fragments)
-                    {
+                    };
+                    #[cfg(not(feature = "alloc"))]
+                    let response =
+                        self.inner
+                            .process_ethernet(sockets, rx_meta, frame, &mut self.fragments);
+                    if let Some(packet) = response {
                         if let Err(err) =
                             self.inner.dispatch(tx_token, packet, &mut self.fragmenter)
                         {
@@ -919,10 +1051,25 @@ impl Interface {
                 }
                 #[cfg(feature = "medium-ip")]
                 Medium::Ip => {
-                    if let Some(packet) =
+                    #[cfg(feature = "alloc")]
+                    let response = if let Some(filter) = filter {
+                        self.inner.process_ip_filtered(
+                            sockets,
+                            rx_meta,
+                            frame,
+                            &mut self.fragments,
+                            &mut self.ingress_scratch,
+                            filter,
+                        )
+                    } else {
                         self.inner
                             .process_ip(sockets, rx_meta, frame, &mut self.fragments)
-                    {
+                    };
+                    #[cfg(not(feature = "alloc"))]
+                    let response =
+                        self.inner
+                            .process_ip(sockets, rx_meta, frame, &mut self.fragments);
+                    if let Some(packet) = response {
                         if let Err(err) = self.inner.dispatch_ip(
                             tx_token,
                             packet.tx_meta(),
@@ -935,6 +1082,13 @@ impl Interface {
                 }
                 #[cfg(feature = "medium-ieee802154")]
                 Medium::Ieee802154 => {
+                    // 6LoWPAN needs its own post-decompression IP boundary.
+                    // Until that exists, a filtered poll must fail closed
+                    // rather than silently bypass the caller's policy.
+                    #[cfg(feature = "alloc")]
+                    if filter.is_some_and(|filter| filter.applies_to(IpVersion::Ipv6)) {
+                        return PollIngressSingleResult::PacketProcessed;
+                    }
                     if let Some(packet) =
                         self.inner
                             .process_ieee802154(sockets, rx_meta, frame, &mut self.fragments)
@@ -977,6 +1131,12 @@ impl Interface {
 
         let mut result = PollResult::None;
         for item in sockets.items_mut() {
+            // A changed policy may require a different route, interface name,
+            // or NAT view. Leave this socket and every later one untouched;
+            // the integration will restart the poll with a fresh snapshot.
+            if !device.policy_current() {
+                break;
+            }
             if !item
                 .meta
                 .egress_permitted(self.inner.now, |ip_addr| self.inner.has_neighbor(&ip_addr))
@@ -985,6 +1145,7 @@ impl Interface {
             }
 
             let mut neighbor_addr = None;
+            let policy_dropped = core::cell::Cell::new(false);
             #[cfg(feature = "socket-tcp")]
             #[allow(unreachable_patterns)]
             let tcp_mtu = match &item.socket {
@@ -1000,14 +1161,14 @@ impl Interface {
                     EgressError::Exhausted
                 })?;
 
-                inner
-                    .dispatch_ip(t, meta, response, &mut self.fragmenter)
-                    .map_err(|error| match error {
-                        DispatchError::Exhausted => EgressError::Exhausted,
-                        DispatchError::NoRoute | DispatchError::NeighborPending => {
-                            EgressError::Dispatch
-                        }
-                    })?;
+                match inner.dispatch_ip(t, meta, response, &mut self.fragmenter) {
+                    Ok(()) => {}
+                    Err(DispatchError::PolicyDrop) => policy_dropped.set(true),
+                    Err(DispatchError::Exhausted) => return Err(EgressError::Exhausted),
+                    Err(DispatchError::NoRoute | DispatchError::NeighborPending) => {
+                        return Err(EgressError::Dispatch);
+                    }
+                }
 
                 result = PollResult::SocketStateChanged;
 
@@ -1052,9 +1213,16 @@ impl Interface {
                 Socket::Tcp(socket) => {
                     let meta = socket.egress_meta();
                     let mtu = tcp_mtu.unwrap_or_else(|| self.inner.ip_mtu());
-                    socket.dispatch_with_mtu(&mut self.inner, mtu, |inner, (ip, tcp)| {
-                        respond(inner, meta, Packet::new(ip, IpPayload::Tcp(tcp)))
-                    })
+                    socket
+                        .dispatch_with_mtu_policy(&mut self.inner, mtu, |inner, (ip, tcp)| {
+                            respond(inner, meta, Packet::new(ip, IpPayload::Tcp(tcp)))?;
+                            Ok(if policy_dropped.replace(false) {
+                                crate::socket::tcp::TcpPacketAdmission::PolicyDropped
+                            } else {
+                                crate::socket::tcp::TcpPacketAdmission::Admitted
+                            })
+                        })
+                        .map(|_| ())
                 }
                 #[cfg(feature = "socket-dhcpv4")]
                 Socket::Dhcpv4(socket) => {
@@ -1190,15 +1358,77 @@ impl InterfaceInner {
         ip_payload: &'frame [u8],
         frag: &'frame mut FragmentsBuffer,
     ) -> Option<Packet<'frame>> {
+        self.process_ip_inner(
+            sockets,
+            meta,
+            ip_payload,
+            frag,
+            #[cfg(feature = "alloc")]
+            None,
+        )
+    }
+
+    #[cfg(all(feature = "alloc", feature = "medium-ip"))]
+    fn process_ip_filtered<'frame>(
+        &mut self,
+        sockets: &mut SocketSet,
+        meta: PacketMeta,
+        ip_payload: &'frame [u8],
+        frag: &'frame mut FragmentsBuffer,
+        scratch: &'frame mut AllocVec<u8>,
+        filter: &mut dyn IpIngressFilter,
+    ) -> Option<Packet<'frame>> {
+        self.process_ip_inner(sockets, meta, ip_payload, frag, Some((scratch, filter)))
+    }
+
+    #[cfg(feature = "medium-ip")]
+    fn process_ip_inner<'frame>(
+        &mut self,
+        sockets: &mut SocketSet,
+        meta: PacketMeta,
+        ip_payload: &'frame [u8],
+        frag: &'frame mut FragmentsBuffer,
+        #[cfg(feature = "alloc")] filter: Option<(
+            &'frame mut AllocVec<u8>,
+            &mut dyn IpIngressFilter,
+        )>,
+    ) -> Option<Packet<'frame>> {
         match IpVersion::of_packet(ip_payload) {
             #[cfg(feature = "proto-ipv4")]
             Ok(IpVersion::Ipv4) => {
                 let ipv4_packet = check!(Ipv4Packet::new_checked(ip_payload));
+                #[cfg(feature = "alloc")]
+                if let Some((scratch, filter)) = filter.filter(|(_, filter)| {
+                    filter.applies_to_packet(IpVersion::Ipv4, ipv4_packet.as_ref())
+                }) {
+                    return self.process_ipv4_filtered(
+                        sockets,
+                        meta,
+                        HardwareAddress::Ip,
+                        &ipv4_packet,
+                        frag,
+                        scratch,
+                        filter,
+                    );
+                }
                 self.process_ipv4(sockets, meta, HardwareAddress::Ip, &ipv4_packet, frag)
             }
             #[cfg(feature = "proto-ipv6")]
             Ok(IpVersion::Ipv6) => {
                 let ipv6_packet = check!(Ipv6Packet::new_checked(ip_payload));
+                #[cfg(feature = "alloc")]
+                if let Some((scratch, filter)) = filter.filter(|(_, filter)| {
+                    filter.applies_to_packet(IpVersion::Ipv6, ipv6_packet.as_ref())
+                }) {
+                    return self.process_ipv6_filtered(
+                        sockets,
+                        meta,
+                        HardwareAddress::Ip,
+                        &ipv6_packet,
+                        scratch,
+                        filter,
+                    );
+                }
                 self.process_ipv6(sockets, meta, HardwareAddress::Ip, &ipv6_packet)
             }
             // Drop all other traffic.
@@ -1515,6 +1745,42 @@ impl InterfaceInner {
             #[allow(unreachable_patterns)]
             _ => false,
         };
+        if tx_token.deferred_ip_output(ip_repr.version()) {
+            let len = ip_repr.buffer_len();
+            match ip_repr {
+                #[cfg(feature = "proto-ipv4")]
+                IpRepr::Ipv4(_) if len > u16::MAX as usize => {
+                    return Err(DispatchError::NoRoute);
+                }
+                #[cfg(feature = "proto-ipv6")]
+                IpRepr::Ipv6(_) if len - ip_repr.header_len() > u16::MAX as usize => {
+                    return Err(DispatchError::NoRoute);
+                }
+                _ => {}
+            }
+            let class = if link_local_control {
+                IpOutputClass::LinkLocalControl
+            } else {
+                IpOutputClass::Ordinary
+            };
+            #[cfg(feature = "proto-ipv4-fragmentation")]
+            let ipv4_fragment_ident =
+                matches!(&ip_repr, IpRepr::Ipv4(_)).then(|| self.next_ipv4_frag_ident());
+            #[cfg(not(feature = "proto-ipv4-fragmentation"))]
+            let ipv4_fragment_ident = None;
+            return tx_token
+                .consume_full_ip(len, meta, class, ipv4_fragment_ident, |buffer| {
+                    ip_repr.emit(&mut *buffer, &self.caps.checksum);
+                    packet.emit_payload(&ip_repr, &mut buffer[ip_repr.header_len()..], &self.caps);
+                })
+                .map_err(|error| match error {
+                    IpOutputError::Exhausted => DispatchError::Exhausted,
+                    IpOutputError::PolicyDrop => DispatchError::PolicyDrop,
+                    IpOutputError::Unsupported
+                    | IpOutputError::NoRoute
+                    | IpOutputError::MtuExceeded => DispatchError::NoRoute,
+                });
+        }
         let egress = if link_local_control {
             None
         } else {
@@ -1743,6 +2009,8 @@ enum DispatchError {
     /// The selected transmit backend has no capacity. The socket should retain
     /// the packet and retry after the device is polled again.
     Exhausted,
+    /// The integration's LOCAL_OUT policy denied the packet.
+    PolicyDrop,
     /// No route to dispatch this packet. Retrying won't help unless
     /// configuration is changed.
     NoRoute,

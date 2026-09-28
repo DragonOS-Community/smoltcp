@@ -2,11 +2,13 @@ use core::result::Result;
 use heapless::{LinearMap, Vec};
 
 #[cfg(any(feature = "proto-ipv4", feature = "proto-ipv6"))]
-use super::{check, IpPayload, Packet};
+use super::{check, DispatchError, IpPayload, Packet};
 use super::{Interface, InterfaceInner};
 use crate::config::{IFACE_MAX_ADDR_COUNT, IFACE_MAX_MULTICAST_GROUP_COUNT};
 use crate::phy::{Device, PacketMeta};
 use crate::wire::*;
+
+const MULTICAST_RETRY_DELAY: crate::time::Duration = crate::time::Duration::from_millis(200);
 
 /// Error type for `join_multicast_group`, `leave_multicast_group`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +60,9 @@ enum GroupState {
 
 pub struct State {
     groups: LinearMap<IpAddress, GroupState, IFACE_MAX_MULTICAST_GROUP_COUNT>,
+    /// Back off only after a transient transmit failure. A permanent policy
+    /// or route denial still finishes this report attempt.
+    retry_at: Option<crate::time::Instant>,
     /// When to report for (all or) the next multicast group membership via IGMP
     #[cfg(feature = "proto-ipv4")]
     igmp_report_state: IgmpReportState,
@@ -69,11 +74,16 @@ impl State {
     pub fn new() -> Self {
         Self {
             groups: LinearMap::new(),
+            retry_at: None,
             #[cfg(feature = "proto-ipv4")]
             igmp_report_state: IgmpReportState::Inactive,
             #[cfg(feature = "proto-ipv6")]
             mld_report_state: MldReportState::Inactive,
         }
+    }
+
+    pub(super) fn retry_at(&self) -> Option<crate::time::Instant> {
+        self.retry_at
     }
 
     pub fn has_multicast_group<T: Into<IpAddress>>(&self, addr: T) -> bool {
@@ -184,7 +194,57 @@ impl Interface {
     /// - Send join/leave packets according to the multicast group state.
     /// - Depending on `igmp_report_state` and the therein contained
     ///   timeouts, send IGMP membership reports.
+    ///
+    /// A policy or permanent route denial drops this one report, as LOCAL_OUT
+    /// does on Linux. Capacity and neighbor discovery are transient: retain
+    /// the group/query state so the same report can be retried.
+    fn dispatch_multicast_report(
+        &mut self,
+        device: &mut (impl Device + ?Sized),
+        packet: Packet<'_>,
+    ) -> bool {
+        if self
+            .inner
+            .multicast
+            .retry_at
+            .is_some_and(|retry_at| self.inner.now < retry_at)
+        {
+            return false;
+        }
+        if !device.policy_current() {
+            return false;
+        }
+        let Some(tx_token) = device.transmit(self.inner.now) else {
+            self.inner.multicast.retry_at = Some(self.inner.now + MULTICAST_RETRY_DELAY);
+            return false;
+        };
+        match self.inner.dispatch_ip(
+            tx_token,
+            PacketMeta::default(),
+            packet,
+            &mut self.fragmenter,
+        ) {
+            Ok(()) | Err(DispatchError::PolicyDrop | DispatchError::NoRoute) => {
+                self.inner.multicast.retry_at = None;
+                true
+            }
+            Err(DispatchError::Exhausted | DispatchError::NeighborPending) => {
+                self.inner.multicast.retry_at = Some(self.inner.now + MULTICAST_RETRY_DELAY);
+                false
+            }
+        }
+    }
+
     pub fn multicast_egress(&mut self, device: &mut (impl Device + ?Sized)) {
+        if self
+            .inner
+            .multicast
+            .retry_at
+            .is_some_and(|retry_at| self.inner.now < retry_at)
+        {
+            return;
+        }
+        self.inner.multicast.retry_at = None;
         // Process multicast joins.
         while let Some((&addr, _)) = self
             .inner
@@ -197,14 +257,9 @@ impl Interface {
                 #[cfg(feature = "proto-ipv4")]
                 IpAddress::Ipv4(addr) => {
                     if let Some(pkt) = self.inner.igmp_report_packet(IgmpVersion::Version2, addr) {
-                        let Some(tx_token) = device.transmit(self.inner.now) else {
+                        if !self.dispatch_multicast_report(device, pkt) {
                             break;
-                        };
-
-                        // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
-                        self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
-                            .unwrap();
+                        }
                     }
                 }
                 #[cfg(feature = "proto-ipv6")]
@@ -213,14 +268,9 @@ impl Interface {
                         MldRecordType::ChangeToInclude,
                         addr,
                     )]) {
-                        let Some(tx_token) = device.transmit(self.inner.now) else {
+                        if !self.dispatch_multicast_report(device, pkt) {
                             break;
-                        };
-
-                        // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
-                        self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
-                            .unwrap();
+                        }
                     }
                 }
             }
@@ -245,14 +295,9 @@ impl Interface {
                 #[cfg(feature = "proto-ipv4")]
                 IpAddress::Ipv4(addr) => {
                     if let Some(pkt) = self.inner.igmp_leave_packet(addr) {
-                        let Some(tx_token) = device.transmit(self.inner.now) else {
+                        if !self.dispatch_multicast_report(device, pkt) {
                             break;
-                        };
-
-                        // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
-                        self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
-                            .unwrap();
+                        }
                     }
                 }
                 #[cfg(feature = "proto-ipv6")]
@@ -261,14 +306,9 @@ impl Interface {
                         MldRecordType::ChangeToExclude,
                         addr,
                     )]) {
-                        let Some(tx_token) = device.transmit(self.inner.now) else {
+                        if !self.dispatch_multicast_report(device, pkt) {
                             break;
-                        };
-
-                        // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
-                        self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
-                            .unwrap();
+                        }
                     }
                 }
             }
@@ -285,11 +325,7 @@ impl Interface {
             } if self.inner.now >= timeout => {
                 if let Some(pkt) = self.inner.igmp_report_packet(version, group) {
                     // Send initial membership report
-                    if let Some(tx_token) = device.transmit(self.inner.now) {
-                        // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
-                        self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
-                            .unwrap();
+                    if self.dispatch_multicast_report(device, pkt) {
                         self.inner.multicast.igmp_report_state = IgmpReportState::Inactive;
                     }
                 }
@@ -316,17 +352,7 @@ impl Interface {
                     Some(addr) => {
                         if let Some(pkt) = self.inner.igmp_report_packet(version, addr) {
                             // Send initial membership report
-                            if let Some(tx_token) = device.transmit(self.inner.now) {
-                                // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
-                                self.inner
-                                    .dispatch_ip(
-                                        tx_token,
-                                        PacketMeta::default(),
-                                        pkt,
-                                        &mut self.fragmenter,
-                                    )
-                                    .unwrap();
-
+                            if self.dispatch_multicast_report(device, pkt) {
                                 let next_timeout = (timeout + interval).max(self.inner.now);
                                 self.inner.multicast.igmp_report_state =
                                     IgmpReportState::ToGeneralQuery {
@@ -363,25 +389,22 @@ impl Interface {
                     })
                     .collect::<heapless::Vec<_, IFACE_MAX_MULTICAST_GROUP_COUNT>>();
                 if let Some(pkt) = self.inner.mldv2_report_packet(&records) {
-                    if let Some(tx_token) = device.transmit(self.inner.now) {
-                        self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
-                            .unwrap();
-                    };
+                    if self.dispatch_multicast_report(device, pkt) {
+                        self.inner.multicast.mld_report_state = MldReportState::Inactive;
+                    }
+                } else {
+                    self.inner.multicast.mld_report_state = MldReportState::Inactive;
                 };
-                self.inner.multicast.mld_report_state = MldReportState::Inactive;
             }
             MldReportState::ToSpecificQuery { group, timeout } if self.inner.now >= timeout => {
                 let record = MldAddressRecordRepr::new(MldRecordType::ModeIsExclude, group);
                 if let Some(pkt) = self.inner.mldv2_report_packet(&[record]) {
-                    if let Some(tx_token) = device.transmit(self.inner.now) {
-                        // NOTE(unwrap): packet destination is multicast, which is always routable and doesn't require neighbor discovery.
-                        self.inner
-                            .dispatch_ip(tx_token, PacketMeta::default(), pkt, &mut self.fragmenter)
-                            .unwrap();
+                    if self.dispatch_multicast_report(device, pkt) {
+                        self.inner.multicast.mld_report_state = MldReportState::Inactive;
                     }
+                } else {
+                    self.inner.multicast.mld_report_state = MldReportState::Inactive;
                 }
-                self.inner.multicast.mld_report_state = MldReportState::Inactive;
             }
             _ => {}
         }
@@ -554,5 +577,261 @@ impl InterfaceInner {
             MldRepr::Report { .. } => None,
             MldRepr::ReportRecordReprs { .. } => None,
         }
+    }
+}
+
+#[cfg(all(test, feature = "medium-ip"))]
+mod policy_tests {
+    use super::*;
+    use crate::phy::{DeviceCapabilities, IpOutputClass, IpOutputError, Medium, TxToken};
+    use crate::time::Instant;
+
+    struct RejectOutput {
+        capabilities: DeviceCapabilities,
+        error: Option<IpOutputError>,
+        current: bool,
+        stale_after_transmit: bool,
+        no_token: bool,
+        sent: core::cell::Cell<usize>,
+    }
+
+    struct RejectToken<'a> {
+        error: Option<IpOutputError>,
+        sent: &'a core::cell::Cell<usize>,
+    }
+
+    impl TxToken for RejectToken<'_> {
+        fn deferred_ip_output(&self, _: IpVersion) -> bool {
+            true
+        }
+
+        fn consume_full_ip<F>(
+            self,
+            len: usize,
+            _: PacketMeta,
+            _: IpOutputClass,
+            _: Option<u16>,
+            emit: F,
+        ) -> Result<(), IpOutputError>
+        where
+            F: FnOnce(&mut [u8]),
+        {
+            if let Some(error) = self.error {
+                return Err(error);
+            }
+            let mut bytes = alloc::vec![0; len];
+            emit(&mut bytes);
+            self.sent.set(self.sent.get() + 1);
+            Ok(())
+        }
+
+        fn consume<R, F>(self, _: usize, _: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            panic!("multicast output must use complete IP admission")
+        }
+    }
+
+    impl Device for RejectOutput {
+        type RxToken<'a> = crate::tests::RxToken;
+        type TxToken<'a> = RejectToken<'a>;
+
+        fn receive(&mut self, _: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            None
+        }
+
+        fn transmit(&mut self, _: Instant) -> Option<Self::TxToken<'_>> {
+            if self.no_token {
+                return None;
+            }
+            if self.stale_after_transmit {
+                self.current = false;
+            }
+            Some(RejectToken {
+                error: self.error,
+                sent: &self.sent,
+            })
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            self.capabilities.clone()
+        }
+
+        fn policy_current(&self) -> bool {
+            self.current
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn igmp_policy_drop_does_not_panic_or_leave_join_pending() {
+        let (mut iface, mut sockets, device) = crate::tests::setup(Medium::Ip);
+        let group = Ipv4Address::new(224, 0, 0, 56);
+        iface.join_multicast_group(group).unwrap();
+        let mut rejecting = RejectOutput {
+            capabilities: device.capabilities(),
+            error: Some(IpOutputError::PolicyDrop),
+            current: true,
+            stale_after_transmit: false,
+            no_token: false,
+            sent: core::cell::Cell::new(0),
+        };
+
+        iface.poll_egress(Instant::ZERO, &mut rejecting, &mut sockets);
+        assert_eq!(
+            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            Some(&GroupState::Joined)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn igmp_capacity_failure_retains_join_for_retry() {
+        let (mut iface, mut sockets, device) = crate::tests::setup(Medium::Ip);
+        let group = Ipv4Address::new(224, 0, 0, 56);
+        iface.join_multicast_group(group).unwrap();
+        let mut rejecting = RejectOutput {
+            capabilities: device.capabilities(),
+            error: Some(IpOutputError::Exhausted),
+            current: true,
+            stale_after_transmit: false,
+            no_token: false,
+            sent: core::cell::Cell::new(0),
+        };
+
+        iface.poll_egress(Instant::ZERO, &mut rejecting, &mut sockets);
+        assert_eq!(
+            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            Some(&GroupState::Joining)
+        );
+        assert_eq!(
+            iface.poll_at(Instant::ZERO, &sockets),
+            Some(Instant::from_millis(200))
+        );
+        iface.poll_egress(Instant::from_millis(100), &mut rejecting, &mut sockets);
+        assert_eq!(
+            iface.poll_at(Instant::from_millis(100), &sockets),
+            Some(Instant::from_millis(200))
+        );
+        iface.poll_egress(Instant::from_millis(200), &mut rejecting, &mut sockets);
+        assert_eq!(
+            iface.poll_at(Instant::from_millis(200), &sockets),
+            Some(Instant::from_millis(400))
+        );
+        rejecting.error = Some(IpOutputError::NoRoute);
+        iface.poll_egress(Instant::from_millis(400), &mut rejecting, &mut sockets);
+        assert_eq!(
+            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            Some(&GroupState::Joined)
+        );
+        assert_eq!(iface.poll_at(Instant::from_millis(400), &sockets), None);
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn igmp_missing_tx_token_retries_after_capacity_recovers() {
+        let (mut iface, mut sockets, device) = crate::tests::setup(Medium::Ip);
+        let group = Ipv4Address::new(224, 0, 0, 58);
+        iface.join_multicast_group(group).unwrap();
+        let mut output = RejectOutput {
+            capabilities: device.capabilities(),
+            error: None,
+            current: true,
+            stale_after_transmit: false,
+            no_token: true,
+            sent: core::cell::Cell::new(0),
+        };
+
+        iface.poll_egress(Instant::ZERO, &mut output, &mut sockets);
+        assert_eq!(
+            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            Some(&GroupState::Joining)
+        );
+        assert_eq!(
+            iface.poll_at(Instant::ZERO, &sockets),
+            Some(Instant::from_millis(200))
+        );
+        output.no_token = false;
+        iface.poll_egress(Instant::from_millis(100), &mut output, &mut sockets);
+        assert_eq!(
+            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            Some(&GroupState::Joining)
+        );
+        iface.poll_egress(Instant::from_millis(200), &mut output, &mut sockets);
+        assert_eq!(
+            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            Some(&GroupState::Joined)
+        );
+        assert_eq!(output.sent.get(), 1);
+        assert_eq!(iface.poll_at(Instant::from_millis(200), &sockets), None);
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6")]
+    fn mld_policy_drop_and_capacity_retry_do_not_panic() {
+        let (mut iface, mut sockets, mut device) = crate::tests::setup(Medium::Ip);
+        iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+        let group = Ipv6Address::new(0xff05, 0, 0, 0, 0, 0, 0, 0x00fb);
+        iface.join_multicast_group(group).unwrap();
+        let mut rejecting = RejectOutput {
+            capabilities: device.capabilities(),
+            error: Some(IpOutputError::Exhausted),
+            current: true,
+            stale_after_transmit: false,
+            no_token: false,
+            sent: core::cell::Cell::new(0),
+        };
+
+        iface.poll_egress(Instant::ZERO, &mut rejecting, &mut sockets);
+        assert_eq!(
+            iface.inner.multicast.groups.get(&IpAddress::Ipv6(group)),
+            Some(&GroupState::Joining)
+        );
+        assert_eq!(
+            iface.poll_at(Instant::ZERO, &sockets),
+            Some(Instant::from_millis(200))
+        );
+        rejecting.error = Some(IpOutputError::PolicyDrop);
+        iface.poll_egress(Instant::from_millis(200), &mut rejecting, &mut sockets);
+        assert_eq!(
+            iface.inner.multicast.groups.get(&IpAddress::Ipv6(group)),
+            Some(&GroupState::Joined)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn policy_change_between_multicast_reports_leaves_next_report_pending() {
+        let (mut iface, mut sockets, device) = crate::tests::setup(Medium::Ip);
+        let first = Ipv4Address::new(224, 0, 0, 56);
+        let second = Ipv4Address::new(224, 0, 0, 57);
+        iface.join_multicast_group(first).unwrap();
+        iface.join_multicast_group(second).unwrap();
+        let mut rejecting = RejectOutput {
+            capabilities: device.capabilities(),
+            error: Some(IpOutputError::PolicyDrop),
+            current: true,
+            stale_after_transmit: true,
+            no_token: false,
+            sent: core::cell::Cell::new(0),
+        };
+
+        iface.poll_egress(Instant::ZERO, &mut rejecting, &mut sockets);
+        assert_eq!(
+            iface.inner.multicast.groups.get(&IpAddress::Ipv4(first)),
+            Some(&GroupState::Joined)
+        );
+        assert_eq!(
+            iface.inner.multicast.groups.get(&IpAddress::Ipv4(second)),
+            Some(&GroupState::Joining)
+        );
+        rejecting.current = true;
+        rejecting.stale_after_transmit = false;
+        iface.poll_egress(Instant::ZERO, &mut rejecting, &mut sockets);
+        assert_eq!(
+            iface.inner.multicast.groups.get(&IpAddress::Ipv4(second)),
+            Some(&GroupState::Joined)
+        );
     }
 }

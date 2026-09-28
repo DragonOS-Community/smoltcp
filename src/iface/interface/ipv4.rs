@@ -73,6 +73,25 @@ impl InterfaceInner {
         address.x_is_unicast() && !self.is_broadcast_v4(address)
     }
 
+    /// Whether the normal local protocol stack may receive this destination.
+    /// DHCP is handled separately before this decision, since a client can
+    /// receive its offer before the offered address belongs to the interface.
+    fn accepts_local_ipv4_destination(&self, address: Ipv4Address) -> bool {
+        if self.has_ip_addr(address)
+            || self.has_multicast_group(address)
+            || self.is_broadcast_v4(address)
+        {
+            return true;
+        }
+
+        self.any_ip
+            && address.x_is_unicast()
+            && self
+                .routes
+                .lookup(&IpAddress::Ipv4(address), self.now)
+                .is_some_and(|router_addr| self.has_ip_addr(router_addr))
+    }
+
     /// Get the first IPv4 address of the interface.
     pub fn ipv4_addr(&self) -> Option<Ipv4Address> {
         self.ip_addrs.iter().find_map(|addr| match *addr {
@@ -90,13 +109,109 @@ impl InterfaceInner {
         ipv4_packet: &Ipv4Packet<&'a [u8]>,
         frag: &'a mut FragmentsBuffer,
     ) -> Option<Packet<'a>> {
+        self.process_ipv4_inner(
+            sockets,
+            meta,
+            source_hardware_addr,
+            ipv4_packet,
+            frag,
+            #[cfg(feature = "alloc")]
+            None,
+            #[cfg(feature = "alloc")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "alloc")]
+    #[allow(clippy::too_many_arguments)] // Packet parsing inputs plus optional policy state.
+    pub(super) fn process_ipv4_filtered<'a>(
+        &mut self,
+        sockets: &mut SocketSet,
+        meta: PacketMeta,
+        source_hardware_addr: HardwareAddress,
+        ipv4_packet: &Ipv4Packet<&'a [u8]>,
+        frag: &'a mut FragmentsBuffer,
+        scratch: &'a mut AllocVec<u8>,
+        filter: &mut dyn IpIngressFilter,
+    ) -> Option<Packet<'a>> {
+        self.process_ipv4_inner(
+            sockets,
+            meta,
+            source_hardware_addr,
+            ipv4_packet,
+            frag,
+            Some(scratch),
+            Some(filter),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Shared unfiltered and policy-aware packet path.
+    fn process_ipv4_inner<'a>(
+        &mut self,
+        sockets: &mut SocketSet,
+        meta: PacketMeta,
+        source_hardware_addr: HardwareAddress,
+        ipv4_packet: &Ipv4Packet<&'a [u8]>,
+        frag: &'a mut FragmentsBuffer,
+        #[cfg(feature = "alloc")] mut scratch: Option<&'a mut AllocVec<u8>>,
+        #[cfg(feature = "alloc")] mut filter: Option<&mut dyn IpIngressFilter>,
+    ) -> Option<Packet<'a>> {
         let ipv4_repr = check!(Ipv4Repr::parse(ipv4_packet, &self.caps.checksum));
-        if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {
-            // Discard packets with non-unicast source addresses but allow unspecified
+        #[cfg(feature = "proto-ipv4-fragmentation")]
+        let mut source_hardware_addr = source_hardware_addr;
+        #[cfg(feature = "proto-ipv4-fragmentation")]
+        let mut ipv4_repr = ipv4_repr;
+        #[cfg(not(feature = "proto-ipv4-fragmentation"))]
+        let mut ipv4_repr = ipv4_repr;
+        #[cfg(all(feature = "alloc", feature = "proto-ipv4-fragmentation"))]
+        let mut first_fragment_header: Option<([u8; 60], usize)> = None;
+        #[cfg(all(feature = "alloc", feature = "proto-ipv4-fragmentation"))]
+        let mut first_fragment_mark: Option<u32> = None;
+        #[cfg(all(feature = "alloc", feature = "proto-ipv4-fragmentation"))]
+        let mut fragment_pre_routing_done = false;
+        // Preserve the pre-existing early rejection on callers with no
+        // pre-routing policy. A filtered caller must be able to observe the
+        // packet at PRE_ROUTING, but an unfiltered caller must not let a
+        // spoofed non-unicast source consume fragment-assembler slots.
+        #[cfg(feature = "alloc")]
+        let reject_before_reassembly = filter.is_none();
+        #[cfg(not(feature = "alloc"))]
+        let reject_before_reassembly = true;
+        if reject_before_reassembly
+            && !self.is_unicast_v4(ipv4_repr.src_addr)
+            && !ipv4_repr.src_addr.is_unspecified()
+        {
             net_debug!("non-unicast or unspecified source address");
             return None;
         }
-
+        #[cfg(all(feature = "alloc", feature = "proto-ipv4-fragmentation"))]
+        if (ipv4_packet.more_frags() || ipv4_packet.frag_offset() != 0)
+            && filter
+                .as_ref()
+                .is_some_and(|filter| !filter.defragment_ipv4())
+        {
+            // Route fragments individually only when no pre-routing rule
+            // requires a reassembled transport header. Preserve the normal
+            // assembler for packets routed to this local stack.
+            if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {
+                return None;
+            }
+            let scratch = scratch.as_deref_mut()?;
+            let filter = filter.as_deref_mut()?;
+            let bytes = ipv4_packet.clone().into_inner();
+            let mut packet =
+                IngressPacket::borrowed(&bytes[..ipv4_packet.total_len() as usize], scratch);
+            match filter.route_fragment(
+                &mut RoutedIngressPacket::new(&mut packet),
+                meta,
+                source_hardware_addr,
+            ) {
+                RouteInputVerdict::Pass => fragment_pre_routing_done = true,
+                RouteInputVerdict::Drop
+                | RouteInputVerdict::Forward
+                | RouteInputVerdict::NeighborDiscovery => return None,
+            }
+        }
         #[cfg(feature = "proto-ipv4-fragmentation")]
         let ip_payload = {
             if ipv4_packet.more_frags() || ipv4_packet.frag_offset() != 0 {
@@ -122,21 +237,78 @@ impl InterfaceInner {
                     }
                 };
 
-                if !ipv4_packet.more_frags() {
-                    // This is the last fragment, so we know the total size
-                    check!(f.set_total_size(fragment_end));
+                if fragment_payload.is_empty() {
+                    f.reset();
+                    return None;
                 }
-
-                if let Err(e) = f.add(fragment_payload, fragment_offset) {
-                    net_debug!("fragmentation error: {:?}", e);
+                if f.total_size().is_some_and(|total| {
+                    fragment_end > total || (!ipv4_packet.more_frags() && fragment_end != total)
+                }) || (!ipv4_packet.more_frags() && f.last_received_end() > fragment_end)
+                {
+                    f.reset();
                     return None;
                 }
 
-                // NOTE: according to the standard, the total length needs to be
-                // recomputed, as well as the checksum. However, we don't really use
-                // the IPv4 header after the packet is reassembled.
+                if !ipv4_packet.more_frags() {
+                    // A valid last length is recorded even if all of this
+                    // fragment's bytes were previously received.
+                    if f.set_total_size(fragment_end).is_err() {
+                        f.reset();
+                        return None;
+                    }
+                }
+
+                match f.classify_received_range(fragment_offset, fragment_end) {
+                    FragmentRange::New => {
+                        if let Err(e) = f.add(fragment_payload, fragment_offset) {
+                            net_debug!("fragmentation error: {:?}", e);
+                            f.reset();
+                            return None;
+                        }
+
+                        if fragment_offset == 0 {
+                            f.set_first_ipv4_header(
+                                &ipv4_packet.as_ref()[..ipv4_packet.header_len() as usize],
+                                source_hardware_addr,
+                                filter.as_ref().map_or(0, |filter| filter.packet_mark()),
+                            );
+                        }
+                    }
+                    // Linux records a final length but does not reassemble on a
+                    // duplicate: no new bytes have entered the queue.
+                    FragmentRange::Duplicate => return None,
+                    FragmentRange::Overlap => {
+                        f.reset();
+                        net_debug!("overlapping IPv4 fragment discarded");
+                        return None;
+                    }
+                }
+
+                let first_header = f.first_ipv4_header()?;
+                source_hardware_addr = f.first_ipv4_source_hardware_addr()?;
+                #[cfg(feature = "alloc")]
+                if filter.is_some() {
+                    first_fragment_mark = f.first_ipv4_mark();
+                }
+                let first_hop_limit = first_header[8];
+                let first_header_len = first_header.len();
+                #[cfg(feature = "alloc")]
+                if filter.is_some() {
+                    let mut header = [0; 60];
+                    header[..first_header_len].copy_from_slice(first_header);
+                    first_fragment_header = Some((header, first_header_len));
+                }
                 match f.assemble() {
-                    Some(payload) => payload,
+                    Some(payload) => {
+                        // The parsed header may belong to the last fragment.
+                        // Raw sockets and ICMP replies need the full length.
+                        if payload.len() > u16::MAX as usize - first_header_len {
+                            return None;
+                        }
+                        ipv4_repr.payload_len = payload.len();
+                        ipv4_repr.hop_limit = first_hop_limit;
+                        payload
+                    }
                     None => return None,
                 }
             } else {
@@ -147,10 +319,163 @@ impl InterfaceInner {
         #[cfg(not(feature = "proto-ipv4-fragmentation"))]
         let ip_payload = ipv4_packet.payload();
 
+        #[cfg(feature = "alloc")]
+        let source_checked_in_filter = filter.is_some();
+        #[cfg(feature = "alloc")]
+        let (ip_payload, local_destination, external_raw) = if let Some(scratch) = scratch {
+            let filter = filter.as_deref_mut()?;
+            #[cfg(feature = "proto-ipv4-fragmentation")]
+            let reassembled = first_fragment_header.is_some();
+            #[cfg(not(feature = "proto-ipv4-fragmentation"))]
+            let reassembled = false;
+            let mut packet = if reassembled {
+                #[cfg(feature = "proto-ipv4-fragmentation")]
+                {
+                    let (header, header_len) = first_fragment_header?;
+                    let total_len = header_len.checked_add(ip_payload.len())?;
+                    if total_len > u16::MAX as usize {
+                        return None;
+                    }
+                    scratch.clear();
+                    scratch.try_reserve_exact(total_len).ok()?;
+                    scratch.extend_from_slice(&header[..header_len]);
+                    scratch.extend_from_slice(ip_payload);
+                    let mut reassembled = Ipv4Packet::new_unchecked(scratch.as_mut_slice());
+                    reassembled.set_total_len(total_len as u16);
+                    reassembled.set_more_frags(false);
+                    reassembled.set_frag_offset(0);
+                    reassembled.fill_checksum();
+                    filter.restore_packet_mark(first_fragment_mark?);
+                    IngressPacket::assembled(scratch)
+                }
+                #[cfg(not(feature = "proto-ipv4-fragmentation"))]
+                unreachable!()
+            } else {
+                // A receive buffer may include Ethernet padding after the IP
+                // total length. PRE_ROUTING must only expose the IP datagram.
+                let bytes = ipv4_packet.clone().into_inner();
+                IngressPacket::borrowed(&bytes[..ipv4_packet.total_len() as usize], scratch)
+            };
+            let fragment_pre_routing_done = {
+                #[cfg(feature = "proto-ipv4-fragmentation")]
+                {
+                    fragment_pre_routing_done
+                }
+                #[cfg(not(feature = "proto-ipv4-fragmentation"))]
+                {
+                    false
+                }
+            };
+            if !fragment_pre_routing_done {
+                match filter.pre_routing(&mut packet, meta, source_hardware_addr) {
+                    PreRoutingVerdict::Pass => {}
+                    PreRoutingVerdict::Drop => return None,
+                }
+            }
+            if !packet.is_borrowed() {
+                let rewritten = Ipv4Packet::new_checked(packet.bytes()).ok()?;
+                ipv4_repr = Ipv4Repr::parse(&rewritten, &self.caps.checksum).ok()?;
+            }
+
+            // The route callback must not be able to rewrite the source after
+            // this check. It can only inspect or retain the validated packet.
+            if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {
+                net_debug!("non-unicast or unspecified source address");
+                return None;
+            }
+            match filter.route_input(
+                &mut RoutedIngressPacket::new(&mut packet),
+                meta,
+                source_hardware_addr,
+            ) {
+                RouteInputVerdict::Pass => {}
+                RouteInputVerdict::Drop
+                | RouteInputVerdict::Forward
+                | RouteInputVerdict::NeighborDiscovery => return None,
+            }
+            // Route selection precedes LOCAL_IN. The hook may rewrite only
+            // after this packet has qualified for local delivery; its final
+            // bytes must then be parsed again before raw/transport demux.
+            let local_destination = self.accepts_local_ipv4_destination(ipv4_repr.dst_addr)
+                || filter.local_route_selected();
+            let external_raw = if local_destination {
+                let transport_offset = (usize::from(packet.bytes()[0]) & 0x0f) * 4;
+                match filter.local_input(
+                    &mut packet,
+                    meta,
+                    source_hardware_addr,
+                    ipv4_repr.next_header,
+                    transport_offset,
+                ) {
+                    LocalInputVerdict::Pass => None,
+                    LocalInputVerdict::Drop => return None,
+                    LocalInputVerdict::ExternalRaw { matched } => Some(matched),
+                }
+            } else {
+                None
+            };
+            if !packet.is_borrowed() {
+                let rewritten = Ipv4Packet::new_checked(packet.bytes()).ok()?;
+                ipv4_repr = Ipv4Repr::parse(&rewritten, &self.caps.checksum).ok()?;
+                if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {
+                    return None;
+                }
+            }
+            if local_destination
+                && !self.accepts_local_ipv4_destination(ipv4_repr.dst_addr)
+                && !filter.local_route_selected()
+            {
+                return None;
+            }
+            let bytes = packet.into_bytes().ok()?;
+            (
+                Ipv4Packet::new_checked(bytes).ok()?.payload(),
+                local_destination,
+                external_raw,
+            )
+        } else {
+            (
+                ip_payload,
+                self.accepts_local_ipv4_destination(ipv4_repr.dst_addr)
+                    || filter
+                        .as_ref()
+                        .is_some_and(|filter| filter.local_route_selected()),
+                None,
+            )
+        };
+
+        // Linux PRE_ROUTING runs after basic IP validation but before
+        // source-address policy and local/forward routing decisions.
+        #[cfg(feature = "alloc")]
+        if !source_checked_in_filter
+            && !self.is_unicast_v4(ipv4_repr.src_addr)
+            && !ipv4_repr.src_addr.is_unspecified()
+        {
+            net_debug!("non-unicast or unspecified source address");
+            return None;
+        }
+
         let ip_repr = IpRepr::Ipv4(ipv4_repr);
 
+        // Raw sockets belong to local delivery, not the forwarding path.
+        // Keep DHCP's pre-address handling below, but do not expose a transit
+        // packet to raw sockets before the local-destination decision.
+        #[cfg(not(feature = "alloc"))]
+        let local_destination = self.accepts_local_ipv4_destination(ipv4_repr.dst_addr);
+
         #[cfg(feature = "socket-raw")]
-        let handled_by_raw_socket = self.raw_socket_filter(sockets, &ip_repr, ip_payload);
+        let handled_by_raw_socket = if local_destination {
+            #[cfg(feature = "alloc")]
+            if let Some(matched) = external_raw {
+                matched
+            } else {
+                self.raw_socket_filter(sockets, &ip_repr, ip_payload)
+            }
+            #[cfg(not(feature = "alloc"))]
+            self.raw_socket_filter(sockets, &ip_repr, ip_payload)
+        } else {
+            false
+        };
         #[cfg(not(feature = "socket-raw"))]
         let handled_by_raw_socket = false;
 
@@ -184,35 +509,12 @@ impl InterfaceInner {
             }
         }
 
-        if !self.has_ip_addr(ipv4_repr.dst_addr)
-            && !self.has_multicast_group(ipv4_repr.dst_addr)
-            && !self.is_broadcast_v4(ipv4_repr.dst_addr)
-        {
-            // Ignore IP packets not directed at us, or broadcast, or any of the multicast groups.
-            // If AnyIP is enabled, also check if the packet is routed locally.
-
-            if !self.any_ip {
-                net_trace!("Rejecting IPv4 packet; any_ip=false");
-                return None;
-            }
-
-            if !ipv4_repr.dst_addr.x_is_unicast() {
-                net_trace!(
-                    "Rejecting IPv4 packet; {} is not a unicast address",
-                    ipv4_repr.dst_addr
-                );
-                return None;
-            }
-
-            if self
-                .routes
-                .lookup(&IpAddress::Ipv4(ipv4_repr.dst_addr), self.now)
-                .map_or(true, |router_addr| !self.has_ip_addr(router_addr))
-            {
-                net_trace!("Rejecting IPv4 packet; no matching routes");
-
-                return None;
-            }
+        if !local_destination {
+            net_trace!(
+                "Rejecting IPv4 packet; {} is not a local destination",
+                ipv4_repr.dst_addr
+            );
+            return None;
         }
 
         #[cfg(feature = "medium-ethernet")]
@@ -231,9 +533,7 @@ impl InterfaceInner {
             IpProtocol::Igmp => self.process_igmp(ipv4_repr, ip_payload),
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
-            IpProtocol::Udp => {
-                self.process_udp(sockets, meta, handled_by_raw_socket, ip_repr, ip_payload)
-            }
+            IpProtocol::Udp => self.process_udp(sockets, meta, ip_repr, ip_payload),
 
             #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => self.process_tcp(sockets, meta, ip_repr, ip_payload),

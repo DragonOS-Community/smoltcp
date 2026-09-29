@@ -202,6 +202,7 @@ fn test_handle_udp_broadcast(#[case] medium: Medium) {
             PacketMeta::default(),
             ip_repr,
             packet.into_inner(),
+            false,
         ),
         None
     );
@@ -232,6 +233,7 @@ fn test_handle_udp_broadcast(#[case] medium: Medium) {
 struct TestUdpIngressHandler {
     result: crate::iface::UdpIngressResult,
     calls: core::sync::atomic::AtomicUsize,
+    expected_broadcast: bool,
 }
 
 #[cfg(all(
@@ -253,7 +255,7 @@ impl crate::iface::UdpIngressHandler for TestUdpIngressHandler {
         assert_eq!(ip_repr.dst_addr(), Ipv4Address::new(127, 0, 0, 1).into());
         assert_eq!(udp_repr.src_port, 67);
         assert_eq!(udp_repr.dst_port, 68);
-        assert!(!is_broadcast);
+        assert_eq!(is_broadcast, self.expected_broadcast);
         assert_eq!(payload, b"hello");
         self.calls
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -306,6 +308,7 @@ fn udp_ingress_handler_consumed_bypasses_socket_and_icmp() {
     let handler = Arc::new(TestUdpIngressHandler {
         result: crate::iface::UdpIngressResult::Consumed,
         calls: core::sync::atomic::AtomicUsize::new(0),
+        expected_broadcast: false,
     });
     sockets.set_udp_ingress_handler(Some(handler.clone()));
 
@@ -318,7 +321,7 @@ fn udp_ingress_handler_consumed_bypasses_socket_and_icmp() {
     assert_eq!(
         iface
             .inner
-            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &packet,),
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &packet, false),
         None
     );
     assert!(!sockets.get::<udp::Socket>(handle).can_recv());
@@ -328,7 +331,7 @@ fn udp_ingress_handler_consumed_bypasses_socket_and_icmp() {
     assert_eq!(
         iface
             .inner
-            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &packet,),
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &packet, false),
         None
     );
     assert_eq!(handler.calls.load(core::sync::atomic::Ordering::Relaxed), 2);
@@ -349,6 +352,7 @@ fn udp_ingress_handler_not_handled_falls_back_to_socket() {
     let handler = Arc::new(TestUdpIngressHandler {
         result: crate::iface::UdpIngressResult::NotHandled,
         calls: core::sync::atomic::AtomicUsize::new(0),
+        expected_broadcast: false,
     });
     sockets.set_udp_ingress_handler(Some(handler.clone()));
 
@@ -361,7 +365,7 @@ fn udp_ingress_handler_not_handled_falls_back_to_socket() {
     assert_eq!(
         iface
             .inner
-            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &packet,),
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &packet, false),
         None
     );
     assert_eq!(handler.calls.load(core::sync::atomic::Ordering::Relaxed), 1);
@@ -369,6 +373,35 @@ fn udp_ingress_handler_not_handled_falls_back_to_socket() {
         sockets.get_mut::<udp::Socket>(handle).recv().unwrap().0,
         b"hello"
     );
+}
+
+#[test]
+#[cfg(all(
+    feature = "alloc",
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "socket-udp"
+))]
+fn udp_ingress_handler_uses_explicit_broadcast_route_verdict() {
+    use alloc::sync::Arc;
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let handler = Arc::new(TestUdpIngressHandler {
+        result: crate::iface::UdpIngressResult::NotHandled,
+        calls: core::sync::atomic::AtomicUsize::new(0),
+        expected_broadcast: true,
+    });
+    sockets.set_udp_ingress_handler(Some(handler.clone()));
+    let (ip_repr, packet) = udp_ingress_test_packet();
+    // The octets look unicast, but the ingress FIB selected RTN_BROADCAST.
+    // With no listener, an ICMP Port Unreachable must not be generated.
+    assert_eq!(
+        iface
+            .inner
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &packet, true),
+        None
+    );
+    assert_eq!(handler.calls.load(core::sync::atomic::Ordering::Relaxed), 1);
 }
 
 #[test]

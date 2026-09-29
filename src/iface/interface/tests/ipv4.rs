@@ -1508,6 +1508,85 @@ fn test_no_icmp_no_unicast(#[case] medium: Medium) {
     );
 }
 
+#[cfg(all(feature = "alloc", feature = "medium-ip", feature = "socket-tcp"))]
+#[test]
+fn explicit_broadcast_route_suppresses_tcp_reset_and_protocol_error() {
+    struct BroadcastRoute;
+
+    impl IpIngressFilter for BroadcastRoute {
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            PreRoutingVerdict::Pass
+        }
+
+        fn broadcast_route_selected(&self) -> bool {
+            true
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let src = Ipv4Address::new(127, 0, 0, 2);
+    let dst = Ipv4Address::new(127, 0, 0, 1);
+    let tcp = TcpRepr {
+        src_port: 4242,
+        dst_port: 4243,
+        control: TcpControl::Syn,
+        seq_number: TcpSeqNumber(1),
+        ack_number: None,
+        window_len: 256,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let mut tcp_payload = vec![0; tcp.buffer_len()];
+    tcp.emit(
+        &mut TcpPacket::new_unchecked(&mut tcp_payload),
+        &src.into(),
+        &dst.into(),
+        &ChecksumCapabilities::default(),
+    );
+
+    for (protocol, payload) in [
+        (IpProtocol::Tcp, tcp_payload.as_slice()),
+        (IpProtocol::Unknown(253), &[][..]),
+    ] {
+        let repr = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: protocol,
+            payload_len: payload.len(),
+            hop_limit: 64,
+        };
+        let mut bytes = vec![0; repr.buffer_len() + payload.len()];
+        repr.emit(
+            &mut Ipv4Packet::new_unchecked(&mut bytes),
+            &ChecksumCapabilities::default(),
+        );
+        bytes[repr.buffer_len()..].copy_from_slice(payload);
+        let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+        let mut scratch = AllocVec::new();
+        assert!(iface
+            .inner
+            .process_ipv4_filtered(
+                &mut sockets,
+                PacketMeta::default(),
+                HardwareAddress::Ip,
+                &packet,
+                &mut iface.fragments,
+                &mut scratch,
+                &mut BroadcastRoute,
+            )
+            .is_none());
+    }
+}
+
 #[rstest]
 #[case(Medium::Ip)]
 #[cfg(feature = "medium-ip")]
@@ -1715,7 +1794,7 @@ fn test_icmp_error_port_unreachable(#[case] medium: Medium) {
     assert_eq!(
         iface
             .inner
-            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, data),
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, data, false),
         Some(expected_repr)
     );
 
@@ -1746,6 +1825,7 @@ fn test_icmp_error_port_unreachable(#[case] medium: Medium) {
             PacketMeta::default(),
             ip_repr,
             packet_broadcast.into_inner(),
+            false,
         ),
         None
     );
@@ -2148,7 +2228,7 @@ fn test_icmpv4_socket(#[case] medium: Medium) {
     assert_eq!(
         iface
             .inner
-            .process_icmpv4(&mut sockets, ipv4_repr, icmp_data),
+            .process_icmpv4(&mut sockets, ipv4_repr, icmp_data, false),
         Some(Packet::new_ipv4(ipv4_reply, IpPayload::Icmpv4(echo_reply)))
     );
 
@@ -3080,9 +3160,13 @@ fn test_icmp_reply_size(#[case] medium: Medium) {
     );
 
     assert_eq!(
-        iface
-            .inner
-            .process_udp(&mut sockets, PacketMeta::default(), ip_repr.into(), payload,),
+        iface.inner.process_udp(
+            &mut sockets,
+            PacketMeta::default(),
+            ip_repr.into(),
+            payload,
+            false
+        ),
         Some(Packet::new_ipv4(
             expected_ip_repr,
             IpPayload::Icmpv4(expected_icmp_repr)

@@ -16,6 +16,7 @@ impl InterfaceInner {
         meta: PacketMeta,
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
+        broadcast_route_selected: bool,
     ) -> Option<Packet<'frame>> {
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
         let udp_packet = check!(UdpPacket::new_checked(ip_payload));
@@ -30,7 +31,9 @@ impl InterfaceInner {
         {
             let is_broadcast = match &ip_repr {
                 #[cfg(feature = "proto-ipv4")]
-                IpRepr::Ipv4(repr) => self.is_broadcast_v4(repr.dst_addr),
+                IpRepr::Ipv4(repr) => {
+                    self.is_broadcast_v4(repr.dst_addr) || broadcast_route_selected
+                }
                 #[cfg(feature = "proto-ipv6")]
                 IpRepr::Ipv6(_) => false,
             };
@@ -68,8 +71,15 @@ impl InterfaceInner {
             }
         }
 
-        // The packet wasn't handled by a socket, send an ICMP port unreachable packet.
+        // The packet wasn't handled by a socket. Broadcasts must not elicit
+        // an ICMP error, whether classified by CIDR or by the ingress route.
         match ip_repr {
+            #[cfg(feature = "proto-ipv4")]
+            IpRepr::Ipv4(repr)
+                if self.is_broadcast_v4(repr.dst_addr) || broadcast_route_selected =>
+            {
+                None
+            }
             #[cfg(feature = "proto-ipv4")]
             IpRepr::Ipv4(ipv4_repr) => {
                 let payload_len =

@@ -517,8 +517,16 @@ impl InterfaceInner {
             return None;
         }
 
+        #[cfg(feature = "alloc")]
+        let broadcast_route_selected = filter
+            .as_ref()
+            .is_some_and(|filter| filter.broadcast_route_selected());
+        #[cfg(not(feature = "alloc"))]
+        let broadcast_route_selected = false;
+        let broadcast_destination =
+            self.is_broadcast_v4(ipv4_repr.dst_addr) || broadcast_route_selected;
         #[cfg(feature = "medium-ethernet")]
-        if self.is_unicast_v4(ipv4_repr.dst_addr) {
+        if self.is_unicast_v4(ipv4_repr.dst_addr) && !broadcast_route_selected {
             self.neighbor_cache.reset_expiry_if_existing(
                 IpAddress::Ipv4(ipv4_repr.src_addr),
                 source_hardware_addr,
@@ -527,18 +535,27 @@ impl InterfaceInner {
         }
 
         match ipv4_repr.next_header {
-            IpProtocol::Icmp => self.process_icmpv4(sockets, ipv4_repr, ip_payload),
+            IpProtocol::Icmp => {
+                self.process_icmpv4(sockets, ipv4_repr, ip_payload, broadcast_route_selected)
+            }
 
             #[cfg(feature = "multicast")]
             IpProtocol::Igmp => self.process_igmp(ipv4_repr, ip_payload),
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
-            IpProtocol::Udp => self.process_udp(sockets, meta, ip_repr, ip_payload),
+            IpProtocol::Udp => {
+                self.process_udp(sockets, meta, ip_repr, ip_payload, broadcast_route_selected)
+            }
+
+            #[cfg(feature = "socket-tcp")]
+            IpProtocol::Tcp if broadcast_destination => None,
 
             #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => self.process_tcp(sockets, meta, ip_repr, ip_payload),
 
             _ if handled_by_raw_socket => None,
+
+            _ if broadcast_destination => None,
 
             _ => {
                 // Send back as much of the original payload as we can.
@@ -629,6 +646,7 @@ impl InterfaceInner {
         _sockets: &mut SocketSet,
         ip_repr: Ipv4Repr,
         ip_payload: &'frame [u8],
+        broadcast_route_selected: bool,
     ) -> Option<Packet<'frame>> {
         let icmp_packet = check!(Icmpv4Packet::new_checked(ip_payload));
         let icmp_repr = check!(Icmpv4Repr::parse(&icmp_packet, &self.caps.checksum));
@@ -655,6 +673,9 @@ impl InterfaceInner {
                 seq_no,
                 data,
             } => {
+                if broadcast_route_selected {
+                    return None;
+                }
                 let icmp_reply_repr = Icmpv4Repr::EchoReply {
                     ident,
                     seq_no,

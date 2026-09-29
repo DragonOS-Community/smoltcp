@@ -107,6 +107,13 @@ pub trait IpIngressFilter {
         false
     }
 
+    /// The packet's ingress route classified its destination as broadcast.
+    /// Integrations may know about explicitly configured broadcast addresses
+    /// that cannot be inferred from this interface's CIDR list alone.
+    fn broadcast_route_selected(&self) -> bool {
+        false
+    }
+
     /// `meta` comes from the trusted receive token. Integrations may use it
     /// to recover the ingress interface, but must not infer it from IP bytes.
     /// For fragmented IPv4 datagrams, `source_hardware_addr` belongs to the

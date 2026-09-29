@@ -2238,9 +2238,13 @@ fn test_icmp_reply_size(#[case] medium: Medium) {
     );
 
     assert_eq!(
-        iface
-            .inner
-            .process_udp(&mut sockets, PacketMeta::default(), ip_repr.into(), payload,),
+        iface.inner.process_udp(
+            &mut sockets,
+            PacketMeta::default(),
+            ip_repr.into(),
+            payload,
+            false
+        ),
         Some(Packet::new_ipv6(
             expected_ip_repr,
             IpPayload::Icmpv6(expected_icmp_repr)
@@ -2291,7 +2295,7 @@ fn raw_udp_multicast_does_not_generate_port_unreachable() {
     assert_eq!(
         iface
             .inner
-            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &bytes),
+            .process_udp(&mut sockets, PacketMeta::default(), ip_repr, &bytes, false),
         None
     );
 }

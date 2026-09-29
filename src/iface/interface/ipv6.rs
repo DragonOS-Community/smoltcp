@@ -481,7 +481,7 @@ impl InterfaceInner {
             IpProtocol::Icmpv6 => self.process_icmpv6(sockets, ipv6_repr, ip_payload),
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
-            IpProtocol::Udp => self.process_udp(sockets, meta, ipv6_repr.into(), ip_payload),
+            IpProtocol::Udp => self.process_udp(sockets, meta, ipv6_repr.into(), ip_payload, false),
 
             #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => self.process_tcp(sockets, meta, ipv6_repr.into(), ip_payload),

@@ -54,7 +54,12 @@ impl InterfaceInner {
 
         match eth_frame.ethertype() {
             #[cfg(feature = "proto-ipv4")]
-            EthernetProtocol::Arp => self.process_arp(self.now, &eth_frame),
+            EthernetProtocol::Arp => self.process_arp(
+                self.now,
+                &eth_frame,
+                #[cfg(feature = "alloc")]
+                filter.map(|(_, filter)| &*filter),
+            ),
             #[cfg(feature = "proto-ipv4")]
             EthernetProtocol::Ipv4 => {
                 let ipv4_packet = check!(Ipv4Packet::new_checked(eth_frame.payload()));

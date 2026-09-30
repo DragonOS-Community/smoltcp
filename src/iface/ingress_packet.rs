@@ -42,6 +42,21 @@ pub enum LocalInputVerdict {
 }
 
 pub trait IpIngressFilter {
+    /// Override ARP reply authorization with the integration's address policy.
+    /// `None` preserves the interface's standalone `any_ip` behavior. This
+    /// decision controls replies only, not neighbor-cache learning. A local
+    /// address may belong to another interface in the same network namespace.
+    /// Integrations must validate both the sender and target according to
+    /// their routing policy, including any martian-source restrictions.
+    #[cfg(feature = "proto-ipv4")]
+    fn arp_reply_allowed(
+        &self,
+        _source: crate::wire::Ipv4Address,
+        _target: crate::wire::Ipv4Address,
+    ) -> Option<bool> {
+        None
+    }
+
     /// Stop before acquiring another RX token if the integration's prepared
     /// policy view has been replaced. The caller can then release its locks
     /// and rebuild the policy and routing views without consuming the packet.

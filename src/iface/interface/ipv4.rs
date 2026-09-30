@@ -576,6 +576,7 @@ impl InterfaceInner {
         &mut self,
         timestamp: Instant,
         eth_frame: &EthernetFrame<&'frame [u8]>,
+        #[cfg(feature = "alloc")] filter: Option<&dyn IpIngressFilter>,
     ) -> Option<EthernetPacket<'frame>> {
         if !self.neighbor_discovery_enabled {
             return None;
@@ -592,10 +593,16 @@ impl InterfaceInner {
                 target_protocol_addr,
                 ..
             } => {
-                // Only process ARP packets for us.
-                if !self.has_ip_addr(target_protocol_addr) && !self.any_ip {
-                    return None;
-                }
+                // Reply ownership and learning are separate: an integration
+                // may authorize weak-host replies without broadening the
+                // interface's existing neighbor-learning policy.
+                let learning_target = self.has_ip_addr(target_protocol_addr) || self.any_ip;
+                #[cfg(feature = "alloc")]
+                let ownership = filter.and_then(|filter| {
+                    filter.arp_reply_allowed(source_protocol_addr, target_protocol_addr)
+                });
+                #[cfg(not(feature = "alloc"))]
+                let ownership: Option<bool> = None;
 
                 // Only process REQUEST and RESPONSE.
                 if let ArpOperation::Unknown(_) = operation {
@@ -603,28 +610,36 @@ impl InterfaceInner {
                     return None;
                 }
 
-                // Discard packets with non-unicast source addresses.
-                if !source_protocol_addr.x_is_unicast() || !source_hardware_addr.is_unicast() {
+                // Only an explicitly authorized local request may use the
+                // zero source address for duplicate-address detection. Never
+                // learn that address, and preserve legacy standalone behavior.
+                let dad_request = source_protocol_addr.is_unspecified()
+                    && operation == ArpOperation::Request
+                    && ownership == Some(true);
+                if (!source_protocol_addr.x_is_unicast() && !dad_request)
+                    || !source_hardware_addr.is_unicast()
+                {
                     net_debug!("arp: non-unicast source address");
                     return None;
                 }
 
-                if !self.in_same_network(&IpAddress::Ipv4(source_protocol_addr)) {
-                    net_debug!("arp: source IP address not in same network as us");
-                    return None;
-                }
+                let same_network = self.in_same_network(&IpAddress::Ipv4(source_protocol_addr));
 
                 // Fill the ARP cache from any ARP packet aimed at us (both request or response).
                 // We fill from requests too because if someone is requesting our address they
                 // are probably going to talk to us, so we avoid having to request their address
                 // when we later reply to them.
-                self.neighbor_cache.fill(
-                    source_protocol_addr.into(),
-                    source_hardware_addr.into(),
-                    timestamp,
-                );
+                if learning_target && same_network && !dad_request {
+                    self.neighbor_cache.fill(
+                        source_protocol_addr.into(),
+                        source_hardware_addr.into(),
+                        timestamp,
+                    );
+                }
 
-                if operation == ArpOperation::Request {
+                if operation == ArpOperation::Request
+                    && ownership.unwrap_or(learning_target && same_network)
+                {
                     let src_hardware_addr = self.hardware_addr.ethernet_or_panic();
 
                     Some(EthernetPacket::Arp(ArpRepr::EthernetIpv4 {

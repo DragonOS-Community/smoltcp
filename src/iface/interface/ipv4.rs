@@ -51,6 +51,32 @@ impl InterfaceInner {
         None
     }
 
+    /// ARP announces an authorized local packet source first. For forwarded
+    /// traffic, choose an interface address in the next hop's prefix, then
+    /// the first IPv4 address. AnyIP admission is not address ownership.
+    #[cfg(feature = "medium-ethernet")]
+    pub(super) fn get_arp_source_address(
+        &self,
+        next_hop: Ipv4Address,
+        authorized_source: Option<IpAddress>,
+    ) -> Option<Ipv4Address> {
+        if let Some(IpAddress::Ipv4(source)) = authorized_source {
+            if source.x_is_unicast() {
+                return Some(source);
+            }
+        }
+        let mut fallback = None;
+        for cidr in self.ip_addrs.iter() {
+            if let IpCidr::Ipv4(cidr) = cidr {
+                fallback.get_or_insert(cidr.address());
+                if cidr.contains_addr(&next_hop) {
+                    return Some(cidr.address());
+                }
+            }
+        }
+        fallback
+    }
+
     /// Checks if an address is broadcast, taking into account ipv4 subnet-local
     /// broadcast addresses.
     pub fn is_broadcast_v4(&self, address: Ipv4Address) -> bool {

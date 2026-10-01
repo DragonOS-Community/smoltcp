@@ -823,7 +823,7 @@ fn global_source_ns_reply_uses_ingress_link_without_source_route() {
     assert_eq!(
         iface
             .inner
-            .lookup_hardware_addr(MockTxToken, &remote.into(), &mut iface.fragmenter),
+            .lookup_hardware_addr(MockTxToken, &remote.into(), None, &mut iface.fragmenter),
         Err(DispatchError::NoRoute)
     );
     let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
@@ -2032,6 +2032,7 @@ fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
         iface.inner.lookup_hardware_addr(
             MockTxToken,
             &IpAddress::Ipv6(remote_ip_addr),
+            None,
             &mut iface.fragmenter,
         ),
         Ok((HardwareAddress::Ethernet(local_hw_addr), MockTxToken))
@@ -2065,6 +2066,7 @@ fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
         iface.inner.lookup_hardware_addr(
             MockTxToken,
             &IpAddress::Ipv6(remote_ip_addr),
+            None,
             &mut iface.fragmenter,
         ),
         Err(DispatchError::NeighborPending)
@@ -2105,6 +2107,7 @@ fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
         iface.inner.lookup_hardware_addr(
             MockTxToken,
             &IpAddress::Ipv6(remote_ip_addr),
+            None,
             &mut iface.fragmenter,
         ),
         Ok((HardwareAddress::Ethernet(remote_hw_addr), MockTxToken))

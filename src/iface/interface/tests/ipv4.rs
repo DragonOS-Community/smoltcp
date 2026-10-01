@@ -1,5 +1,182 @@
 use super::*;
 
+#[cfg(all(feature = "alloc", feature = "medium-ethernet"))]
+#[rstest]
+#[case(Some(false), (false, true, false), ArpOperation::Request, true, (false, false))]
+#[case(Some(false), (true, true, false), ArpOperation::Request, true, (false, true))]
+#[case(Some(false), (false, false, false), ArpOperation::Request, true, (false, true))]
+#[case(Some(false), (true, false, false), ArpOperation::Request, true, (false, true))]
+#[case(Some(true), (false, false, false), ArpOperation::Request, true, (true, true))]
+#[case(Some(true), (false, true, false), ArpOperation::Request, true, (true, false))]
+#[case(Some(true), (false, true, true), ArpOperation::Request, true, (true, false))]
+#[case(Some(true), (false, false, false), ArpOperation::Reply, true, (false, true))]
+#[case(Some(false), (true, false, false), ArpOperation::Reply, true, (false, true))]
+#[case(Some(true), (true, false, false), ArpOperation::Unknown(3), true, (false, false))]
+#[case(Some(true), (true, false, false), ArpOperation::Request, false, (false, false))]
+#[case(None, (false, false, false), ArpOperation::Request, true, (true, true))]
+#[case(None, (false, true, false), ArpOperation::Request, true, (false, false))]
+#[case(None, (true, true, false), ArpOperation::Request, true, (true, true))]
+#[case(None, (true, true, true), ArpOperation::Request, true, (false, false))]
+fn arp_reply_ownership_preserves_learning(
+    #[case] ownership: Option<bool>,
+    #[case] interface: (bool, bool, bool),
+    #[case] operation: ArpOperation,
+    #[case] valid_mac: bool,
+    #[case] expected: (bool, bool),
+) {
+    let (any_ip, foreign_target, no_address) = interface;
+    let (reply, learn) = expected;
+    struct Ownership(Option<bool>, Ipv4Address, Ipv4Address);
+    impl IpIngressFilter for Ownership {
+        fn arp_reply_allowed(&self, source: Ipv4Address, target: Ipv4Address) -> Option<bool> {
+            assert_eq!(source, self.1);
+            assert_eq!(target, self.2);
+            self.0
+        }
+
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            panic!("ARP must not enter IP hooks")
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ethernet);
+    iface.set_any_ip(any_ip);
+    if no_address {
+        iface.update_ip_addrs(|addresses| addresses.clear());
+    }
+    let target = if foreign_target {
+        Ipv4Address::new(192, 168, 1, 3)
+    } else {
+        Ipv4Address::new(127, 0, 0, 1)
+    };
+    let source = if foreign_target {
+        Ipv4Address::new(192, 168, 1, 2)
+    } else {
+        Ipv4Address::new(127, 0, 0, 2)
+    };
+    if any_ip && foreign_target && !no_address {
+        iface.update_ip_addrs(|addresses| {
+            addresses.clear();
+            addresses.push(IpCidr::new(source.into(), 24)).unwrap();
+        });
+    }
+    let source_mac = if valid_mac {
+        EthernetAddress([0x52, 0x54, 0, 0, 0, 1])
+    } else {
+        EthernetAddress::BROADCAST
+    };
+    let arp = ArpRepr::EthernetIpv4 {
+        operation,
+        source_hardware_addr: source_mac,
+        source_protocol_addr: source,
+        target_hardware_addr: EthernetAddress::default(),
+        target_protocol_addr: target,
+    };
+    let mut bytes = [0u8; 42];
+    let mut frame = EthernetFrame::new_unchecked(&mut bytes[..]);
+    frame.set_dst_addr(EthernetAddress::BROADCAST);
+    frame.set_src_addr(source_mac);
+    frame.set_ethertype(EthernetProtocol::Arp);
+    arp.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
+    let mut scratch = Vec::new();
+    let mut filter = Ownership(ownership, source, target);
+    let result = iface.inner.process_ethernet_filtered(
+        &mut sockets,
+        PacketMeta::default(),
+        &bytes,
+        &mut iface.fragments,
+        &mut scratch,
+        &mut filter,
+    );
+    assert_eq!(result.is_some(), reply);
+    if reply {
+        assert_eq!(
+            result,
+            Some(EthernetPacket::Arp(ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Reply,
+                source_hardware_addr: iface.inner.hardware_addr.ethernet_or_panic(),
+                source_protocol_addr: target,
+                target_hardware_addr: source_mac,
+                target_protocol_addr: source,
+            }))
+        );
+    }
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&source.into(), Instant::ZERO)
+            .found(),
+        learn
+    );
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ethernet"))]
+#[rstest]
+#[case(Some(true), ArpOperation::Request, true)]
+#[case(Some(false), ArpOperation::Request, false)]
+#[case(None, ArpOperation::Request, false)]
+#[case(Some(true), ArpOperation::Reply, false)]
+fn arp_local_dad_does_not_learn_zero(
+    #[case] ownership: Option<bool>,
+    #[case] operation: ArpOperation,
+    #[case] reply: bool,
+) {
+    struct Ownership(Option<bool>);
+    impl IpIngressFilter for Ownership {
+        fn arp_reply_allowed(&self, source: Ipv4Address, target: Ipv4Address) -> Option<bool> {
+            assert_eq!(source, Ipv4Address::UNSPECIFIED);
+            assert_eq!(target, Ipv4Address::new(127, 0, 0, 1));
+            self.0
+        }
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            panic!("ARP must not enter IP hooks")
+        }
+    }
+    let (mut iface, mut sockets, _) = setup(Medium::Ethernet);
+    iface.set_any_ip(true);
+    let arp = ArpRepr::EthernetIpv4 {
+        operation,
+        source_hardware_addr: EthernetAddress([0x52, 0x54, 0, 0, 0, 1]),
+        source_protocol_addr: Ipv4Address::UNSPECIFIED,
+        target_hardware_addr: EthernetAddress::default(),
+        target_protocol_addr: Ipv4Address::new(127, 0, 0, 1),
+    };
+    let mut bytes = [0u8; 42];
+    let mut frame = EthernetFrame::new_unchecked(&mut bytes[..]);
+    frame.set_dst_addr(EthernetAddress::BROADCAST);
+    frame.set_src_addr(EthernetAddress([0x52, 0x54, 0, 0, 0, 1]));
+    frame.set_ethertype(EthernetProtocol::Arp);
+    arp.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
+    let mut scratch = Vec::new();
+    let mut filter = Ownership(ownership);
+    assert_eq!(
+        iface
+            .inner
+            .process_ethernet_filtered(
+                &mut sockets,
+                PacketMeta::default(),
+                &bytes,
+                &mut iface.fragments,
+                &mut scratch,
+                &mut filter,
+            )
+            .is_some(),
+        reply
+    );
+    assert_eq!(iface.inner.neighbor_cache.iter().count(), 0);
+}
+
 #[cfg(all(feature = "medium-ip", feature = "socket-udp"))]
 #[test]
 fn changed_output_policy_keeps_later_socket_packet_queued() {

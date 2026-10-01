@@ -1237,6 +1237,158 @@ impl TxToken for CapturingTxToken {
     }
 }
 
+#[cfg(feature = "medium-ethernet")]
+#[rstest]
+#[case::secondary_local(
+    Ipv4Address::new(198, 18, 220, 1),
+    Some(Ipv4Address::new(198, 18, 220, 1)),
+    Ipv4Address::new(192, 0, 2, 254),
+    Ipv4Address::new(198, 18, 220, 1)
+)]
+#[case::configured_but_not_namespace_local(
+    Ipv4Address::new(198, 18, 220, 1),
+    None,
+    Ipv4Address::new(192, 0, 2, 254),
+    Ipv4Address::new(192, 0, 2, 1)
+)]
+#[case::authorized_other_interface(
+    Ipv4Address::new(198, 18, 215, 1),
+    Some(Ipv4Address::new(198, 18, 215, 1)),
+    Ipv4Address::new(198, 18, 220, 254),
+    Ipv4Address::new(198, 18, 215, 1)
+)]
+#[case::forwarded_remote(
+    Ipv4Address::new(203, 0, 113, 7),
+    None,
+    Ipv4Address::new(198, 18, 220, 254),
+    Ipv4Address::new(198, 18, 220, 1)
+)]
+#[case::unmatched_gateway(
+    Ipv4Address::new(203, 0, 113, 7),
+    None,
+    Ipv4Address::new(198, 18, 222, 254),
+    Ipv4Address::new(192, 0, 2, 1)
+)]
+#[case::mismatched_authorization(
+    Ipv4Address::new(203, 0, 113, 7),
+    Some(Ipv4Address::new(198, 18, 215, 1)),
+    Ipv4Address::new(198, 18, 220, 254),
+    Ipv4Address::new(198, 18, 220, 1)
+)]
+#[case::unspecified_source(
+    Ipv4Address::UNSPECIFIED,
+    Some(Ipv4Address::UNSPECIFIED),
+    Ipv4Address::new(198, 18, 220, 254),
+    Ipv4Address::new(198, 18, 220, 1)
+)]
+fn routed_ipv4_arp_announces_authorized_source_or_next_hop_prefix(
+    #[case] source: Ipv4Address,
+    #[case] authorized: Option<Ipv4Address>,
+    #[case] next_hop: Ipv4Address,
+    #[case] expected: Ipv4Address,
+) {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    iface.update_ip_addrs(|addresses| {
+        addresses.clear();
+        addresses
+            .push(IpCidr::new(Ipv4Address::new(192, 0, 2, 1).into(), 24))
+            .unwrap();
+        addresses
+            .push(IpCidr::new(Ipv4Address::new(198, 18, 220, 1).into(), 24))
+            .unwrap();
+    });
+    // AnyIP is enabled in DragonOS for routed weak-host input. It must not
+    // cause a foreign forwarded source to become an owned ARP announcement.
+    iface.set_any_ip(true);
+    let mut packet = serialized_ipv4_packet(Ipv4Address::new(198, 18, 221, 7));
+    let mut header = Ipv4Packet::new_unchecked(&mut packet);
+    header.set_src_addr(source);
+    header.fill_checksum();
+    let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    assert_eq!(
+        iface.dispatch_ip_packet_with_arp_source(
+            Instant::from_millis(10),
+            CapturingTxToken(frames.clone()),
+            next_hop.into(),
+            None,
+            &packet,
+            authorized.map(IpAddress::from),
+        ),
+        Err(IpPacketDispatchError::NeighborPending {
+            retry_at: Instant::from_millis(1_010),
+        })
+    );
+    // Source authorization must not bypass neighbor-discovery rate limiting.
+    assert_eq!(
+        iface.dispatch_ip_packet_with_arp_source(
+            Instant::from_millis(11),
+            CapturingTxToken(frames.clone()),
+            next_hop.into(),
+            None,
+            &packet,
+            authorized.map(IpAddress::from),
+        ),
+        Err(IpPacketDispatchError::NeighborPending {
+            retry_at: Instant::from_millis(1_010),
+        })
+    );
+    let frames = frames.borrow();
+    assert_eq!(frames.len(), 1);
+    let frame = EthernetFrame::new_checked(&frames[0]).unwrap();
+    assert_eq!(frame.ethertype(), EthernetProtocol::Arp);
+    assert_eq!(
+        ArpRepr::parse(&ArpPacket::new_checked(frame.payload()).unwrap()).unwrap(),
+        ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Request,
+            source_hardware_addr: iface.inner.hardware_addr.ethernet_or_panic(),
+            source_protocol_addr: expected,
+            target_hardware_addr: EthernetAddress::BROADCAST,
+            target_protocol_addr: next_hop,
+        }
+    );
+}
+
+#[test]
+#[cfg(all(feature = "medium-ethernet", feature = "socket-icmp"))]
+fn ordinary_ipv4_arp_announces_secondary_source_before_neighbor_prefix() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let secondary = Ipv4Address::new(198, 18, 220, 1);
+    iface.update_ip_addrs(|addresses| {
+        addresses.push(IpCidr::new(secondary.into(), 24)).unwrap();
+    });
+    let destination = Ipv4Address::new(192, 168, 1, 254);
+    let packet = Packet::new_ipv4(
+        Ipv4Repr {
+            src_addr: secondary,
+            dst_addr: destination,
+            next_header: IpProtocol::Icmp,
+            payload_len: 8,
+            hop_limit: 64,
+        },
+        IpPayload::Icmpv4(Icmpv4Repr::EchoRequest {
+            ident: 1,
+            seq_no: 1,
+            data: &[],
+        }),
+    );
+    let frames = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    assert_eq!(
+        iface.inner.dispatch_ip(
+            CapturingTxToken(frames.clone()),
+            PacketMeta::default(),
+            packet,
+            &mut iface.fragmenter,
+        ),
+        Err(DispatchError::NeighborPending)
+    );
+    let frames = frames.borrow();
+    assert_eq!(frames.len(), 1);
+    let frame = EthernetFrame::new_checked(&frames[0]).unwrap();
+    let arp = ArpPacket::new_checked(frame.payload()).unwrap();
+    assert_eq!(arp.source_protocol_addr(), &secondary.octets()[..]);
+    assert_eq!(arp.target_protocol_addr(), &destination.octets()[..]);
+}
+
 #[test]
 #[cfg(feature = "medium-ethernet")]
 fn explicit_ipv4_dispatch_uses_supplied_next_hop_neighbor() {
@@ -1360,6 +1512,7 @@ fn disabled_neighbor_discovery_flushes_cache_and_uses_direct_hardware_address() 
         iface.inner.lookup_hardware_addr(
             MockTxToken,
             &IpAddress::Ipv4(next_hop),
+            None,
             &mut iface.fragmenter,
         ),
         Err(DispatchError::NeighborPending)
@@ -2123,6 +2276,7 @@ fn test_handle_valid_arp_request(#[case] medium: Medium) {
         iface.inner.lookup_hardware_addr(
             MockTxToken,
             &IpAddress::Ipv4(remote_ip_addr),
+            None,
             &mut iface.fragmenter,
         ),
         Err(DispatchError::NeighborPending)
@@ -2152,6 +2306,7 @@ fn test_handle_valid_arp_request(#[case] medium: Medium) {
         iface.inner.lookup_hardware_addr(
             MockTxToken,
             &IpAddress::Ipv4(remote_ip_addr),
+            None,
             &mut iface.fragmenter,
         ),
         Ok((HardwareAddress::Ethernet(remote_hw_addr), MockTxToken))
@@ -2268,6 +2423,7 @@ fn test_handle_other_arp_request(#[case] medium: Medium) {
         iface.inner.lookup_hardware_addr(
             MockTxToken,
             &IpAddress::Ipv4(remote_ip_addr),
+            None,
             &mut iface.fragmenter,
         ),
         Err(DispatchError::NeighborPending)
@@ -2326,6 +2482,7 @@ fn test_arp_flush_after_update_ip(#[case] medium: Medium) {
         iface.inner.lookup_hardware_addr(
             MockTxToken,
             &IpAddress::Ipv4(remote_ip_addr),
+            None,
             &mut iface.fragmenter,
         ),
         Ok((HardwareAddress::Ethernet(remote_hw_addr), MockTxToken))

@@ -559,26 +559,67 @@ impl Interface {
         destination_hardware_addr: Option<HardwareAddress>,
         ip_packet: &[u8],
     ) -> Result<(), IpPacketDispatchError> {
+        #[cfg(feature = "proto-ipv4")]
+        let arp_source = Ipv4Packet::new_checked(ip_packet)
+            .ok()
+            .filter(|packet| packet.version() == 4)
+            .map(|packet| IpAddress::Ipv4(packet.src_addr()))
+            .filter(|source| self.inner.has_ip_addr(*source));
+        #[cfg(not(feature = "proto-ipv4"))]
+        let arp_source = None;
+        self.dispatch_ip_packet_with_arp_source(
+            timestamp,
+            tx_token,
+            next_hop,
+            destination_hardware_addr,
+            ip_packet,
+            arp_source,
+        )
+    }
+
+    /// Dispatch an already-routed packet with namespace-local ARP ownership.
+    ///
+    /// `arp_source` authorizes the packet's IPv4 source for ARP announcements
+    /// even when that address belongs to another interface in the caller's
+    /// network namespace. The caller must verify this ownership; remote
+    /// forwarded sources must not be authorized. `None` explicitly requests
+    /// interface-prefix fallback, including when the packet source is still
+    /// configured but no longer classified as local by the caller's FIB.
+    /// A hint different from the
+    /// packet source is ignored. IPv6 neighbor discovery is unchanged.
+    pub fn dispatch_ip_packet_with_arp_source<Tx: TxToken>(
+        &mut self,
+        timestamp: Instant,
+        tx_token: Tx,
+        next_hop: IpAddress,
+        destination_hardware_addr: Option<HardwareAddress>,
+        ip_packet: &[u8],
+        arp_source: Option<IpAddress>,
+    ) -> Result<(), IpPacketDispatchError> {
         let version =
             IpVersion::of_packet(ip_packet).map_err(|_| IpPacketDispatchError::Malformed)?;
-        let packet_len = match (version, next_hop) {
+        let (packet_len, packet_source) = match (version, next_hop) {
             #[cfg(feature = "proto-ipv4")]
-            (IpVersion::Ipv4, IpAddress::Ipv4(_)) => Ipv4Packet::new_checked(ip_packet)
-                .map_err(|_| IpPacketDispatchError::Malformed)?
-                .total_len() as usize,
+            (IpVersion::Ipv4, IpAddress::Ipv4(_)) => {
+                let packet = Ipv4Packet::new_checked(ip_packet)
+                    .map_err(|_| IpPacketDispatchError::Malformed)?;
+                (packet.total_len() as usize, Some(packet.src_addr().into()))
+            }
             #[cfg(feature = "proto-ipv6")]
-            (IpVersion::Ipv6, IpAddress::Ipv6(_)) => {
+            (IpVersion::Ipv6, IpAddress::Ipv6(_)) => (
                 IPV6_HEADER_LEN
                     + Ipv6Packet::new_checked(ip_packet)
                         .map_err(|_| IpPacketDispatchError::Malformed)?
-                        .payload_len() as usize
-            }
+                        .payload_len() as usize,
+                None,
+            ),
             #[allow(unreachable_patterns)]
             _ => return Err(IpPacketDispatchError::Malformed),
         };
         if packet_len != ip_packet.len() {
             return Err(Ipv4PacketDispatchError::Malformed);
         }
+        let arp_source = packet_source.filter(|source| arp_source == Some(*source));
 
         self.inner.now = timestamp;
         match self.inner.caps.medium {
@@ -600,6 +641,7 @@ impl Interface {
                             match self.inner.lookup_hardware_addr_for_next_hop(
                                 tx_token,
                                 &next_hop,
+                                arp_source,
                                 &mut self.fragmenter,
                             ) {
                                 Ok(result) => result,
@@ -1546,6 +1588,7 @@ impl InterfaceInner {
         &mut self,
         tx_token: Tx,
         dst_addr: &IpAddress,
+        arp_source: Option<IpAddress>,
         fragmenter: &mut Fragmenter,
     ) -> Result<(HardwareAddress, Tx), DispatchError>
     where
@@ -1557,7 +1600,7 @@ impl InterfaceInner {
             self.route(dst_addr, self.now)
                 .ok_or(DispatchError::NoRoute)?
         };
-        self.lookup_hardware_addr_for_next_hop(tx_token, &next_hop, fragmenter)
+        self.lookup_hardware_addr_for_next_hop(tx_token, &next_hop, arp_source, fragmenter)
     }
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
@@ -1565,6 +1608,7 @@ impl InterfaceInner {
         &mut self,
         tx_token: Tx,
         next_hop: &IpAddress,
+        _arp_source: Option<IpAddress>,
         fragmenter: &mut Fragmenter,
     ) -> Result<(HardwareAddress, Tx), DispatchError>
     where
@@ -1649,7 +1693,7 @@ impl InterfaceInner {
                     operation: ArpOperation::Request,
                     source_hardware_addr: src_hardware_addr,
                     source_protocol_addr: self
-                        .get_source_address_ipv4(&dst_addr)
+                        .get_arp_source_address(dst_addr, _arp_source)
                         .ok_or(DispatchError::NoRoute)?,
                     target_hardware_addr: EthernetAddress::BROADCAST,
                     target_protocol_addr: dst_addr,
@@ -1790,15 +1834,23 @@ impl InterfaceInner {
         };
         let tx_medium = egress.map_or(self.caps.medium, |egress| egress.medium);
         let ip_mtu = egress.map_or(self.caps.ip_mtu(), |egress| egress.ip_mtu);
+        let arp_source = self
+            .has_ip_addr(ip_repr.src_addr())
+            .then_some(ip_repr.src_addr());
 
         // Dispatch IEEE802.15.4:
 
         #[cfg(feature = "medium-ieee802154")]
         if matches!(tx_medium, Medium::Ieee802154) {
             let (addr, tx_token) = if link_local_control {
-                self.lookup_hardware_addr_for_next_hop(tx_token, &ip_repr.dst_addr(), frag)?
+                self.lookup_hardware_addr_for_next_hop(
+                    tx_token,
+                    &ip_repr.dst_addr(),
+                    arp_source,
+                    frag,
+                )?
             } else {
-                self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)?
+                self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), arp_source, frag)?
             };
             let addr = addr.ieee802154_or_panic();
 
@@ -1827,9 +1879,14 @@ impl InterfaceInner {
         let (dst_hardware_addr, mut tx_token) = match tx_medium {
             Medium::Ethernet => {
                 let neighbor = if link_local_control {
-                    self.lookup_hardware_addr_for_next_hop(tx_token, &ip_repr.dst_addr(), frag)?
+                    self.lookup_hardware_addr_for_next_hop(
+                        tx_token,
+                        &ip_repr.dst_addr(),
+                        arp_source,
+                        frag,
+                    )?
                 } else {
-                    self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)?
+                    self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), arp_source, frag)?
                 };
                 match neighbor {
                     (HardwareAddress::Ethernet(addr), tx_token) => (addr, tx_token),

@@ -374,6 +374,23 @@ pub trait Device {
         self.capabilities().ip_mtu()
     }
 
+    /// TCP route lookup may require the original four-tuple to resolve NAT.
+    fn outbound_tcp_mtu(
+        &self,
+        _local: crate::wire::IpEndpoint,
+        remote: crate::wire::IpEndpoint,
+        meta: PacketMeta,
+    ) -> usize {
+        self.outbound_ip_mtu(remote.addr, meta)
+    }
+
+    /// Invalidate local MTU retry hints when routing or output policy changes.
+    /// Integrations which return MTU retries must change this value whenever
+    /// the path selected for a TCP flow may change.
+    fn outbound_tcp_mtu_generation(&self) -> u64 {
+        0
+    }
+
     /// Whether the integration's policy view is still current. A poll may
     /// dispatch several distinct packets; stop before advancing the next
     /// socket when its pinned policy has been replaced.
@@ -495,6 +512,9 @@ pub enum IpOutputError {
     NoRoute,
     PolicyDrop,
     MtuExceeded,
+    /// The final output route requires TCP to construct a smaller segment.
+    /// The packet was not admitted; output hooks may already have run.
+    MtuRetry(usize),
 }
 
 /// A transmit backend could not admit the packet selected by

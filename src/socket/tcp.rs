@@ -171,12 +171,15 @@ pub enum State {
 pub enum TcpPacketAdmission {
     Admitted,
     PolicyDropped,
+    /// Output hooks completed, but the final route requires resegmentation.
+    MtuRetry(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpDispatchOutcome {
     Done,
     PolicyDeferred,
+    MtuRetry,
 }
 
 impl fmt::Display for State {
@@ -515,6 +518,10 @@ pub struct Socket<'a> {
     /// The last sequence number sent.
     /// I.e. in an idle socket, local_seq_no+tx_buffer.len().
     remote_last_seq: TcpSeqNumber,
+    /// Highest admitted sequence end; unlike the send cursor this never
+    /// rewinds during retransmission. None until a sequence-bearing packet
+    /// has actually been admitted by the output integration.
+    admitted_seq_end: Option<TcpSeqNumber>,
     /// The last acknowledgement number sent.
     /// I.e. in an idle socket, remote_seq_no+rx_buffer.len().
     remote_last_ack: Option<TcpSeqNumber>,
@@ -534,6 +541,11 @@ pub struct Socket<'a> {
     remote_mss: usize,
     /// Last route-selected MTU, shared by dispatch and poll/Nagle decisions.
     output_ip_mtu: Option<usize>,
+    pmtu_discover: u8,
+    mtu_retry_hint: Option<(u64, usize)>,
+    mtu_retry_at: Option<Instant>,
+    mtu_retry_failures: u8,
+    pmtu_retransmitting: bool,
     /// An unsent data/FIN segment denied by output policy. Unlike a SYN,
     /// this segment has not advanced the send head and needs a retry deadline.
     policy_retry_at: Option<Instant>,
@@ -710,6 +722,7 @@ impl<'a> Socket<'a> {
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
             remote_last_seq: TcpSeqNumber::default(),
+            admitted_seq_end: None,
             remote_last_ack: None,
             remote_last_win: 0,
             remote_win_len: 0,
@@ -718,6 +731,11 @@ impl<'a> Socket<'a> {
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
             output_ip_mtu: None,
+            pmtu_discover: 1,
+            mtu_retry_hint: None,
+            mtu_retry_at: None,
+            mtu_retry_failures: 0,
+            pmtu_retransmitting: false,
             policy_retry_at: None,
             policy_retry_failures: 0,
             remote_last_ts: None,
@@ -916,6 +934,105 @@ impl<'a> Socket<'a> {
 
     pub fn local_seq_no(&self) -> TcpSeqNumber {
         self.local_seq_no
+    }
+
+    /// Linux IP{,V6}_MTU_DISCOVER values. This controls ICMP learning and
+    /// immediate retransmission, not TCP's route-selected segment size.
+    pub fn set_pmtu_discover(&mut self, value: u8) -> Result<(), ()> {
+        if value > 5 {
+            return Err(());
+        }
+        self.pmtu_discover = value;
+        Ok(())
+    }
+
+    pub fn pmtu_discover(&self) -> u8 {
+        self.pmtu_discover
+    }
+
+    pub fn output_ip_mtu(&self) -> Option<usize> {
+        self.output_ip_mtu
+    }
+
+    /// Validate the original outbound TCP header quoted by an ICMP error.
+    /// The inclusive sequence interval follows Linux's snd_una..snd_nxt
+    /// check, using admitted high water rather than the retransmit cursor.
+    pub fn accepts_pmtu_quote(
+        &self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        seq: TcpSeqNumber,
+        ingress: u32,
+    ) -> bool {
+        if matches!(self.state, State::Closed | State::Listen | State::TimeWait) {
+            return false;
+        }
+        let Some(tuple) = self.tuple else {
+            return false;
+        };
+        if tuple.local != local || tuple.remote != remote {
+            return false;
+        }
+        #[cfg(feature = "packetmeta-id")]
+        if self
+            .bound_device()
+            .is_some_and(|device| device.get() != ingress)
+        {
+            return false;
+        }
+        #[cfg(not(feature = "packetmeta-id"))]
+        let _ = ingress;
+        self.admitted_seq_end
+            .is_some_and(|end| seq >= self.local_seq_no && seq <= end)
+    }
+
+    /// Rewind outstanding data after a validated PMTU decrease without
+    /// treating the loss as congestion or backing off the RTO estimator.
+    /// The existing retransmit timer remains armed, including at zero window.
+    pub fn schedule_pmtu_retransmit(&mut self, mtu: usize) -> bool {
+        let Some(tuple) = self.tuple else {
+            return false;
+        };
+        if matches!(self.state, State::Closed | State::Listen | State::TimeWait)
+            || self.pmtu_discover >= 4
+        {
+            return false;
+        }
+        let minimum = match tuple.local.addr {
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(_) => {
+                if self.pmtu_discover == 0 {
+                    return false;
+                }
+                crate::wire::IPV4_HEADER_LEN
+                    + TCP_HEADER_LEN
+                    + if self.tsval_generator.is_some() {
+                        12
+                    } else {
+                        0
+                    }
+                    + 1
+            }
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(_) => 1280,
+        };
+        if mtu < minimum || !self.output_ip_mtu.is_some_and(|old| mtu < old) {
+            return false;
+        }
+        self.output_ip_mtu = Some(mtu);
+        // Cancel Karn-ambiguous sampling only, without RTO count/backoff.
+        self.rtte.timestamp = None;
+        self.pmtu_retransmitting = self
+            .admitted_seq_end
+            .is_some_and(|end| end > self.local_seq_no);
+        if self.pmtu_retransmitting {
+            self.remote_last_seq = self.local_seq_no;
+        }
+        self.policy_retry_at = None;
+        self.policy_retry_failures = 0;
+        self.mtu_retry_at = None;
+        self.mtu_retry_failures = 0;
+        true
     }
 
     pub fn remote_last_ack(&self) -> Option<TcpSeqNumber> {
@@ -1135,6 +1252,7 @@ impl<'a> Socket<'a> {
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
+        self.admitted_seq_end = None;
         self.remote_last_ack = None;
         self.remote_last_win = 0;
         self.remote_win_len = 0;
@@ -1142,6 +1260,10 @@ impl<'a> Socket<'a> {
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
         self.output_ip_mtu = None;
+        self.mtu_retry_hint = None;
+        self.mtu_retry_at = None;
+        self.mtu_retry_failures = 0;
+        self.pmtu_retransmitting = false;
         self.policy_retry_at = None;
         self.policy_retry_failures = 0;
         self.remote_last_ts = None;
@@ -1299,6 +1421,7 @@ impl<'a> Socket<'a> {
         let seq = reuse.map_or_else(|| Self::random_seq_no(cx), TimeWaitState::new_isn);
         self.local_seq_no = seq;
         self.remote_last_seq = seq;
+        self.admitted_seq_end = None;
         if let Some(old) = reuse {
             self.ts_recent = old.ts_recent;
         }
@@ -1942,6 +2065,7 @@ impl<'a> Socket<'a> {
             if let Some((old, _)) = reuse {
                 self.local_seq_no = old.new_isn();
                 self.remote_last_seq = self.local_seq_no;
+                self.admitted_seq_end = None;
             }
         }
         if self.state == State::TimeWait {
@@ -2276,6 +2400,7 @@ impl<'a> Socket<'a> {
                     remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
                 });
                 self.local_seq_no = Self::random_seq_no(cx);
+                self.admitted_seq_end = None;
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no;
                 self.remote_has_sack = repr.sack_permitted;
@@ -2790,7 +2915,7 @@ impl<'a> Socket<'a> {
     {
         self.policy_retry_at = None;
         self.policy_retry_failures = 0;
-        let result = self.dispatch_inner(cx, ip_mtu, |cx, packet| {
+        let result = self.dispatch_inner(cx, ip_mtu, 0, |cx, packet| {
             emit(cx, packet).map(|_| TcpPacketAdmission::Admitted)
         });
         self.notify_lifecycle();
@@ -2809,13 +2934,28 @@ impl<'a> Socket<'a> {
     where
         F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<TcpPacketAdmission, E>,
     {
+        self.dispatch_with_mtu_policy_generation(cx, ip_mtu, 0, emit)
+    }
+
+    /// A generation ties final-route MTU retry hints to the integration's
+    /// routing and output-policy view. It must change when that view changes.
+    pub fn dispatch_with_mtu_policy_generation<F, E>(
+        &mut self,
+        cx: &mut Context,
+        ip_mtu: usize,
+        generation: u64,
+        emit: F,
+    ) -> Result<TcpDispatchOutcome, E>
+    where
+        F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<TcpPacketAdmission, E>,
+    {
         if self.policy_retry_at.is_some_and(|deadline| {
             cx.now() >= deadline || self.timer.should_retransmit(cx.now()).is_some()
         }) {
             self.policy_retry_at = None;
         }
         let mut admitted_sequence = false;
-        let result = self.dispatch_inner(cx, ip_mtu, |cx, packet| {
+        let result = self.dispatch_inner(cx, ip_mtu, generation, |cx, packet| {
             let occupies_sequence = packet.1.segment_len() > 0;
             let admission = emit(cx, packet)?;
             admitted_sequence = occupies_sequence && admission == TcpPacketAdmission::Admitted;
@@ -2843,6 +2983,7 @@ impl<'a> Socket<'a> {
         &mut self,
         cx: &mut Context,
         ip_mtu: usize,
+        generation: u64,
         emit: F,
     ) -> Result<TcpDispatchOutcome, E>
     where
@@ -2862,7 +3003,21 @@ impl<'a> Socket<'a> {
             self.output_ip_mtu = None;
             return Ok(TcpDispatchOutcome::Done);
         }
+        if self
+            .mtu_retry_hint
+            .is_some_and(|(old_generation, _)| old_generation != generation)
+        {
+            self.mtu_retry_hint = None;
+            self.mtu_retry_at = None;
+            self.mtu_retry_failures = 0;
+        }
+        let ip_mtu = self
+            .mtu_retry_hint
+            .map_or(ip_mtu, |(_, hint)| hint.min(ip_mtu));
         self.output_ip_mtu = Some(ip_mtu);
+        if self.mtu_retry_at.is_some_and(|at| cx.now() >= at) {
+            self.mtu_retry_at = None;
+        }
 
         if self.remote_last_ts.is_none() {
             // We get here in exactly two cases:
@@ -2910,7 +3065,14 @@ impl<'a> Socket<'a> {
 
         let defer_unsent_data = self
             .policy_retry_at
-            .is_some_and(|deadline| cx.now() < deadline);
+            .is_some_and(|deadline| cx.now() < deadline)
+            || self
+                .mtu_retry_at
+                .is_some_and(|deadline| cx.now() < deadline);
+
+        if self.mtu_retry_at.is_some_and(|at| cx.now() < at) {
+            return Ok(TcpDispatchOutcome::Done);
+        }
 
         // Decide whether we're sending a packet.
         if self.seq_to_transmit(cx) && !defer_unsent_data {
@@ -3113,7 +3275,33 @@ impl<'a> Socket<'a> {
         // to not waste time waiting for the retransmit timer on packets that we know
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
-        let admission = emit(cx, (ip_repr, repr))?;
+        let packet_header_len = ip_repr.header_len() + repr.header_len();
+        let admission = match emit(cx, (ip_repr, repr)) {
+            Ok(admission) => admission,
+            Err(error) => {
+                if self.pmtu_retransmitting || self.mtu_retry_hint.is_some() {
+                    let delay_ms = (1u64 << self.mtu_retry_failures.min(10)).min(1000);
+                    self.mtu_retry_at = Some(cx.now() + Duration::from_millis(delay_ms));
+                    self.mtu_retry_failures = self.mtu_retry_failures.saturating_add(1);
+                }
+                return Err(error);
+            }
+        };
+        if let TcpPacketAdmission::MtuRetry(mtu) = admission {
+            if mtu > packet_header_len && mtu < ip_mtu {
+                self.mtu_retry_hint = Some((generation, mtu));
+                self.output_ip_mtu = Some(mtu);
+                self.mtu_retry_at = None;
+                self.mtu_retry_failures = 0;
+            } else {
+                // A repeated or unusable hint cannot produce progress now.
+                // Back off independently of congestion/RTO and policy denial.
+                let delay_ms = (1u64 << self.mtu_retry_failures.min(10)).min(1000);
+                self.mtu_retry_at = Some(cx.now() + Duration::from_millis(delay_ms));
+                self.mtu_retry_failures = self.mtu_retry_failures.saturating_add(1);
+            }
+            return Ok(TcpDispatchOutcome::MtuRetry);
+        }
         if admission == TcpPacketAdmission::PolicyDropped
             && repr.segment_len() > 0
             && repr.control != TcpControl::Syn
@@ -3149,6 +3337,22 @@ impl<'a> Socket<'a> {
 
         // We've sent a packet successfully, so we can update the internal state now.
         self.remote_last_seq = repr.seq_number + repr.segment_len();
+        if admission == TcpPacketAdmission::Admitted && repr.segment_len() > 0 {
+            if self
+                .admitted_seq_end
+                .is_none_or(|end| self.remote_last_seq > end)
+            {
+                self.admitted_seq_end = Some(self.remote_last_seq);
+            }
+            self.mtu_retry_at = None;
+            self.mtu_retry_failures = 0;
+            if self
+                .admitted_seq_end
+                .is_some_and(|end| self.remote_last_seq >= end)
+            {
+                self.pmtu_retransmitting = false;
+            }
+        }
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
 
@@ -3194,10 +3398,22 @@ impl<'a> Socket<'a> {
         } else if self.remote_last_ts.is_none() {
             // Socket stopped being quiet recently, we need to acquire a timestamp.
             PollAt::Now
-        } else if self.state == State::Closed {
+        } else if self.state == State::Closed && self.mtu_retry_at.is_none() {
             // Socket was aborted, we have an RST packet to transmit.
             PollAt::Now
-        } else if self.seq_to_transmit(cx) && self.policy_retry_at.is_none() {
+        } else if let Some(at) = self.mtu_retry_at {
+            let timeout = match (self.remote_last_ts, self.timeout) {
+                (Some(last), Some(timeout)) => PollAt::Time(last + timeout),
+                _ => PollAt::Ingress,
+            };
+            *[PollAt::Time(at), self.timer.poll_at(), timeout]
+                .iter()
+                .min()
+                .unwrap()
+        } else if self.seq_to_transmit(cx)
+            && self.policy_retry_at.is_none()
+            && self.mtu_retry_at.is_none()
+        {
             // We have a data or flag packet to transmit.
             PollAt::Now
         } else if self.window_to_update() {
@@ -3229,11 +3445,13 @@ impl<'a> Socket<'a> {
                     PollAt::Ingress
                 }
             });
+            let mtu_poll_at = self.mtu_retry_at.map_or(PollAt::Ingress, PollAt::Time);
             *[
                 self.timer.poll_at(),
                 timeout_poll_at,
                 delayed_ack_poll_at,
                 policy_poll_at,
+                mtu_poll_at,
             ]
             .iter()
             .min()
@@ -3559,6 +3777,246 @@ mod test {
 
     fn socket_established() -> TestSocket {
         socket_established_with_buffer_sizes(64, 64)
+    }
+
+    fn pmtu_dispatch(
+        s: &mut TestSocket,
+        mtu: usize,
+        generation: u64,
+        admission: TcpPacketAdmission,
+    ) -> TcpDispatchOutcome {
+        let TestSocket { socket, cx } = s;
+        socket
+            .dispatch_with_mtu_policy_generation(cx, mtu, generation, |_, _| Ok::<_, ()>(admission))
+            .unwrap()
+    }
+
+    #[test]
+    fn pmtu_quote_high_water_survives_wrap_and_rewind() {
+        let mut s = socket_established();
+        let start = TcpSeqNumber(i32::MAX - 8);
+        s.local_seq_no = start;
+        s.remote_last_seq = start;
+        s.send_slice(&[1; 32]).unwrap();
+        assert!(!s.accepts_pmtu_quote(TUPLE.local, TUPLE.remote, start, 0));
+        pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::Admitted);
+        let end = start + 32;
+        s.remote_last_seq = start; // RTO/PMTU retransmit cursor rewind.
+        assert!(s.accepts_pmtu_quote(TUPLE.local, TUPLE.remote, start, 0));
+        assert!(s.accepts_pmtu_quote(TUPLE.local, TUPLE.remote, end, 0));
+        assert!(s.accepts_pmtu_quote(TUPLE.local, TUPLE.remote, start + 16, 0));
+        assert!(!s.accepts_pmtu_quote(TUPLE.local, TUPLE.remote, start - 1, 0));
+        assert!(!s.accepts_pmtu_quote(TUPLE.local, TUPLE.remote, end + 1, 0));
+        s.local_seq_no = start + 16; // Cumulative ACK advances snd_una.
+        assert!(!s.accepts_pmtu_quote(TUPLE.local, TUPLE.remote, start, 0));
+        let mut wrong = TUPLE.remote;
+        wrong.port += 1;
+        assert!(!s.accepts_pmtu_quote(TUPLE.local, wrong, end, 0));
+        #[cfg(feature = "packetmeta-id")]
+        {
+            s.set_bound_device(NonZeroU32::new(7));
+            assert!(!s.accepts_pmtu_quote(TUPLE.local, TUPLE.remote, end, 8));
+            assert!(s.accepts_pmtu_quote(TUPLE.local, TUPLE.remote, end, 7));
+        }
+        s.state = State::TimeWait;
+        assert!(!s.accepts_pmtu_quote(TUPLE.local, TUPLE.remote, end, 7));
+    }
+
+    #[test]
+    fn pmtu_retransmit_preserves_congestion_rto_and_zero_window_timer() {
+        let mut s = socket_established_with_buffer_sizes(4096, 4096);
+        #[cfg(feature = "socket-tcp-reno")]
+        s.set_congestion_control(CongestionControl::Reno);
+        s.remote_mss = 4000;
+        s.remote_win_len = 4096;
+        s.send_slice(&[1; 1460]).unwrap();
+        pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::Admitted);
+        let seq_end = s.admitted_seq_end;
+        let timer = s.timer;
+        let cwnd = s.cwnd();
+        let rto = s.rto();
+        let retransmits = s.retransmits();
+        assert!(s.schedule_pmtu_retransmit(1280));
+        assert_eq!(s.remote_last_seq, s.local_seq_no);
+        assert_eq!(s.admitted_seq_end, seq_end);
+        assert_eq!(s.cwnd(), cwnd);
+        assert_eq!(s.rto(), rto);
+        assert_eq!(s.retransmits(), retransmits);
+        assert_eq!(s.timer, timer);
+        assert!(s.rtte.timestamp.is_none());
+        assert!(!s.schedule_pmtu_retransmit(1280));
+        let start = s.local_seq_no;
+        let TestSocket { socket, cx } = &mut s;
+        socket
+            .dispatch_with_mtu_policy(cx, 1280, |_, (ip, tcp)| {
+                assert_eq!(tcp.seq_number, start);
+                assert_eq!(ip.header_len() + tcp.buffer_len(), 1280);
+                Ok::<_, ()>(TcpPacketAdmission::Admitted)
+            })
+            .unwrap();
+        assert_eq!(s.cwnd(), cwnd);
+        assert_eq!(s.retransmits(), retransmits);
+        assert_eq!(s.timer, timer);
+        s.remote_win_len = 0;
+        let TestSocket { socket, cx } = &mut s;
+        assert_ne!(socket.poll_at(cx), PollAt::Now);
+        socket
+            .dispatch_with_mtu_policy(cx, 1280, |_, _| {
+                panic!("zero window must retain the retransmit deadline");
+                #[allow(unreachable_code)]
+                Ok::<_, ()>(TcpPacketAdmission::Admitted)
+            })
+            .unwrap();
+        assert_eq!(s.timer, timer);
+    }
+
+    #[test]
+    fn pmtu_mtu_retry_does_not_admit_and_repeated_hint_backs_off() {
+        let mut s = socket_established_with_buffer_sizes(4096, 4096);
+        s.remote_mss = 4000;
+        s.remote_win_len = 4096;
+        s.send_slice(&[1; 1460]).unwrap();
+        let start = s.remote_last_seq;
+        let rto = s.rto();
+        let cwnd = s.cwnd();
+        assert_eq!(
+            pmtu_dispatch(&mut s, 1500, 3, TcpPacketAdmission::MtuRetry(1280)),
+            TcpDispatchOutcome::MtuRetry
+        );
+        assert_eq!(s.remote_last_seq, start);
+        assert_eq!(s.admitted_seq_end, None);
+        assert!(s.rtte.timestamp.is_none());
+        assert_eq!(s.rto(), rto);
+        assert_eq!(s.cwnd(), cwnd);
+        assert_eq!(s.output_ip_mtu, Some(1280));
+        assert_eq!(
+            pmtu_dispatch(&mut s, 1500, 3, TcpPacketAdmission::MtuRetry(1280)),
+            TcpDispatchOutcome::MtuRetry
+        );
+        let TestSocket { socket, cx } = &mut s;
+        assert_eq!(
+            socket.poll_at(cx),
+            PollAt::Time(cx.now() + Duration::from_millis(1))
+        );
+        socket
+            .dispatch_with_mtu_policy_generation(cx, 1500, 3, |_, _| {
+                panic!("same hint must not emit again before the deadline");
+                #[allow(unreachable_code)]
+                Ok::<_, ()>(TcpPacketAdmission::Admitted)
+            })
+            .unwrap();
+        // Replacing rules/routes discards the old local hint and its backoff.
+        let TestSocket { socket, cx } = &mut s;
+        socket
+            .dispatch_with_mtu_policy_generation(cx, 1500, 4, |_, (ip, tcp)| {
+                assert_eq!(ip.header_len() + tcp.buffer_len(), 1500);
+                Ok::<_, ()>(TcpPacketAdmission::Admitted)
+            })
+            .unwrap();
+        assert_eq!(s.admitted_seq_end, Some(start + 1460));
+    }
+
+    #[test]
+    fn pmtu_retransmit_exhaustion_retains_data_and_timer() {
+        let mut s = socket_established();
+        s.send_slice(&[1; 32]).unwrap();
+        pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::Admitted);
+        let timer = s.timer;
+        let end = s.admitted_seq_end;
+        assert!(s.schedule_pmtu_retransmit(1280));
+        let TestSocket { socket, cx } = &mut s;
+        assert_eq!(
+            socket.dispatch_with_mtu_policy(cx, 1280, |_, _| { Err::<TcpPacketAdmission, _>(()) }),
+            Err(())
+        );
+        assert_eq!(s.remote_last_seq, s.local_seq_no);
+        assert_eq!(s.admitted_seq_end, end);
+        assert_eq!(s.timer, timer);
+        assert_eq!(s.tx_buffer.len(), 32);
+        let TestSocket { socket, cx } = &mut s;
+        assert_eq!(
+            socket.poll_at(cx),
+            PollAt::Time(cx.now() + Duration::from_millis(1))
+        );
+        cx.set_now(cx.now() + Duration::from_millis(1));
+        pmtu_dispatch(&mut s, 1280, 0, TcpPacketAdmission::Admitted);
+        assert_eq!(s.remote_last_seq, end.unwrap());
+    }
+
+    #[test]
+    fn pmtu_abort_obeys_output_backoff_without_empty_polling() {
+        let mut s = socket_established();
+        s.send_slice(&[1; 32]).unwrap();
+        pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::Admitted);
+        assert!(s.schedule_pmtu_retransmit(1280));
+        let TestSocket { socket, cx } = &mut s;
+        assert_eq!(
+            socket.dispatch_with_mtu_policy(cx, 1280, |_, _| Err::<TcpPacketAdmission, _>(())),
+            Err(())
+        );
+        socket.abort();
+        let deadline = cx.now() + Duration::from_millis(1);
+        assert_eq!(socket.poll_at(cx), PollAt::Time(deadline));
+        assert_eq!(
+            socket.dispatch_with_mtu_policy(cx, 1280, |_, _| -> Result<TcpPacketAdmission, ()> {
+                panic!("output before retry deadline")
+            }),
+            Ok(TcpDispatchOutcome::Done)
+        );
+        cx.set_now(deadline);
+        socket
+            .dispatch_with_mtu_policy(cx, 1280, |_, (_, repr)| {
+                assert_eq!(repr.control, TcpControl::Rst);
+                Ok::<_, ()>(TcpPacketAdmission::Admitted)
+            })
+            .unwrap();
+        assert_eq!(socket.poll_at(cx), PollAt::Ingress);
+    }
+
+    #[test]
+    fn pmtu_policy_validation_and_feedback_gates() {
+        let mut s = socket_established();
+        assert_eq!(s.pmtu_discover(), 1);
+        assert_eq!(s.set_pmtu_discover(6), Err(()));
+        for mode in 0..=5 {
+            assert_eq!(s.set_pmtu_discover(mode), Ok(()));
+            assert_eq!(s.pmtu_discover(), mode);
+            s.output_ip_mtu = Some(1500);
+            let ipv4 = TUPLE.local.addr.version() == crate::wire::IpVersion::Ipv4;
+            assert_eq!(
+                s.schedule_pmtu_retransmit(1280),
+                mode < 4 && (!ipv4 || mode != 0)
+            );
+        }
+    }
+
+    #[test]
+    fn pmtu_syn_policy_drop_is_not_admitted_sequence() {
+        let mut s = socket_syn_sent();
+        pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::PolicyDropped);
+        assert_eq!(s.admitted_seq_end, None);
+        assert!(!s.accepts_pmtu_quote(TUPLE.local, TUPLE.remote, LOCAL_SEQ, 0));
+        s.timer = Timer::FastRetransmit;
+        pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::Admitted);
+        assert_eq!(s.admitted_seq_end, Some(LOCAL_SEQ + 1));
+    }
+
+    #[test]
+    fn pmtu_fin_and_syn_mtu_retry_do_not_admit_prematurely() {
+        let mut syn = socket_syn_sent();
+        pmtu_dispatch(&mut syn, 1500, 0, TcpPacketAdmission::MtuRetry(1280));
+        assert_eq!(syn.remote_last_seq, LOCAL_SEQ);
+        assert_eq!(syn.admitted_seq_end, None);
+        pmtu_dispatch(&mut syn, 1500, 0, TcpPacketAdmission::Admitted);
+        assert_eq!(syn.admitted_seq_end, Some(LOCAL_SEQ + 1));
+        let mut fin = socket_established();
+        fin.close();
+        let start = fin.local_seq_no;
+        pmtu_dispatch(&mut fin, 1500, 0, TcpPacketAdmission::MtuRetry(1280));
+        assert_eq!(fin.remote_last_seq, start);
+        assert_eq!(fin.admitted_seq_end, None);
+        pmtu_dispatch(&mut fin, 1500, 0, TcpPacketAdmission::Admitted);
+        assert_eq!(fin.admitted_seq_end, Some(start + 1));
     }
 
     #[test]

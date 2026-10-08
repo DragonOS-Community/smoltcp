@@ -224,7 +224,10 @@ impl Interface {
             packet,
             &mut self.fragmenter,
         ) {
-            Ok(()) | Err(DispatchError::PolicyDrop | DispatchError::NoRoute) => {
+            Ok(())
+            | Err(
+                DispatchError::PolicyDrop | DispatchError::NoRoute | DispatchError::MtuRetry(_),
+            ) => {
                 self.inner.multicast.retry_at = None;
                 true
             }

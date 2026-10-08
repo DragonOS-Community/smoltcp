@@ -318,3 +318,106 @@ fn tcp_transport_rejects_inconsistent_ip_metadata() {
         assert!(device.tx_queue.is_empty());
     }
 }
+
+#[test]
+fn tcp_transport_mtu_retry_preserves_sequence_and_avoids_neighbor_wait() {
+    struct RetryDevice {
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        attempts: Vec<Vec<u8>>,
+    }
+    struct RetryToken<'a>(&'a mut RetryDevice);
+    impl TxToken for RetryToken<'_> {
+        fn deferred_ip_output(&self, _: IpVersion) -> bool {
+            true
+        }
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, _: usize, _: F) -> R {
+            panic!("complete IP admission required")
+        }
+        fn consume_full_ip<F>(
+            self,
+            len: usize,
+            _: PacketMeta,
+            _: crate::phy::IpOutputClass,
+            _: Option<u16>,
+            emit: F,
+        ) -> Result<(), crate::phy::IpOutputError>
+        where
+            F: FnOnce(&mut [u8]),
+        {
+            let mut bytes = vec![0; len];
+            emit(&mut bytes);
+            self.0.attempts.push(bytes);
+            if self.0.attempts.len() == 1 {
+                Err(crate::phy::IpOutputError::MtuRetry(1280))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl Device for RetryDevice {
+        type RxToken<'a> = crate::tests::RxToken;
+        type TxToken<'a> = RetryToken<'a>;
+        fn receive(&mut self, _: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            None
+        }
+        fn transmit(&mut self, _: Instant) -> Option<Self::TxToken<'_>> {
+            Some(RetryToken(self))
+        }
+        fn capabilities(&self) -> crate::phy::DeviceCapabilities {
+            let mut caps = crate::phy::DeviceCapabilities::default();
+            caps.medium = Medium::Ip;
+            caps.max_transmission_unit = 1500;
+            caps
+        }
+        fn outbound_tcp_mtu(&self, local: IpEndpoint, remote: IpEndpoint, _: PacketMeta) -> usize {
+            assert_eq!(local, self.local);
+            assert_eq!(remote, self.remote);
+            1500
+        }
+        fn outbound_tcp_mtu_generation(&self) -> u64 {
+            7
+        }
+    }
+    for ip in addresses() {
+        let (mut iface, mut sockets, _) = setup(Medium::Ip);
+        let local = IpEndpoint::new(ip.src_addr(), 40000);
+        let remote = IpEndpoint::new(ip.dst_addr(), 80);
+        let mut device = RetryDevice {
+            local,
+            remote,
+            attempts: Vec::new(),
+        };
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 256]),
+            tcp::SocketBuffer::new(vec![0; 256]),
+        );
+        socket.connect(iface.context(), remote, local).unwrap();
+        let handle = sockets.add(socket);
+        iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+        let first = TcpPacket::new_checked(&device.attempts[0][ip.header_len()..]).unwrap();
+        let seq = first.seq_number();
+        assert!(!sockets
+            .get::<tcp::Socket>(handle)
+            .accepts_pmtu_quote(local, remote, seq, 0));
+        // Same-time poll must reach TCP again, without neighbor_missing delay.
+        iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+        assert_eq!(device.attempts.len(), 2);
+        let second = TcpPacket::new_checked(&device.attempts[1][ip.header_len()..]).unwrap();
+        assert_eq!(second.seq_number(), seq);
+        let repr = TcpRepr::parse(
+            &second,
+            &local.addr,
+            &remote.addr,
+            &ChecksumCapabilities::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            repr.max_seg_size,
+            Some((1280 - ip.header_len() - 20) as u16)
+        );
+        assert!(sockets
+            .get::<tcp::Socket>(handle)
+            .accepts_pmtu_quote(local, remote, seq + 1, 0));
+    }
+}

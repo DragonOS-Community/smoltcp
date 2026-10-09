@@ -365,10 +365,11 @@ fn tcp_transport_mtu_retry_preserves_sequence_and_avoids_neighbor_wait() {
             Some(RetryToken(self))
         }
         fn capabilities(&self) -> crate::phy::DeviceCapabilities {
-            let mut caps = crate::phy::DeviceCapabilities::default();
-            caps.medium = Medium::Ip;
-            caps.max_transmission_unit = 1500;
-            caps
+            crate::phy::DeviceCapabilities {
+                medium: Medium::Ip,
+                max_transmission_unit: 1500,
+                ..Default::default()
+            }
         }
         fn outbound_tcp_mtu(&self, local: IpEndpoint, remote: IpEndpoint, _: PacketMeta) -> usize {
             assert_eq!(local, self.local);

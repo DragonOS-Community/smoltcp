@@ -142,6 +142,20 @@ impl Display for RecvError {
 #[cfg(feature = "std")]
 impl std::error::Error for RecvError {}
 
+/// Invalid Linux IP{,V6}_MTU_DISCOVER value passed to [`Socket::set_pmtu_discover`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PmtuDiscoverError;
+
+impl Display for PmtuDiscoverError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "invalid PMTU discovery mode")
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PmtuDiscoverError {}
+
 /// A TCP socket ring buffer.
 pub type SocketBuffer<'a> = RingBuffer<'a, u8>;
 
@@ -938,9 +952,9 @@ impl<'a> Socket<'a> {
 
     /// Linux IP{,V6}_MTU_DISCOVER values. This controls ICMP learning and
     /// immediate retransmission, not TCP's route-selected segment size.
-    pub fn set_pmtu_discover(&mut self, value: u8) -> Result<(), ()> {
+    pub fn set_pmtu_discover(&mut self, value: u8) -> Result<(), PmtuDiscoverError> {
         if value > 5 {
-            return Err(());
+            return Err(PmtuDiscoverError);
         }
         self.pmtu_discover = value;
         Ok(())
@@ -3340,7 +3354,7 @@ impl<'a> Socket<'a> {
         if admission == TcpPacketAdmission::Admitted && repr.segment_len() > 0 {
             if self
                 .admitted_seq_end
-                .is_none_or(|end| self.remote_last_seq > end)
+                .map_or(true, |end| self.remote_last_seq > end)
             {
                 self.admitted_seq_end = Some(self.remote_last_seq);
             }
@@ -3907,13 +3921,19 @@ mod test {
             .unwrap();
         // Replacing rules/routes discards the old local hint and its backoff.
         let TestSocket { socket, cx } = &mut s;
+        let mut admitted_end = None;
         socket
             .dispatch_with_mtu_policy_generation(cx, 1500, 4, |_, (ip, tcp)| {
                 assert_eq!(ip.header_len() + tcp.buffer_len(), 1500);
+                // IPv6's larger IP header leaves less payload at the same MTU.
+                // Admission must track the segment actually emitted, not all
+                // 1460 queued bytes or an IPv4-specific MSS assumption.
+                admitted_end = Some(tcp.seq_number + tcp.segment_len());
                 Ok::<_, ()>(TcpPacketAdmission::Admitted)
             })
             .unwrap();
-        assert_eq!(s.admitted_seq_end, Some(start + 1460));
+        assert!(admitted_end.is_some());
+        assert_eq!(s.admitted_seq_end, admitted_end);
     }
 
     #[test]
@@ -3977,12 +3997,17 @@ mod test {
     fn pmtu_policy_validation_and_feedback_gates() {
         let mut s = socket_established();
         assert_eq!(s.pmtu_discover(), 1);
-        assert_eq!(s.set_pmtu_discover(6), Err(()));
+        assert_eq!(s.set_pmtu_discover(6), Err(PmtuDiscoverError));
         for mode in 0..=5 {
             assert_eq!(s.set_pmtu_discover(mode), Ok(()));
             assert_eq!(s.pmtu_discover(), mode);
             s.output_ip_mtu = Some(1500);
-            let ipv4 = TUPLE.local.addr.version() == crate::wire::IpVersion::Ipv4;
+            let ipv4 = match TUPLE.local.addr {
+                #[cfg(feature = "proto-ipv4")]
+                IpAddress::Ipv4(_) => true,
+                #[cfg(feature = "proto-ipv6")]
+                IpAddress::Ipv6(_) => false,
+            };
             assert_eq!(
                 s.schedule_pmtu_retransmit(1280),
                 mode < 4 && (!ipv4 || mode != 0)

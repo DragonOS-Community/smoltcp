@@ -653,7 +653,7 @@ impl Interface {
                                             .discovery_retry_at(&next_hop, timestamp),
                                     });
                                 }
-                                Err(DispatchError::NoRoute) => {
+                                Err(DispatchError::NoRoute | DispatchError::MtuRetry(_)) => {
                                     return Err(Ipv4PacketDispatchError::NoRoute);
                                 }
                                 Err(DispatchError::PolicyDrop) => {
@@ -678,7 +678,9 @@ impl Interface {
                         frame.payload_mut().copy_from_slice(ip_packet);
                     })
                     .map_err(|error| match error {
-                        DispatchError::NoRoute => Ipv4PacketDispatchError::NoRoute,
+                        DispatchError::NoRoute | DispatchError::MtuRetry(_) => {
+                            Ipv4PacketDispatchError::NoRoute
+                        }
                         DispatchError::PolicyDrop => Ipv4PacketDispatchError::NoRoute,
                         DispatchError::Exhausted => Ipv4PacketDispatchError::Exhausted,
                         DispatchError::NeighborPending => {
@@ -1167,6 +1169,7 @@ impl Interface {
         sockets.expire_tcp_time_wait(self.inner.now);
 
         enum EgressError {
+            MtuRetry(usize),
             Exhausted,
             Dispatch,
         }
@@ -1190,12 +1193,18 @@ impl Interface {
             let policy_dropped = core::cell::Cell::new(false);
             #[cfg(feature = "socket-tcp")]
             #[allow(unreachable_patterns)]
-            let tcp_mtu = match &item.socket {
-                Socket::Tcp(socket) => socket
-                    .remote_endpoint()
-                    .map(|remote| device.outbound_ip_mtu(remote.addr, socket.egress_meta())),
-                _ => None,
-            };
+            let tcp_mtu =
+                match &item.socket {
+                    Socket::Tcp(socket) => socket
+                        .local_endpoint()
+                        .zip(socket.remote_endpoint())
+                        .map(|(local, remote)| {
+                            device.outbound_tcp_mtu(local, remote, socket.egress_meta())
+                        }),
+                    _ => None,
+                };
+            #[cfg(feature = "socket-tcp")]
+            let tcp_mtu_generation = device.outbound_tcp_mtu_generation();
             let mut respond = |inner: &mut InterfaceInner, meta: PacketMeta, response: Packet| {
                 neighbor_addr = Some(response.ip_repr().dst_addr());
                 let t = device.transmit(inner.now).ok_or_else(|| {
@@ -1207,6 +1216,7 @@ impl Interface {
                     Ok(()) => {}
                     Err(DispatchError::PolicyDrop) => policy_dropped.set(true),
                     Err(DispatchError::Exhausted) => return Err(EgressError::Exhausted),
+                    Err(DispatchError::MtuRetry(mtu)) => return Err(EgressError::MtuRetry(mtu)),
                     Err(DispatchError::NoRoute | DispatchError::NeighborPending) => {
                         return Err(EgressError::Dispatch);
                     }
@@ -1256,14 +1266,26 @@ impl Interface {
                     let meta = socket.egress_meta();
                     let mtu = tcp_mtu.unwrap_or_else(|| self.inner.ip_mtu());
                     socket
-                        .dispatch_with_mtu_policy(&mut self.inner, mtu, |inner, (ip, tcp)| {
-                            respond(inner, meta, Packet::new(ip, IpPayload::Tcp(tcp)))?;
-                            Ok(if policy_dropped.replace(false) {
-                                crate::socket::tcp::TcpPacketAdmission::PolicyDropped
-                            } else {
-                                crate::socket::tcp::TcpPacketAdmission::Admitted
-                            })
-                        })
+                        .dispatch_with_mtu_policy_generation(
+                            &mut self.inner,
+                            mtu,
+                            tcp_mtu_generation,
+                            |inner, (ip, tcp)| {
+                                match respond(inner, meta, Packet::new(ip, IpPayload::Tcp(tcp))) {
+                                    Err(EgressError::MtuRetry(mtu)) => {
+                                        return Ok(
+                                            crate::socket::tcp::TcpPacketAdmission::MtuRetry(mtu),
+                                        )
+                                    }
+                                    result => result?,
+                                }
+                                Ok(if policy_dropped.replace(false) {
+                                    crate::socket::tcp::TcpPacketAdmission::PolicyDropped
+                                } else {
+                                    crate::socket::tcp::TcpPacketAdmission::Admitted
+                                })
+                            },
+                        )
                         .map(|_| ())
                 }
                 #[cfg(feature = "socket-dhcpv4")]
@@ -1298,6 +1320,7 @@ impl Interface {
                         neighbor_addr.expect("non-IP response packet"),
                     );
                 }
+                Err(EgressError::MtuRetry(_)) => {}
                 Ok(()) => {}
             }
         }
@@ -1820,6 +1843,7 @@ impl InterfaceInner {
                 .map_err(|error| match error {
                     IpOutputError::Exhausted => DispatchError::Exhausted,
                     IpOutputError::PolicyDrop => DispatchError::PolicyDrop,
+                    IpOutputError::MtuRetry(mtu) => DispatchError::MtuRetry(mtu),
                     IpOutputError::Unsupported
                     | IpOutputError::NoRoute
                     | IpOutputError::MtuExceeded => DispatchError::NoRoute,
@@ -2063,6 +2087,7 @@ impl InterfaceInner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum DispatchError {
+    MtuRetry(usize),
     /// The selected transmit backend has no capacity. The socket should retain
     /// the packet and retry after the device is polled again.
     Exhausted,

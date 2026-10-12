@@ -5,7 +5,7 @@ use crate::phy::{self, Device, DeviceCapabilities, Medium};
 use crate::time::Instant;
 use crate::wire::*;
 
-pub fn setup<'a>(medium: Medium) -> (Interface, SocketSet<'a>, TestingDevice) {
+pub fn setup<'a>(medium: Medium) -> (Interface, SocketSet<'a, 'a>, TestingDevice) {
     let mut device = TestingDevice::new(medium);
 
     let config = Config::new(match medium {

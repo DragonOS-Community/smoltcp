@@ -121,6 +121,8 @@ pub struct Socket<'a> {
     endpoint: IpListenEndpoint,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
+    rx_admission_limit: Option<usize>,
+    tx_admission_limit: Option<usize>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
     #[cfg(feature = "async")]
@@ -136,12 +138,37 @@ impl<'a> Socket<'a> {
             endpoint: IpListenEndpoint::default(),
             rx_buffer,
             tx_buffer,
+            rx_admission_limit: None,
+            tx_admission_limit: None,
             hop_limit: None,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
             tx_waker: WakerRegistration::new(),
         }
+    }
+
+    /// Borrow a pre-born replacement. Success leaves the real old backing in
+    /// the caller's candidate; failure leaves both sides wholly unchanged.
+    pub fn swap_prepared_receive_buffer(&mut self, replacement: &mut PacketBuffer<'a>) -> bool {
+        self.rx_buffer.swap_prepared(replacement)
+    }
+    pub fn swap_prepared_send_buffer(&mut self, replacement: &mut PacketBuffer<'a>) -> bool {
+        self.tx_buffer.swap_prepared(replacement)
+    }
+    pub fn set_receive_buffer_limit(&mut self, limit: usize) -> bool {
+        if limit > self.rx_buffer.payload_capacity() {
+            return false;
+        }
+        self.rx_admission_limit = Some(limit);
+        true
+    }
+    pub fn set_send_buffer_limit(&mut self, limit: usize) -> bool {
+        if limit > self.tx_buffer.payload_capacity() {
+            return false;
+        }
+        self.tx_admission_limit = Some(limit);
+        true
     }
 
     /// Register a waker for receive operations.
@@ -264,6 +291,9 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn can_send(&self) -> bool {
         !self.tx_buffer.is_full()
+            && self
+                .tx_admission_limit
+                .map_or(true, |limit| self.tx_buffer.payload_bytes_count() < limit)
     }
 
     /// Check whether the receive buffer is not empty.
@@ -319,6 +349,13 @@ impl<'a> Socket<'a> {
             return Err(SendError::Unaddressable);
         }
 
+        if self
+            .tx_admission_limit
+            .is_some_and(|limit| size > limit.saturating_sub(self.tx_buffer.payload_bytes_count()))
+        {
+            return Err(SendError::BufferFull);
+        }
+
         let payload_buf = self
             .tx_buffer
             .enqueue(size, meta)
@@ -358,6 +395,16 @@ impl<'a> Socket<'a> {
             return Err(SendError::Unaddressable);
         }
 
+        if max_size != 0
+            && self
+                .tx_admission_limit
+                .is_some_and(|limit| self.tx_buffer.payload_bytes_count() >= limit)
+        {
+            return Err(SendError::BufferFull);
+        }
+        let max_size = self.tx_admission_limit.map_or(max_size, |limit| {
+            max_size.min(limit.saturating_sub(self.tx_buffer.payload_bytes_count()))
+        });
         let size = self
             .tx_buffer
             .enqueue_with_infallible(max_size, meta, f)
@@ -503,6 +550,16 @@ impl<'a> Socket<'a> {
         debug_assert!(self.accepts(cx, ip_repr, repr));
 
         let size = payload.len();
+        if self
+            .rx_admission_limit
+            .is_some_and(|limit| size > limit.saturating_sub(self.rx_buffer.payload_bytes_count()))
+        {
+            net_trace!(
+                "udp:{}: receive limit reached, dropping packet",
+                self.endpoint
+            );
+            return;
+        }
 
         let remote_endpoint = IpEndpoint {
             addr: ip_repr.src_addr(),

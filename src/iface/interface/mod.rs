@@ -815,7 +815,7 @@ impl Interface {
         &mut self,
         timestamp: Instant,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'_, '_>,
     ) -> PollResult {
         self.poll_inner(
             timestamp,
@@ -835,7 +835,7 @@ impl Interface {
         &mut self,
         timestamp: Instant,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'_, '_>,
         filter: &mut dyn IpIngressFilter,
     ) -> PollResult {
         self.poll_inner(timestamp, device, sockets, Some(filter))
@@ -845,7 +845,7 @@ impl Interface {
         &mut self,
         timestamp: Instant,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'_, '_>,
         #[cfg(feature = "alloc")] mut filter: Option<&mut (dyn IpIngressFilter + '_)>,
     ) -> PollResult {
         self.inner.now = timestamp;
@@ -902,7 +902,7 @@ impl Interface {
         &mut self,
         timestamp: Instant,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'_, '_>,
     ) -> PollResult {
         self.inner.now = timestamp;
 
@@ -940,7 +940,7 @@ impl Interface {
         &mut self,
         timestamp: Instant,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'_, '_>,
     ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
         #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
@@ -963,7 +963,7 @@ impl Interface {
         &mut self,
         timestamp: Instant,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'_, '_>,
         filter: &mut dyn IpIngressFilter,
     ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
@@ -985,7 +985,7 @@ impl Interface {
     ///
     /// [poll]: #method.poll
     /// [Instant]: struct.Instant.html
-    pub fn poll_at(&mut self, timestamp: Instant, sockets: &SocketSet<'_>) -> Option<Instant> {
+    pub fn poll_at(&mut self, timestamp: Instant, sockets: &SocketSet<'_, '_>) -> Option<Instant> {
         self.inner.now = timestamp;
 
         #[cfg(feature = "_proto-fragmentation")]
@@ -1036,7 +1036,11 @@ impl Interface {
     ///
     /// [poll]: #method.poll
     /// [Duration]: struct.Duration.html
-    pub fn poll_delay(&mut self, timestamp: Instant, sockets: &SocketSet<'_>) -> Option<Duration> {
+    pub fn poll_delay(
+        &mut self,
+        timestamp: Instant,
+        sockets: &SocketSet<'_, '_>,
+    ) -> Option<Duration> {
         match self.poll_at(timestamp, sockets) {
             Some(poll_at) if timestamp < poll_at => Some(poll_at - timestamp),
             Some(_) => Some(Duration::from_millis(0)),
@@ -1047,7 +1051,7 @@ impl Interface {
     fn socket_ingress(
         &mut self,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'_, '_>,
         #[cfg(feature = "alloc")] mut filter: Option<&mut (dyn IpIngressFilter + '_)>,
     ) -> PollIngressSingleResult {
         let Some((rx_token, tx_token)) = device.receive(self.inner.now) else {
@@ -1162,7 +1166,7 @@ impl Interface {
     fn socket_egress(
         &mut self,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'_, '_>,
     ) -> PollResult {
         let _caps = device.capabilities();
         #[cfg(all(feature = "alloc", feature = "socket-tcp"))]

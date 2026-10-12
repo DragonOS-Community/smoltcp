@@ -497,6 +497,7 @@ pub struct Socket<'a> {
     rtte: RttEstimator,
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
+    rx_admission_limit: Option<usize>,
     rx_fin_received: bool,
     /// The local receive half has been shut down by the user.
     ///
@@ -505,6 +506,9 @@ pub struct Socket<'a> {
     /// connection instead of being queued indefinitely.
     rx_shutdown: bool,
     tx_buffer: SocketBuffer<'a>,
+    // Optional integration admission limit, independent of retained physical
+    // storage. Shrinking it never discards already queued transmit bytes.
+    tx_admission_limit: Option<usize>,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
     /// Interval at which keep-alive packets will be sent.
@@ -517,6 +521,9 @@ pub struct Socket<'a> {
     /// Optional IP version constraint for incoming connections. Unlike the listen
     /// endpoint, this is configuration and survives resetting the connection.
     listen_ip_version: Option<IpVersion>,
+    /// Explicit passive-open policies, selected from the actual admitted SYN
+    /// under protocol serialization, never from an external ingress snapshot.
+    listen_pmtu_policies: Option<[u8; 2]>,
     #[cfg(feature = "packetmeta-id")]
     listen_bound_device: Option<NonZeroU32>,
     #[cfg(feature = "packetmeta-id")]
@@ -539,8 +546,9 @@ pub struct Socket<'a> {
     /// The last acknowledgement number sent.
     /// I.e. in an idle socket, remote_seq_no+rx_buffer.len().
     remote_last_ack: Option<TcpSeqNumber>,
-    /// The last window length sent.
-    remote_last_win: u16,
+    /// Last advertised window in actual bytes. SYN windows are unscaled;
+    /// ordinary windows include the negotiated scale exactly once.
+    remote_last_win: usize,
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
@@ -720,7 +728,9 @@ impl<'a> Socket<'a> {
             rtte: RttEstimator::default(),
             assembler: Assembler::new(),
             tx_buffer,
+            tx_admission_limit: None,
             rx_buffer,
+            rx_admission_limit: None,
             rx_fin_received: false,
             rx_shutdown: false,
             timeout: None,
@@ -728,6 +738,7 @@ impl<'a> Socket<'a> {
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
             listen_ip_version: None,
+            listen_pmtu_policies: None,
             #[cfg(feature = "packetmeta-id")]
             listen_bound_device: None,
             #[cfg(feature = "packetmeta-id")]
@@ -780,13 +791,199 @@ impl<'a> Socket<'a> {
     }
 
     #[cfg(feature = "alloc")]
-    pub fn set_send_buffer_size(&mut self, size: usize) {
-        self.tx_buffer.resize(size, 0);
+    pub fn set_send_buffer_size(
+        &mut self,
+        size: usize,
+    ) -> Result<(), crate::storage::OwnedBufferResizeError> {
+        self.tx_buffer.resize(size, 0)
     }
 
     #[cfg(feature = "alloc")]
-    pub fn set_recv_buffer_size(&mut self, size: usize) {
-        self.rx_buffer.resize(size, 0);
+    pub fn set_recv_buffer_size(
+        &mut self,
+        size: usize,
+    ) -> Result<(), crate::storage::OwnedBufferResizeError> {
+        self.rx_buffer.resize(size, 0)
+    }
+
+    /// Atomically install empty, preallocated receive/transmit storage.
+    /// Failure returns both candidates unchanged and preserves the socket.
+    /// Success returns the old rings for retirement outside integration locks.
+    /// RX copies include reassembly bytes beyond the readable queue; neither
+    /// sequence state nor the assembler is reset by a capacity update.
+    pub fn replace_prepared_buffers(
+        &mut self,
+        rx: SocketBuffer<'a>,
+        tx: SocketBuffer<'a>,
+    ) -> Result<(SocketBuffer<'a>, SocketBuffer<'a>), (SocketBuffer<'a>, SocketBuffer<'a>)> {
+        let rx_preserve = self.rx_buffer.len()
+            + self
+                .assembler
+                .iter_data(0)
+                .map(|(_, end)| end)
+                .max()
+                .unwrap_or(0);
+        let tx_preserve = self.tx_buffer.len();
+        if !rx.is_empty()
+            || !tx.is_empty()
+            || rx.capacity() < rx_preserve
+            || rx.capacity() < self.receive_storage_min_capacity()
+            || tx.capacity() < tx_preserve
+            || rx.capacity() as u64 > (1u64 << 30)
+        {
+            return Err((rx, tx));
+        }
+        let old_rx = self
+            .rx_buffer
+            .replace_prepared(rx, rx_preserve)
+            .unwrap_or_else(|_| unreachable!("prevalidated receive storage"));
+        let old_tx = self
+            .tx_buffer
+            .replace_prepared(tx, tx_preserve)
+            .unwrap_or_else(|_| unreachable!("prevalidated transmit storage"));
+        Ok((old_rx, old_tx))
+    }
+
+    /// Install only prepared receive storage, preserving readable bytes and
+    /// all out-of-order reassembly bytes. A rejected candidate is unchanged.
+    /// The returned old storage must be retired outside integration locks.
+    pub fn replace_prepared_receive_buffer(
+        &mut self,
+        rx: SocketBuffer<'a>,
+    ) -> Result<SocketBuffer<'a>, SocketBuffer<'a>> {
+        let preserve = self.rx_buffer.len()
+            + self
+                .assembler
+                .iter_data(0)
+                .map(|(_, end)| end)
+                .max()
+                .unwrap_or(0);
+        if rx.capacity() as u64 > (1u64 << 30)
+            || rx.capacity() < self.receive_storage_min_capacity()
+        {
+            return Err(rx);
+        }
+        self.rx_buffer.replace_prepared(rx, preserve)
+    }
+
+    /// Install only prepared transmit storage without allocating or retiring
+    /// backing storage. Failure preserves both the candidate and socket.
+    pub fn replace_prepared_send_buffer(
+        &mut self,
+        tx: SocketBuffer<'a>,
+    ) -> Result<SocketBuffer<'a>, SocketBuffer<'a>> {
+        self.tx_buffer.replace_prepared(tx, self.tx_buffer.len())
+    }
+
+    /// Restrict future enqueue operations without discarding queued data or
+    /// resizing retained physical storage. Return false without mutation when
+    /// the requested limit is not supported by the actual backing capacity.
+    pub fn set_send_buffer_limit(&mut self, limit: usize) -> bool {
+        if limit > self.tx_buffer.capacity() {
+            return false;
+        }
+        self.tx_admission_limit = Some(limit);
+        true
+    }
+
+    pub fn send_buffer_limit(&self) -> usize {
+        self.tx_admission_limit.unwrap_or(self.tx_buffer.capacity())
+    }
+
+    pub fn receive_buffer_limit(&self) -> usize {
+        self.rx_admission_limit.unwrap_or(self.rx_buffer.capacity())
+    }
+
+    fn send_window(&self) -> usize {
+        self.tx_buffer
+            .window()
+            .min(self.tx_admission_limit.map_or(usize::MAX, |limit| {
+                limit.saturating_sub(self.tx_buffer.len())
+            }))
+    }
+
+    /// Enable logical receive admission before the first open, then update
+    /// its limit independently of retained backing. Already advertised space
+    /// remains valid. First enabling on an existing connection is rejected.
+    pub fn set_receive_buffer_limit(&mut self, limit: usize) -> bool {
+        if limit > self.rx_buffer.capacity()
+            || (self.rx_admission_limit.is_none()
+                && (self.state != State::Closed || self.remote_last_ack.is_some()))
+        {
+            return false;
+        }
+        self.rx_admission_limit = Some(limit);
+        true
+    }
+
+    fn receive_slack(&self) -> usize {
+        if self.rx_admission_limit.is_some() {
+            (1usize << self.remote_win_shift) - 1
+        } else {
+            0
+        }
+    }
+
+    fn desired_receive_window(&self) -> usize {
+        match self.rx_admission_limit {
+            None => self.rx_buffer.window(),
+            Some(limit) => limit
+                .saturating_sub(self.rx_buffer.len())
+                .min(self.rx_buffer.window().saturating_sub(self.receive_slack())),
+        }
+    }
+
+    fn promised_receive_window(&self) -> usize {
+        let Some(ack) = self.remote_last_ack else {
+            return 0;
+        };
+        let edge = ack + self.remote_last_win;
+        let next = self.remote_seq_no + self.rx_buffer.len();
+        if edge > next {
+            edge - next
+        } else {
+            0
+        }
+    }
+
+    fn receive_storage_min_capacity(&self) -> usize {
+        let Some(ack) = self.remote_last_ack else {
+            return 0;
+        };
+        let edge = ack + self.remote_last_win;
+        if edge > self.remote_seq_no {
+            (edge - self.remote_seq_no) + self.receive_slack()
+        } else {
+            0
+        }
+    }
+
+    fn remember_advertised_window(&mut self, repr: &TcpRepr<'_>) {
+        self.remote_last_ack = repr.ack_number;
+        self.remote_last_win = Self::advertised_window_bytes(repr, self.remote_win_shift);
+    }
+
+    fn advertised_window_bytes(repr: &TcpRepr<'_>, shift: u8) -> usize {
+        if repr.control == TcpControl::Syn {
+            usize::from(repr.window_len)
+        } else {
+            usize::from(repr.window_len) << shift
+        }
+    }
+
+    /// Mutate integration metadata under the caller's exclusive socket guard,
+    /// e.g. committing pending -> accepted ownership without moving data.
+    #[cfg(feature = "alloc")]
+    pub fn owned_buffer_storage_mut(
+        &mut self,
+    ) -> (
+        Option<&mut (dyn crate::storage::OwnedBuffer<u8> + 'a)>,
+        Option<&mut (dyn crate::storage::OwnedBuffer<u8> + 'a)>,
+    ) {
+        (
+            self.rx_buffer.owned_storage_mut(),
+            self.tx_buffer.owned_storage_mut(),
+        )
     }
 
     /// Enable or disable TCP Timestamp.
@@ -964,6 +1161,17 @@ impl<'a> Socket<'a> {
         self.pmtu_discover
     }
 
+    /// Configure independent IPv4/IPv6 policies for future passive opens.
+    /// Both values are validated before modifying any configuration. Existing
+    /// pending/established connections keep their already-selected policy.
+    pub fn set_listen_pmtu_policies(&mut self, policies: [u8; 2]) -> Result<(), PmtuDiscoverError> {
+        if policies.iter().any(|value| *value > 5) {
+            return Err(PmtuDiscoverError);
+        }
+        self.listen_pmtu_policies = Some(policies);
+        Ok(())
+    }
+
     pub fn output_ip_mtu(&self) -> Option<usize> {
         self.output_ip_mtu
     }
@@ -1058,7 +1266,16 @@ impl<'a> Socket<'a> {
     /// Used in internal calculations as well as packet generation.
     #[inline]
     fn scaled_window(&self) -> u16 {
-        u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+        let mut window = self.desired_receive_window();
+        if self.rx_admission_limit.is_some() {
+            let scale = 1usize << self.remote_win_shift;
+            window = window.max(self.promised_receive_window().div_ceil(scale) * scale);
+            // Pre-open slack and prepared storage validation preserve this
+            // invariant even when next_ack is not scale-aligned. Clamping then
+            // rounding down here would revoke an already advertised edge.
+            debug_assert!(window <= self.rx_buffer.window());
+        }
+        u16::try_from(window >> self.remote_win_shift).unwrap_or(u16::MAX)
     }
 
     /// Return the last window field value, including scaling according to RFC 1323.
@@ -1074,7 +1291,7 @@ impl<'a> Socket<'a> {
         let last_ack = self.remote_last_ack?;
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
 
-        let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
+        let last_win = self.remote_last_win;
         let window_edge = last_ack + last_win;
         if next_ack > window_edge {
             return Some(0);
@@ -1613,7 +1830,7 @@ impl<'a> Socket<'a> {
             return false;
         }
 
-        !self.tx_buffer.is_full()
+        self.send_window() != 0
     }
 
     /// Return the maximum number of bytes inside the recv buffer.
@@ -1641,14 +1858,15 @@ impl<'a> Socket<'a> {
 
     fn send_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
     where
-        F: FnOnce(&'b mut SocketBuffer<'a>) -> (usize, R),
+        F: FnOnce(&'b mut SocketBuffer<'a>, usize) -> (usize, R),
     {
         if !self.may_send() {
             return Err(SendError::InvalidState);
         }
 
         let old_length = self.tx_buffer.len();
-        let (size, result) = f(&mut self.tx_buffer);
+        let window = self.send_window();
+        let (size, result) = f(&mut self.tx_buffer, window);
         if size > 0 {
             // The connection might have been idle for a long time, and so remote_last_ts
             // would be far in the past. Unless we clear it here, we'll abort the connection
@@ -1676,7 +1894,17 @@ impl<'a> Socket<'a> {
     where
         F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
-        self.send_impl(|tx_buffer| tx_buffer.enqueue_many_with(f))
+        self.send_impl(|tx_buffer, window| {
+            tx_buffer.enqueue_many_with(|slice| {
+                let available = slice.len().min(window);
+                let (size, result) = f(&mut slice[..available]);
+                assert!(
+                    size <= available,
+                    "enqueue count exceeds offered send slice"
+                );
+                (size, result)
+            })
+        })
     }
 
     /// Enqueue a sequence of octets to be sent, and fill it from a slice.
@@ -1686,8 +1914,8 @@ impl<'a> Socket<'a> {
     ///
     /// See also [send](#method.send).
     pub fn send_slice(&mut self, data: &[u8]) -> Result<usize, SendError> {
-        self.send_impl(|tx_buffer| {
-            let size = tx_buffer.enqueue_slice(data);
+        self.send_impl(|tx_buffer, window| {
+            let size = tx_buffer.enqueue_slice(&data[..data.len().min(window)]);
             (size, size)
         })
     }
@@ -1865,13 +2093,12 @@ impl<'a> Socket<'a> {
         // to be received.
         reply_repr.seq_number = self.remote_last_seq;
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
-        self.remote_last_ack = reply_repr.ack_number;
 
         // From RFC 1323:
         // The window field [...] of every outgoing segment, with the exception of SYN
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
-        self.remote_last_win = reply_repr.window_len;
+        self.remember_advertised_window(&reply_repr);
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -2405,6 +2632,15 @@ impl<'a> Socket<'a> {
                     self.remote_mss = max_seg_size as usize
                 }
 
+                if let Some(policies) = self.listen_pmtu_policies {
+                    self.pmtu_discover = policies[match ip_repr {
+                        #[cfg(feature = "proto-ipv4")]
+                        IpRepr::Ipv4(_) => 0,
+                        #[cfg(feature = "proto-ipv6")]
+                        IpRepr::Ipv6(_) => 1,
+                    }];
+                }
+
                 #[cfg(feature = "packetmeta-id")]
                 {
                     self.connection_bound_device = self.listen_bound_device;
@@ -2893,11 +3129,10 @@ impl<'a> Socket<'a> {
     /// <https://elixir.bootlin.com/linux/v6.9.9/source/net/ipv4/tcp.c#L1472>.
     fn window_to_update(&self) -> bool {
         match self.state {
-            State::SynSent
-            | State::SynReceived
-            | State::Established
-            | State::FinWait1
-            | State::FinWait2 => {
+            // SYN windows are unscaled and the handshake is driven by SYN
+            // sequence/timer state, not ordinary scaled ACK window updates.
+            // Comparing those two wire formats could spuriously resend SYNACK.
+            State::Established | State::FinWait1 | State::FinWait2 => {
                 let new_win = self.scaled_window();
                 if let Some(last_win) = self.last_scaled_window() {
                     new_win > 0 && new_win / 2 >= last_win
@@ -3162,7 +3397,7 @@ impl<'a> Socket<'a> {
                 repr.control = TcpControl::Syn;
                 repr.seq_number = self.local_seq_no;
                 // window len must NOT be scaled in SYNs.
-                repr.window_len = u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
+                repr.window_len = u16::try_from(self.desired_receive_window()).unwrap_or(u16::MAX);
                 if self.state == State::SynSent {
                     repr.ack_number = None;
                     repr.window_scale = Some(self.remote_win_shift);
@@ -3368,7 +3603,7 @@ impl<'a> Socket<'a> {
             }
         }
         self.remote_last_ack = repr.ack_number;
-        self.remote_last_win = repr.window_len;
+        self.remote_last_win = Self::advertised_window_bytes(&repr, self.remote_win_shift);
 
         if repr.segment_len() > 0 {
             self.rtte
@@ -3785,7 +4020,7 @@ mod test {
         s.local_seq_no = LOCAL_SEQ + 1;
         s.remote_last_seq = LOCAL_SEQ + 1;
         s.remote_last_ack = Some(REMOTE_SEQ + 1);
-        s.remote_last_win = s.scaled_window();
+        s.remote_last_win = usize::from(s.scaled_window()) << s.remote_win_shift;
         s
     }
 
@@ -4543,6 +4778,86 @@ mod test {
             }
         );
         sanity!(s, socket_syn_received());
+    }
+
+    #[test]
+    fn test_passive_pmtu_policy_validation_is_atomic_and_pending_is_stable() {
+        let mut s = socket_listen();
+        s.set_pmtu_discover(5).unwrap();
+        s.set_listen_pmtu_policies([1, 2]).unwrap();
+        assert_eq!(s.set_listen_pmtu_policies([3, 6]), Err(PmtuDiscoverError));
+        assert_eq!(s.listen_pmtu_policies, Some([1, 2]));
+        let invalid = TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            max_seg_size: Some(0),
+            ..SEND_TEMPL
+        };
+        send(&mut s, Instant::ZERO, &invalid);
+        assert_eq!(s.state, State::Listen);
+        assert_eq!(s.pmtu_discover(), 5);
+        let valid = TcpRepr {
+            max_seg_size: Some(BASE_MSS),
+            ..invalid
+        };
+        send(&mut s, Instant::ZERO, &valid);
+        assert_eq!(s.state, State::SynReceived);
+        let expected = match LOCAL_END.addr {
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(_) => 1,
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(_) => 2,
+        };
+        assert_eq!(s.pmtu_discover(), expected);
+        s.set_listen_pmtu_policies([3, 4]).unwrap();
+        assert_eq!(s.pmtu_discover(), expected);
+    }
+
+    #[test]
+    #[cfg(all(feature = "proto-ipv4", feature = "proto-ipv6"))]
+    fn test_dual_stack_passive_pmtu_uses_actual_matching_syn_family() {
+        for ipv6 in [false, true] {
+            let mut s = socket_listen();
+            s.listen_endpoint.addr = None;
+            s.set_listen_pmtu_policies([0, 2]).unwrap();
+            let repr = TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                max_seg_size: Some(1200),
+                ..SEND_TEMPL
+            };
+            let ip = if ipv6 {
+                IpRepr::Ipv6(crate::wire::Ipv6Repr {
+                    src_addr: crate::wire::Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 2),
+                    dst_addr: crate::wire::Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+                    next_header: IpProtocol::Tcp,
+                    payload_len: repr.buffer_len(),
+                    hop_limit: 64,
+                })
+            } else {
+                IpRepr::Ipv4(crate::wire::Ipv4Repr {
+                    src_addr: crate::wire::Ipv4Address::new(192, 0, 2, 2),
+                    dst_addr: crate::wire::Ipv4Address::new(192, 0, 2, 1),
+                    next_header: IpProtocol::Tcp,
+                    payload_len: repr.buffer_len(),
+                    hop_limit: 64,
+                })
+            };
+            assert!(s.socket.accepts(&mut s.cx, &ip, &repr));
+            s.socket.process(&mut s.cx, &ip, &repr);
+            assert_eq!(s.state, State::SynReceived);
+            assert_eq!(s.pmtu_discover(), if ipv6 { 2 } else { 0 });
+            assert_eq!(
+                s.local_endpoint().unwrap().addr.version(),
+                if ipv6 {
+                    IpVersion::Ipv6
+                } else {
+                    IpVersion::Ipv4
+                }
+            );
+        }
     }
 
     #[test]
@@ -5711,7 +6026,7 @@ mod test {
         s.rx_buffer = SocketBuffer::new(vec![0; 262143]);
         s.assembler = Assembler::new();
         s.remote_win_scale = Some(0);
-        s.remote_last_win = 65535;
+        s.remote_last_win = 65535 << 2;
         s.remote_win_shift = 2;
 
         // Create a TCP segment that will mostly fill an IP frame.
@@ -8332,7 +8647,7 @@ mod test {
             }]
         );
         // Test that `dispatch` updates `remote_last_win`
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
+        assert_eq!(s.remote_last_win, s.rx_buffer.window());
         s.recv(|buffer| (buffer.len(), ())).unwrap();
         assert!(s.window_to_update());
         recv!(
@@ -8344,7 +8659,7 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
+        assert_eq!(s.remote_last_win, s.rx_buffer.window());
         // Provoke immediate ACK to test that `process` updates `remote_last_win`
         send!(
             s,
@@ -8376,7 +8691,7 @@ mod test {
                 ..RECV_TEMPL
             })
         );
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
+        assert_eq!(s.remote_last_win, s.rx_buffer.window());
         s.recv(|buffer| (buffer.len(), ())).unwrap();
         assert!(s.window_to_update());
     }
@@ -8818,8 +9133,8 @@ mod test {
     #[cfg(feature = "alloc")]
     fn test_set_buffer_size_updates_capacity() {
         let mut s = socket_established();
-        s.set_send_buffer_size(128);
-        s.set_recv_buffer_size(256);
+        s.set_send_buffer_size(128).unwrap();
+        s.set_recv_buffer_size(256).unwrap();
         assert_eq!(s.tx_buffer.capacity(), 128);
         assert_eq!(s.rx_buffer.capacity(), 256);
     }
@@ -8829,8 +9144,207 @@ mod test {
     fn test_set_send_buffer_size_does_not_shrink_below_length() {
         let mut s = socket_established_with_buffer_sizes(16, 64);
         assert_eq!(s.send_slice(b"abcdef"), Ok(6));
-        s.set_send_buffer_size(4);
+        s.set_send_buffer_size(4).unwrap();
         assert_eq!(s.tx_buffer.capacity(), 16);
+    }
+
+    #[test]
+    fn test_logical_send_shrink_retains_data_and_restricts_both_enqueue_apis() {
+        let mut s = socket_established_with_buffer_sizes(16, 64);
+        assert_eq!(s.send_slice(b"abcdef"), Ok(6));
+        assert!(s.set_send_buffer_limit(4));
+        assert_eq!(s.send_queue(), 6);
+        assert_eq!(s.send_capacity(), 16);
+        assert!(!s.can_send());
+        assert_eq!(s.send_slice(b"extra"), Ok(0));
+        assert_eq!(
+            s.send(|bytes| {
+                assert!(bytes.is_empty());
+                (0, ())
+            }),
+            Ok(())
+        );
+        let _ = s.tx_buffer.dequeue_many(4);
+        assert!(s.can_send());
+        assert_eq!(s.send_slice(b"12345"), Ok(2));
+        let mut bytes = [0; 4];
+        assert_eq!(s.tx_buffer.read_allocated(0, &mut bytes), 4);
+        assert_eq!(&bytes, b"ef12");
+        let _ = s.tx_buffer.dequeue_many(2);
+        assert_eq!(
+            s.send(|bytes| {
+                assert_eq!(bytes.len(), 2);
+                bytes.copy_from_slice(b"XY");
+                (2, 17)
+            }),
+            Ok(17)
+        );
+        assert!(!s.set_send_buffer_limit(17));
+        assert!(!s.can_send());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_logical_receive_syn_window_unaligned_ack_and_wrap() {
+        for base in [TcpSeqNumber(1000), TcpSeqNumber(i32::MAX - 5)] {
+            let mut s = Socket::new(
+                SocketBuffer::new(vec![0; 131072]),
+                SocketBuffer::new(vec![0; 16]),
+            );
+            assert_eq!(s.remote_win_shift, 2);
+            assert!(s.set_receive_buffer_limit(131072));
+            assert_eq!(s.desired_receive_window(), 131069);
+            s.remote_seq_no = base;
+            s.state = State::SynReceived;
+            let syn = TcpRepr {
+                control: TcpControl::Syn,
+                ack_number: Some(base),
+                window_len: 65535,
+                ..RECV_TEMPL
+            };
+            s.remember_advertised_window(&syn);
+            assert_eq!(s.remote_last_win, 65535, "SYN window must not be scaled");
+            let original_edge = base + s.remote_last_win;
+            s.state = State::Established;
+            let _ = s.rx_buffer.enqueue_slice(b"q");
+            assert!(s.set_receive_buffer_limit(1));
+            let window = usize::from(s.scaled_window()) << s.remote_win_shift;
+            let ack = base + s.rx_buffer.len();
+            assert!(ack + window >= original_edge);
+            assert!(window <= s.rx_buffer.window());
+            let update = TcpRepr {
+                control: TcpControl::None,
+                ack_number: Some(ack),
+                window_len: s.scaled_window(),
+                ..RECV_TEMPL
+            };
+            s.remember_advertised_window(&update);
+            assert_eq!(s.remote_last_win, window);
+            let promised_capacity = s.receive_storage_min_capacity();
+            let candidate = SocketBuffer::new(vec![0; promised_capacity - 1]);
+            assert_eq!(
+                s.replace_prepared_receive_buffer(candidate)
+                    .unwrap_err()
+                    .capacity(),
+                promised_capacity - 1
+            );
+            let _ = s.rx_buffer.enqueue_slice(&vec![7; window]);
+            assert_eq!(
+                s.scaled_window(),
+                0,
+                "promise converges without discarding queued bytes"
+            );
+            assert_eq!(s.rx_buffer.len(), window + 1);
+        }
+        let mut existing = socket_established();
+        assert!(
+            !existing.set_receive_buffer_limit(1),
+            "first activation is pre-open only"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_prepared_buffers_preserve_wrapped_data_and_reassembly() {
+        let mut s = socket_established_with_buffer_sizes(16, 16);
+        let _ = s.rx_buffer.enqueue_slice(b"abcdefghijklmn");
+        let _ = s.rx_buffer.dequeue_many(12);
+        let _ = s.rx_buffer.enqueue_slice(b"op");
+        // The assembler is relative to the unallocated window, not read_at.
+        let _ = s.rx_buffer.write_unallocated(3, b"XYZ");
+        s.assembler.add(3, 3).unwrap();
+        let _ = s.tx_buffer.enqueue_slice(b"abcdefghijklmn");
+        let _ = s.tx_buffer.dequeue_many(12);
+        let _ = s.tx_buffer.enqueue_slice(b"opqrst");
+        let before_seq = (s.local_seq_no, s.remote_seq_no, s.remote_last_seq);
+        let old = s
+            .replace_prepared_buffers(
+                SocketBuffer::new(vec![0; 32]),
+                SocketBuffer::new(vec![0; 32]),
+            )
+            .unwrap();
+        assert_eq!(old.0.capacity(), 16);
+        assert_eq!(old.1.capacity(), 16);
+        let mut bytes = [0u8; 8];
+        assert_eq!(s.rx_buffer.read_allocated(0, &mut bytes), 4);
+        assert_eq!(&bytes[..4], b"mnop");
+        assert_eq!(s.tx_buffer.read_allocated(0, &mut bytes), 8);
+        assert_eq!(&bytes, b"mnopqrst");
+        assert_eq!(s.assembler.iter_data(0).collect::<Vec<_>>(), vec![(3, 6)]);
+        let _ = s.rx_buffer.write_unallocated(0, b"123");
+        assert_eq!(s.assembler.add_then_remove_front(0, 3), Ok(6));
+        s.rx_buffer.enqueue_unallocated(6);
+        let mut received = [0u8; 10];
+        assert_eq!(s.rx_buffer.read_allocated(0, &mut received), 10);
+        assert_eq!(&received, b"mnop123XYZ");
+        assert_eq!(
+            before_seq,
+            (s.local_seq_no, s.remote_seq_no, s.remote_last_seq)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_single_axis_prepared_buffers_preserve_other_storage_and_holes() {
+        let mut s = socket_established_with_buffer_sizes(16, 16);
+        let _ = s.rx_buffer.enqueue_slice(b"abcdefghijklmn");
+        let _ = s.rx_buffer.dequeue_many(12);
+        let _ = s.rx_buffer.enqueue_slice(b"op");
+        let _ = s.rx_buffer.write_unallocated(3, b"XYZ");
+        s.assembler.add(3, 3).unwrap();
+        let _ = s.tx_buffer.enqueue_slice(b"abcdefghijklmn");
+        let _ = s.tx_buffer.dequeue_many(12);
+        let _ = s.tx_buffer.enqueue_slice(b"opqrst");
+        let tx_ptr = s.tx_buffer.get_unallocated(0, 0).as_ptr();
+        let old_rx = s
+            .replace_prepared_receive_buffer(SocketBuffer::new(vec![0; 32]))
+            .unwrap();
+        assert_eq!(old_rx.capacity(), 16);
+        assert_eq!(s.tx_buffer.get_unallocated(0, 0).as_ptr(), tx_ptr);
+        assert_eq!(s.assembler.iter_data(0).collect::<Vec<_>>(), vec![(3, 6)]);
+        let rx_ptr = s.rx_buffer.get_unallocated(0, 0).as_ptr();
+        let old_tx = s
+            .replace_prepared_send_buffer(SocketBuffer::new(vec![0; 32]))
+            .unwrap();
+        assert_eq!(old_tx.capacity(), 16);
+        assert_eq!(s.rx_buffer.get_unallocated(0, 0).as_ptr(), rx_ptr);
+        let mut bytes = [0; 8];
+        assert_eq!(s.tx_buffer.read_allocated(0, &mut bytes), 8);
+        assert_eq!(&bytes, b"mnopqrst");
+        let candidate = s
+            .replace_prepared_receive_buffer(SocketBuffer::new(vec![0; 9]))
+            .unwrap_err();
+        assert_eq!(candidate.capacity(), 9);
+        assert!(candidate.is_empty());
+        assert_eq!(s.rx_buffer.capacity(), 32);
+        assert_eq!(s.assembler.iter_data(0).collect::<Vec<_>>(), vec![(3, 6)]);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_prepared_buffers_reject_both_atomically() {
+        let mut s = socket_established_with_buffer_sizes(16, 16);
+        let _ = s.rx_buffer.enqueue_slice(b"read");
+        let _ = s.rx_buffer.write_unallocated(4, b"HOLE");
+        s.assembler.add(4, 4).unwrap();
+        let _ = s.tx_buffer.enqueue_slice(b"transmit");
+        for (rx_size, tx_size, nonempty) in [(11, 16, false), (16, 7, false), (16, 16, true)] {
+            let mut rx = SocketBuffer::new(vec![0; rx_size]);
+            let tx = SocketBuffer::new(vec![0; tx_size]);
+            if nonempty {
+                let _ = rx.enqueue_slice(b"candidate");
+            }
+            let candidates = s.replace_prepared_buffers(rx, tx).unwrap_err();
+            assert_eq!(candidates.0.capacity(), rx_size);
+            assert_eq!(candidates.1.capacity(), tx_size);
+            assert_eq!(candidates.0.len(), if nonempty { 9 } else { 0 });
+            assert_eq!((s.rx_buffer.capacity(), s.tx_buffer.capacity()), (16, 16));
+            let mut bytes = [0; 8];
+            assert_eq!(s.tx_buffer.read_allocated(0, &mut bytes), 8);
+            assert_eq!(&bytes, b"transmit");
+            assert_eq!(s.rx_buffer.len(), 4);
+            assert_eq!(s.assembler.iter_data(0).collect::<Vec<_>>(), vec![(4, 8)]);
+        }
     }
 
     // =========================================================================================//

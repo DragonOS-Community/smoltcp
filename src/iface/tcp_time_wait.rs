@@ -71,7 +71,7 @@ impl TimeWaitTable {
     }
 }
 
-impl<'a> SocketSet<'a> {
+impl<'storage, 'a: 'storage> SocketSet<'storage, 'a> {
     pub fn has_tcp_time_wait(&self) -> bool {
         !self.time_wait.entries.is_empty()
     }

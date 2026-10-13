@@ -46,6 +46,45 @@ pub struct PacketBuffer<'a, H: 'a> {
 }
 
 impl<'a, H> PacketBuffer<'a, H> {
+    /// Replace preallocated storage without changing queued packet identity or
+    /// destroying backing. Padding descriptions and their occupied bytes are
+    /// part of the logical sequence and must travel together.
+    pub fn swap_prepared(&mut self, replacement: &mut Self) -> bool
+    where
+        H: Copy,
+    {
+        if !replacement.metadata_ring.is_empty()
+            || !replacement.payload_ring.is_empty()
+            || replacement.metadata_ring.capacity() < self.metadata_ring.len()
+            || replacement.payload_ring.capacity() < self.payload_ring.len()
+        {
+            return false;
+        }
+        let metadata_len = self.metadata_ring.len();
+        let payload_len = self.payload_ring.len();
+        // Both validations above precede either mutation. Each operation is
+        // infallible now, and the original owners remain in `replacement`.
+        assert!(self
+            .metadata_ring
+            .swap_prepared(&mut replacement.metadata_ring, metadata_len));
+        assert!(self
+            .payload_ring
+            .swap_prepared(&mut replacement.payload_ring, payload_len));
+        true
+    }
+
+    /// Consume independently owned metadata and payload allocations. Their
+    /// owners remain in the actual rings through every socket/queue move.
+    #[cfg(feature = "alloc")]
+    pub fn from_owned(
+        metadata: alloc::boxed::Box<dyn super::OwnedBuffer<PacketMetadata<H>> + 'a>,
+        payload: alloc::boxed::Box<dyn super::OwnedBuffer<u8> + 'a>,
+    ) -> Self {
+        Self {
+            metadata_ring: RingBuffer::from_owned(metadata),
+            payload_ring: RingBuffer::from_owned(payload),
+        }
+    }
     /// Create a new packet buffer with the provided metadata and payload storage.
     ///
     /// Metadata storage limits the maximum _number_ of packets in the buffer and payload

@@ -11,7 +11,10 @@ mod ring_buffer;
 
 pub use self::assembler::Assembler;
 pub use self::packet_buffer::{PacketBuffer, PacketMetadata};
+pub(crate) use self::ring_buffer::BufferStorage;
 pub use self::ring_buffer::RingBuffer;
+#[cfg(feature = "alloc")]
+pub use self::ring_buffer::{OwnedBuffer, OwnedBufferResizeError};
 
 /// A trait for setting a value to a known state.
 ///

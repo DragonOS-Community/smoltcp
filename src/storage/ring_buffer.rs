@@ -3,13 +3,67 @@
 // [RFC 1940]: https://github.com/rust-lang/rust/issues/43302
 
 #[cfg(feature = "alloc")]
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::cmp;
+use core::ops::{Deref, DerefMut};
 use managed::ManagedSlice;
 
 use crate::storage::Resettable;
 
 use super::{Empty, Full};
+
+/// Integration-owned allocation whose destruction releases its storage.
+/// Keeping this owner inside the ring ties any allocation receipt to the
+/// physical backing, rather than to a socket handle or lifecycle observer.
+#[cfg(feature = "alloc")]
+pub trait OwnedBuffer<T>: AsRef<[T]> + AsMut<[T]> + core::fmt::Debug + Send + Sync {
+    /// Standard access to integration metadata in the actual storage owner.
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any;
+}
+
+#[cfg(feature = "alloc")]
+impl<T, B> OwnedBuffer<T> for B
+where
+    B: AsRef<[T]> + AsMut<[T]> + core::fmt::Debug + Send + Sync + 'static,
+{
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+}
+
+/// Integration-owned storage must be replaced through a preallocated swap,
+/// not resized by an allocator hidden inside a socket/resource lock.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnedBufferResizeError;
+
+#[derive(Debug)]
+pub(crate) enum BufferStorage<'a, T> {
+    Managed(ManagedSlice<'a, T>),
+    #[cfg(feature = "alloc")]
+    Owned(Box<dyn OwnedBuffer<T> + 'a>),
+}
+
+impl<T> Deref for BufferStorage<'_, T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Managed(storage) => storage,
+            #[cfg(feature = "alloc")]
+            Self::Owned(storage) => storage.as_ref().as_ref(),
+        }
+    }
+}
+
+impl<T> DerefMut for BufferStorage<'_, T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        match self {
+            Self::Managed(storage) => storage,
+            #[cfg(feature = "alloc")]
+            Self::Owned(storage) => storage.as_mut().as_mut(),
+        }
+    }
+}
 
 /// A ring buffer.
 ///
@@ -27,7 +81,7 @@ use super::{Empty, Full};
 /// of UDP packets, and advanced ones such as a TCP reassembly buffer.
 #[derive(Debug)]
 pub struct RingBuffer<'a, T: 'a> {
-    storage: ManagedSlice<'a, T>,
+    storage: BufferStorage<'a, T>,
     read_at: usize,
     length: usize,
 }
@@ -41,10 +95,72 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
         S: Into<ManagedSlice<'a, T>>,
     {
         RingBuffer {
-            storage: storage.into(),
+            storage: BufferStorage::Managed(storage.into()),
             read_at: 0,
             length: 0,
         }
+    }
+
+    /// Consume preallocated integration-owned storage without allocating.
+    #[cfg(feature = "alloc")]
+    pub fn from_owned(storage: Box<dyn OwnedBuffer<T> + 'a>) -> Self {
+        Self {
+            storage: BufferStorage::Owned(storage),
+            read_at: 0,
+            length: 0,
+        }
+    }
+
+    /// Borrow integration metadata without moving or resizing its backing.
+    /// ManagedSlice (including borrowed storage) has no such owner.
+    #[cfg(feature = "alloc")]
+    pub fn owned_storage_mut(&mut self) -> Option<&mut (dyn OwnedBuffer<T> + 'a)> {
+        match &mut self.storage {
+            BufferStorage::Owned(storage) => Some(storage.as_mut()),
+            BufferStorage::Managed(_) => None,
+        }
+    }
+
+    /// Move valid logical storage (including TCP's out-of-order receive
+    /// region) into an empty prepared ring. No allocation or destruction of
+    /// the original backing occurs: the caller receives it on success.
+    pub(crate) fn replace_prepared(
+        &mut self,
+        mut replacement: Self,
+        preserve: usize,
+    ) -> Result<Self, Self>
+    where
+        T: Copy,
+    {
+        if self.swap_prepared(&mut replacement, preserve) {
+            Ok(replacement)
+        } else {
+            Err(replacement)
+        }
+    }
+
+    /// Borrowed preparation keeps both success-retired and rejected physical
+    /// owners with the caller; no resource guard needs to destroy a candidate.
+    pub(crate) fn swap_prepared(&mut self, replacement: &mut Self, preserve: usize) -> bool
+    where
+        T: Copy,
+    {
+        if !replacement.is_empty()
+            || preserve < self.length
+            || preserve > self.capacity()
+            || preserve > replacement.capacity()
+        {
+            return false;
+        }
+        // Empty rings may have a nonzero cursor after a previous dequeue.
+        // Copying to index zero requires publishing that same logical origin.
+        replacement.read_at = 0;
+        for offset in 0..preserve {
+            replacement.storage[offset] = self.storage[self.get_idx(offset)];
+        }
+        replacement.length = self.length;
+        core::mem::swap(self, replacement);
+        true
     }
 
     /// Clear the ring buffer.
@@ -54,18 +170,21 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     }
 
     #[cfg(feature = "alloc")]
-    pub fn resize(&mut self, new_capacity: usize, default: T)
+    pub fn resize(&mut self, new_capacity: usize, default: T) -> Result<(), OwnedBufferResizeError>
     where
         T: Clone,
     {
+        if matches!(self.storage, BufferStorage::Owned(_)) {
+            return Err(OwnedBufferResizeError);
+        }
         if new_capacity < self.length {
-            return;
+            return Ok(());
         }
 
-        if let ManagedSlice::Owned(vec) = &mut self.storage {
+        if let BufferStorage::Managed(ManagedSlice::Owned(vec)) = &mut self.storage {
             let old_capacity = vec.len();
             if new_capacity == old_capacity {
-                return;
+                return Ok(());
             }
 
             let mut new_vec = Vec::with_capacity(new_capacity);
@@ -79,6 +198,7 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
             *vec = new_vec;
             self.read_at = 0;
         }
+        Ok(())
     }
 
     /// Return the maximum number of elements in the ring buffer.
@@ -475,7 +595,7 @@ mod test {
         assert_eq!(ring.enqueue_slice(b"ef"), 2);
         assert_eq!(ring.len(), 4);
 
-        ring.resize(8, 0);
+        ring.resize(8, 0).unwrap();
         assert_eq!(ring.capacity(), 8);
         assert_eq!(ring.read_at, 0);
         assert_eq!(ring.len(), 4);
@@ -491,7 +611,7 @@ mod test {
         let mut ring = RingBuffer::new(vec![0u8; 4]);
         assert_eq!(ring.enqueue_slice(b"abc"), 3);
 
-        ring.resize(2, 0);
+        ring.resize(2, 0).unwrap();
         assert_eq!(ring.capacity(), 4);
         assert_eq!(ring.len(), 3);
 
@@ -507,7 +627,7 @@ mod test {
         let mut ring = RingBuffer::new(&mut storage[..]);
         assert_eq!(ring.capacity(), 4);
 
-        ring.resize(8, 0);
+        ring.resize(8, 0).unwrap();
         assert_eq!(ring.capacity(), 4);
     }
 

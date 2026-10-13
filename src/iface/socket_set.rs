@@ -2,6 +2,7 @@ use core::fmt;
 #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
 #[path = "tcp_time_wait.rs"]
 mod tcp_time_wait;
+use crate::storage::BufferStorage;
 use managed::ManagedSlice;
 
 #[cfg(all(
@@ -103,10 +104,33 @@ pub trait TcpListenRegistry: fmt::Debug + Send + Sync {
 #[derive(Debug, Default)]
 pub struct SocketStorage<'a> {
     inner: Option<Item<'a>>,
+    reserved: bool,
+}
+
+/// A prepared allocation of empty slots, or retired storage returned by a
+/// replacement. Its owner releases any allocation receipt only on real free.
+#[cfg(feature = "alloc")]
+#[derive(Debug)]
+pub struct SocketSetStorage<'storage, 'a: 'storage> {
+    slots: BufferStorage<'storage, SocketStorage<'a>>,
+}
+
+#[cfg(feature = "alloc")]
+impl<'storage, 'a: 'storage> SocketSetStorage<'storage, 'a> {
+    pub fn from_owned(
+        storage: alloc::boxed::Box<dyn crate::storage::OwnedBuffer<SocketStorage<'a>> + 'storage>,
+    ) -> Self {
+        Self {
+            slots: BufferStorage::Owned(storage),
+        }
+    }
 }
 
 impl<'a> SocketStorage<'a> {
-    pub const EMPTY: Self = Self { inner: None };
+    pub const EMPTY: Self = Self {
+        inner: None,
+        reserved: false,
+    };
 }
 
 /// An item of a socket set.
@@ -129,12 +153,13 @@ impl fmt::Display for SocketHandle {
 
 /// An extensible set of sockets.
 ///
-/// The lifetime `'a` is used when storing a `Socket<'a>`.  If you're using
-/// owned buffers for your sockets (passed in as `Vec`s) you can use
-/// `SocketSet<'static>`.
+/// The lifetime `'storage` describes the slot array, while `'a` describes the
+/// buffers of the stored `Socket<'a>` values. Keeping them independent allows
+/// borrowed slot arrays to contain sockets with owned (`'static`) buffers.
+/// Both lifetimes can be `'static` when slots and socket buffers are owned.
 #[derive(Debug)]
-pub struct SocketSet<'a> {
-    sockets: ManagedSlice<'a, SocketStorage<'a>>,
+pub struct SocketSet<'storage, 'a: 'storage> {
+    sockets: BufferStorage<'storage, SocketStorage<'a>>,
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     time_wait: tcp_time_wait::TimeWaitTable,
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
@@ -145,15 +170,134 @@ pub struct SocketSet<'a> {
     udp_ingress_handler: Option<Shared<dyn UdpIngressHandler>>,
 }
 
-impl<'a> SocketSet<'a> {
+impl<'storage, 'a: 'storage> SocketSet<'storage, 'a> {
+    /// Total initialized slots, including empty reusable slots.
+    pub fn storage_slots(&self) -> usize {
+        self.sockets.len()
+    }
+
+    pub fn available_slots(&self) -> usize {
+        self.sockets
+            .iter()
+            .filter(|slot| slot.inner.is_none() && !slot.reserved)
+            .count()
+    }
+
+    /// Swap an empty prepared array, preserving every existing handle/index.
+    /// Does not allocate or drop any socket/backing allocation. On failure
+    /// the candidate is returned intact; on success retire old storage unlocked.
+    #[cfg(feature = "alloc")]
+    pub fn replace_prepared_storage(
+        &mut self,
+        mut candidate: SocketSetStorage<'storage, 'a>,
+    ) -> Result<SocketSetStorage<'storage, 'a>, SocketSetStorage<'storage, 'a>> {
+        if candidate.slots.len() < self.sockets.len()
+            || candidate
+                .slots
+                .iter()
+                .any(|slot| slot.inner.is_some() || slot.reserved)
+        {
+            return Err(candidate);
+        }
+        for (old, new) in self.sockets.iter_mut().zip(candidate.slots.iter_mut()) {
+            *new = core::mem::replace(old, SocketStorage::EMPTY);
+        }
+        core::mem::swap(&mut self.sockets, &mut candidate.slots);
+        Ok(candidate)
+    }
+
+    /// An integration with explicit allocation admission never permits an
+    /// implicit Vec grow while holding its SocketSet lock.
+    pub fn try_add_no_grow<T: AnySocket<'a>>(&mut self, socket: T) -> Result<SocketHandle, T> {
+        let Some(index) = self
+            .sockets
+            .iter()
+            .position(|slot| slot.inner.is_none() && !slot.reserved)
+        else {
+            return Err(socket);
+        };
+        let handle = SocketHandle(index);
+        let mut meta = Meta::default();
+        meta.handle = handle;
+        self.sockets[index].inner = Some(Item {
+            meta,
+            socket: socket.upcast(),
+        });
+        Ok(handle)
+    }
+
+    /// Reserve an existing vacancy without allocation. As with every socket
+    /// handle, this handle belongs exclusively to this set. It must be consumed
+    /// once with add_reserved or cancel_reserved; ordinary add skips it.
+    pub fn reserve_slot_no_grow(&mut self) -> Option<SocketHandle> {
+        let index = self
+            .sockets
+            .iter()
+            .position(|slot| slot.inner.is_none() && !slot.reserved)?;
+        self.sockets[index].reserved = true;
+        Some(SocketHandle(index))
+    }
+
+    pub fn cancel_reserved(&mut self, handle: SocketHandle) {
+        let slot = &mut self.sockets[handle.0];
+        assert!(
+            slot.reserved && slot.inner.is_none(),
+            "handle is not a reserved vacancy"
+        );
+        slot.reserved = false;
+    }
+
+    /// Pin an occupied slot for a move-and-return operation. Removing its
+    /// socket preserves this mark, so no ordinary insertion can steal it.
+    pub fn reserve_existing(&mut self, handle: SocketHandle) {
+        let slot = &mut self.sockets[handle.0];
+        assert!(slot.inner.is_some() && !slot.reserved);
+        slot.reserved = true;
+    }
+
+    /// Cancel before removal; unlike cancel_reserved the socket is still live.
+    pub fn unreserve_existing(&mut self, handle: SocketHandle) {
+        let slot = &mut self.sockets[handle.0];
+        assert!(slot.inner.is_some() && slot.reserved);
+        slot.reserved = false;
+    }
+
+    /// Commit a previously reserved vacancy. The caller's lease guarantees
+    /// this slot is not reused; no storage preparation remains at this point.
+    pub fn add_reserved<T: AnySocket<'a>>(
+        &mut self,
+        handle: SocketHandle,
+        socket: T,
+    ) -> SocketHandle {
+        self.add_reserved_socket(handle, socket.upcast())
+    }
+
+    /// Move an already erased protocol without rebuilding its owned storage.
+    pub fn add_reserved_socket(
+        &mut self,
+        handle: SocketHandle,
+        socket: Socket<'a>,
+    ) -> SocketHandle {
+        let slot = &mut self.sockets[handle.0];
+        assert!(
+            slot.reserved && slot.inner.is_none(),
+            "handle is not a reserved vacancy"
+        );
+        let mut meta = Meta::default();
+        meta.handle = handle;
+        slot.inner = Some(Item { meta, socket });
+        slot.reserved = false;
+        handle
+    }
+
     /// Create a socket set using the provided storage.
-    pub fn new<SocketsT>(sockets: SocketsT) -> SocketSet<'a>
+    pub fn new<SocketsT>(sockets: SocketsT) -> SocketSet<'storage, 'a>
     where
-        SocketsT: Into<ManagedSlice<'a, SocketStorage<'a>>>,
+        SocketsT: Into<ManagedSlice<'storage, SocketStorage<'a>>>,
     {
         let sockets = sockets.into();
         SocketSet {
-            sockets,
+            sockets: BufferStorage::Managed(sockets),
             #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
             time_wait: tcp_time_wait::TimeWaitTable::default(),
             #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
@@ -245,6 +389,7 @@ impl<'a> SocketSet<'a> {
             meta.handle = handle;
             *slot = SocketStorage {
                 inner: Some(Item { meta, socket }),
+                reserved: false,
             };
             handle
         }
@@ -252,18 +397,24 @@ impl<'a> SocketSet<'a> {
         let socket = socket.upcast();
 
         for (index, slot) in self.sockets.iter_mut().enumerate() {
-            if slot.inner.is_none() {
+            if slot.inner.is_none() && !slot.reserved {
                 return put(index, slot, socket);
             }
         }
 
         match &mut self.sockets {
-            ManagedSlice::Borrowed(_) => panic!("adding a socket to a full SocketSet"),
+            BufferStorage::Managed(ManagedSlice::Borrowed(_)) => {
+                panic!("adding a socket to a full SocketSet")
+            }
             #[cfg(feature = "alloc")]
-            ManagedSlice::Owned(sockets) => {
-                sockets.push(SocketStorage { inner: None });
+            BufferStorage::Managed(ManagedSlice::Owned(sockets)) => {
+                sockets.push(SocketStorage::EMPTY);
                 let index = sockets.len() - 1;
                 put(index, &mut sockets[index], socket)
+            }
+            #[cfg(feature = "alloc")]
+            BufferStorage::Owned(_) => {
+                panic!("adding a socket requires prepared SocketSet capacity")
             }
         }
     }

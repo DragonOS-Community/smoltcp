@@ -95,6 +95,12 @@ pub struct Socket<'a> {
 }
 
 impl<'a> Socket<'a> {
+    pub fn swap_prepared_receive_buffer(&mut self, replacement: &mut PacketBuffer<'a>) -> bool {
+        self.rx_buffer.swap_prepared(replacement)
+    }
+    pub fn swap_prepared_send_buffer(&mut self, replacement: &mut PacketBuffer<'a>) -> bool {
+        self.tx_buffer.swap_prepared(replacement)
+    }
     /// Create a raw IP socket bound to the given IP version and datagram protocol,
     /// with the given buffers.
     pub fn new(

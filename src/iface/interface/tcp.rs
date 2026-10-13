@@ -110,7 +110,7 @@ impl Interface {
         &mut self,
         timestamp: Instant,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'_, '_>,
         meta: PacketMeta,
         ip_repr: IpRepr,
         segment: &[u8],

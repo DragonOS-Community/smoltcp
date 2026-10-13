@@ -1261,6 +1261,27 @@ impl<'a> Socket<'a> {
         self.remote_last_ack
     }
 
+    /// SND.NXT does not rewind with the RTO/PMTU retransmission cursor.
+    fn send_sequence_end(&self) -> TcpSeqNumber {
+        self.admitted_seq_end
+            .unwrap_or(self.remote_last_seq)
+            .max(self.local_seq_no)
+    }
+
+    /// Linux tcp_acceptable_seq(): retain SND.NXT unless the peer really
+    /// shrank its window, allowing the negotiated scale's rounding loss.
+    fn acceptable_ack_sequence(&self) -> TcpSeqNumber {
+        let next = self.send_sequence_end();
+        let edge = self.local_seq_no + self.remote_win_len;
+        if next <= edge
+            || (self.remote_win_scale.is_some() && next - edge < (1usize << self.remote_win_shift))
+        {
+            next
+        } else {
+            edge
+        }
+    }
+
     /// Return the current window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.
@@ -2091,7 +2112,7 @@ impl<'a> Socket<'a> {
         // [...] an empty acknowledgment segment containing the current send-sequence number
         // and an acknowledgment indicating the next sequence number expected
         // to be received.
-        reply_repr.seq_number = self.remote_last_seq;
+        reply_repr.seq_number = self.acceptable_ack_sequence();
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
 
         // From RFC 1323:
@@ -2566,7 +2587,7 @@ impl<'a> Socket<'a> {
                         ack_of_fin = true;
                     }
 
-                    ack_all = self.remote_last_seq == ack_number
+                    ack_all = self.send_sequence_end() == ack_number
                 }
 
                 self.rtte.on_ack(cx.now(), ack_number);
@@ -2857,7 +2878,7 @@ impl<'a> Socket<'a> {
                 Some(last_rx_ack)
                     if repr.payload.is_empty()
                         && last_rx_ack == ack_number
-                        && ack_number < self.remote_last_seq
+                        && ack_number < self.send_sequence_end()
                         && !is_window_update =>
                 {
                     // Increment duplicate ACK count
@@ -3487,6 +3508,13 @@ impl<'a> Socket<'a> {
             is_keep_alive = false;
         }
 
+        // Pure ACKs (including window updates during a PMTU retry) use
+        // SND.NXT, not a cursor into the data being retransmitted. Probes
+        // deliberately use an old sequence and retain their separate rule.
+        if !is_keep_alive && repr.is_empty() && repr.control == TcpControl::None {
+            repr.seq_number = self.acceptable_ack_sequence();
+        }
+
         // Trace a summary of what will be sent.
         if is_keep_alive {
             tcp_trace!("sending a keep-alive");
@@ -3585,7 +3613,9 @@ impl<'a> Socket<'a> {
         }
 
         // We've sent a packet successfully, so we can update the internal state now.
-        self.remote_last_seq = repr.seq_number + repr.segment_len();
+        if repr.segment_len() > 0 {
+            self.remote_last_seq = repr.seq_number + repr.segment_len();
+        }
         if admission == TcpPacketAdmission::Admitted && repr.segment_len() > 0 {
             if self
                 .admitted_seq_end
@@ -4038,6 +4068,170 @@ mod test {
         socket
             .dispatch_with_mtu_policy_generation(cx, mtu, generation, |_, _| Ok::<_, ()>(admission))
             .unwrap()
+    }
+
+    #[test]
+    fn ack_sequence_uses_send_high_water_after_wrap_and_rewind() {
+        for start in [LOCAL_SEQ + 1, TcpSeqNumber(i32::MAX - 8)] {
+            let mut s = socket_established();
+            s.local_seq_no = start;
+            s.remote_last_seq = start;
+            s.send_slice(&[1; 32]).unwrap();
+            pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::Admitted);
+            let end = start + 32;
+            assert_eq!(s.send_sequence_end(), end);
+            s.remote_last_seq = start + 8;
+            let ip = IpRepr::new(TUPLE.remote.addr, TUPLE.local.addr, IpProtocol::Tcp, 20, 64);
+            // A duplicate segment elicits an immediate ACK without waiting
+            // for another egress pass. Its sequence must survive cursor rewind.
+            let probe = TcpRepr {
+                seq_number: s.remote_seq_no - 1,
+                ack_number: Some(start),
+                ..SEND_TEMPL
+            };
+            let TestSocket { socket, cx } = &mut s;
+            let (_, ack) = socket.process(cx, &ip, &probe).unwrap();
+            assert_eq!(ack.seq_number, end);
+            assert_eq!(s.remote_last_seq, start + 8);
+        }
+    }
+
+    #[test]
+    fn ack_sequence_obeys_zero_shrunken_and_scaled_peer_window() {
+        let mut s = socket_established();
+        let start = s.local_seq_no;
+        s.admitted_seq_end = Some(start + 32);
+        s.remote_last_seq = start + 8;
+        s.remote_win_len = 0;
+        assert_eq!(s.acceptable_ack_sequence(), start);
+        s.remote_win_len = 16;
+        assert_eq!(s.acceptable_ack_sequence(), start + 16);
+        s.remote_win_shift = 2;
+        s.remote_win_len = 29;
+        s.remote_win_scale = None;
+        assert_eq!(s.acceptable_ack_sequence(), start + 29);
+        // Peer and local scale differ: Linux's rounding allowance uses the
+        // local advertised receive shift, not the peer's shift.
+        s.remote_win_scale = Some(7);
+        assert_eq!(s.acceptable_ack_sequence(), start + 32);
+        s.remote_win_len = 28;
+        assert_eq!(s.acceptable_ack_sequence(), start + 28);
+        // A FIN also occupies sequence space, unlike an empty ACK.
+        s.admitted_seq_end = Some(start + 33);
+        s.remote_win_len = 256;
+        assert_eq!(s.acceptable_ack_sequence(), start + 33);
+        s.reset();
+        assert_eq!(s.admitted_seq_end, None);
+        assert_eq!(s.send_sequence_end(), TcpSeqNumber::default());
+    }
+
+    #[test]
+    fn ack_only_dispatch_does_not_skip_pmtu_retransmission_cursor() {
+        let mut s = socket_established();
+        s.send_slice(&[1; 32]).unwrap();
+        pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::Admitted);
+        let end = s.admitted_seq_end.unwrap();
+        assert!(s.schedule_pmtu_retransmit(1280));
+        let cursor = s.remote_last_seq;
+        let timer = s.timer;
+        s.policy_retry_at = Some(s.cx.now() + Duration::from_secs(1));
+        s.remote_last_ack = Some(s.remote_seq_no - 1);
+        let mut emitted = false;
+        let TestSocket { socket, cx } = &mut s;
+        socket
+            .dispatch_with_mtu_policy(cx, 1280, |_, (_, tcp)| {
+                emitted = true;
+                assert!(tcp.is_empty());
+                assert_eq!(tcp.seq_number, end);
+                Ok::<_, ()>(TcpPacketAdmission::Admitted)
+            })
+            .unwrap();
+        assert!(emitted);
+        assert_eq!(s.remote_last_seq, cursor);
+        assert_eq!(s.admitted_seq_end, Some(end));
+        assert_eq!(s.timer, timer);
+        assert_eq!(s.tx_buffer.len(), 32);
+    }
+
+    #[test]
+    fn partial_retransmission_ack_keeps_timer_and_duplicate_detection() {
+        let mut s = socket_established();
+        s.send_slice(&[1; 32]).unwrap();
+        pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::Admitted);
+        let start = s.local_seq_no;
+        let timer = s.timer;
+        s.remote_last_seq = start + 8;
+        let ip = IpRepr::new(TUPLE.remote.addr, TUPLE.local.addr, IpProtocol::Tcp, 20, 64);
+        let ack = TcpRepr {
+            seq_number: s.remote_seq_no,
+            ack_number: Some(start + 8),
+            window_len: s.remote_win_len as u16,
+            ..SEND_TEMPL
+        };
+        let TestSocket { socket, cx } = &mut s;
+        assert!(socket.process(cx, &ip, &ack).is_none());
+        assert_eq!(s.timer, timer);
+        assert_eq!(s.tx_buffer.len(), 24);
+        // The cursor equals SND.UNA, but the admitted high water still has
+        // outstanding data: duplicate ACKs must still trigger fast recovery.
+        for _ in 0..3 {
+            let TestSocket { socket, cx } = &mut s;
+            socket.process(cx, &ip, &ack);
+        }
+        assert_eq!(s.timer, Timer::FastRetransmit);
+    }
+
+    #[test]
+    fn rto_ack_sequence_keeps_high_water_while_data_cursor_rewinds() {
+        let mut s = socket_established();
+        s.send_slice(&[1; 32]).unwrap();
+        pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::Admitted);
+        let start = s.local_seq_no;
+        let end = s.admitted_seq_end.unwrap();
+        let Timer::Retransmit { expires_at, .. } = s.timer else {
+            panic!("initial transmission must arm the RTO");
+        };
+        s.cx.set_now(expires_at + Duration::from_millis(1));
+        s.remote_mss = 8;
+        let mut emitted = false;
+        let TestSocket { socket, cx } = &mut s;
+        socket
+            .dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+                emitted = true;
+                assert_eq!(tcp.seq_number, start);
+                assert_eq!(tcp.payload.len(), 8);
+                Ok::<_, ()>(TcpPacketAdmission::Admitted)
+            })
+            .unwrap();
+        assert!(emitted);
+        assert_eq!(s.remote_last_seq, start + 8);
+        assert_eq!(s.send_sequence_end(), end);
+        assert_eq!(s.acceptable_ack_sequence(), end);
+    }
+
+    #[test]
+    fn ack_high_water_does_not_suppress_syn_retransmission() {
+        for mut s in [socket_syn_sent(), socket_syn_received()] {
+            pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::Admitted);
+            assert_eq!(s.admitted_seq_end, Some(LOCAL_SEQ + 1));
+            let Timer::Retransmit { expires_at, .. } = s.timer else {
+                panic!("initial SYN must arm the RTO");
+            };
+            s.cx.set_now(expires_at + Duration::from_millis(1));
+            let mut emitted = false;
+            let TestSocket { socket, cx } = &mut s;
+            socket
+                .dispatch_with_mtu_policy(cx, 1500, |_, (_, tcp)| {
+                    emitted = true;
+                    assert_eq!(tcp.control, TcpControl::Syn);
+                    assert_eq!(tcp.seq_number, LOCAL_SEQ);
+                    Ok::<_, ()>(TcpPacketAdmission::Admitted)
+                })
+                .unwrap();
+            assert!(emitted);
+            assert_eq!(s.remote_last_seq, LOCAL_SEQ + 1);
+            assert_eq!(s.admitted_seq_end, Some(LOCAL_SEQ + 1));
+        }
     }
 
     #[test]
@@ -6197,15 +6391,19 @@ mod test {
 
         // More data should not get sent since it doesn't fit in the window
         s.send_slice(b"foobar").unwrap();
+        // Linux tcp_acceptable_seq() bounds a pure ACK to the peer's real
+        // shrunken window edge (SND.UNA + SND.WND), not old SND.NXT.
         recv!(
             s,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1 + 6,
+                seq_number: LOCAL_SEQ + 1 + 3,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
                 window_len: 64 - 6,
                 ..RECV_TEMPL
             }]
         );
+        assert_eq!(s.remote_last_seq, LOCAL_SEQ + 1 + 6);
+        assert_eq!(s.tx_buffer.len(), 12);
     }
 
     #[test]

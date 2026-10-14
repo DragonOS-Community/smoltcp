@@ -3428,6 +3428,7 @@ fn test_raw_socket_with_udp_socket(#[case] medium: Medium) {
             &UDP_PAYLOAD[..],
             udp::UdpMetadata {
                 local_address: Some(dst_addr.into()),
+                local_port: Some(68),
                 ..IpEndpoint::new(src_addr.into(), 67).into()
             }
         ))

@@ -1,4 +1,5 @@
 use core::cmp::min;
+use core::num::NonZeroU32;
 #[cfg(feature = "async")]
 use core::task::Waker;
 
@@ -19,10 +20,12 @@ pub struct UdpMetadata {
     pub endpoint: IpEndpoint,
     /// The IP address to which an incoming datagram was sent, or from which an outgoing datagram
     /// will be sent. Incoming datagrams always have this set. On outgoing datagrams, if it is not
-    /// set, and the socket is not bound to a single address anyway, a suitable address will be
+    /// set, the bound address is captured at enqueue time; if neither is set, a suitable address is
     /// determined using the algorithms of RFC 6724 (candidate source address selection) or some
     /// heuristic (for IPv4).
     pub local_address: Option<IpAddress>,
+    /// Local destination port on reception, or source port captured when queued for transmission.
+    pub local_port: Option<u16>,
     pub meta: PacketMeta,
 }
 
@@ -31,6 +34,7 @@ impl<T: Into<IpEndpoint>> From<T> for UdpMetadata {
         Self {
             endpoint: value.into(),
             local_address: None,
+            local_port: None,
             meta: PacketMeta::default(),
         }
     }
@@ -51,6 +55,19 @@ pub type PacketMetadata = crate::storage::PacketMetadata<UdpMetadata>;
 
 /// A UDP packet ring buffer.
 pub type PacketBuffer<'a> = crate::storage::PacketBuffer<'a, UdpMetadata>;
+
+/// Constraints applied only when admitting new incoming datagrams.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReceiveFilter {
+    /// Connected peer; a zero peer port accepts any source port at that address.
+    pub remote: Option<IpEndpoint>,
+    /// Connected local address, distinct from the listening wildcard address.
+    pub local_address: Option<IpAddress>,
+    /// Required ingress interface ID, when `packetmeta-id` is enabled.
+    pub bound_device: Option<NonZeroU32>,
+    /// Interface owning this socket, used when ingress metadata has no interface ID.
+    pub ingress_ifindex: u32,
+}
 
 /// Error returned by [`Socket::bind`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -119,6 +136,7 @@ impl std::error::Error for RecvError {}
 #[derive(Debug)]
 pub struct Socket<'a> {
     endpoint: IpListenEndpoint,
+    receive_filter: ReceiveFilter,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
     rx_admission_limit: Option<usize>,
@@ -136,6 +154,7 @@ impl<'a> Socket<'a> {
     pub fn new(rx_buffer: PacketBuffer<'a>, tx_buffer: PacketBuffer<'a>) -> Socket<'a> {
         Socket {
             endpoint: IpListenEndpoint::default(),
+            receive_filter: ReceiveFilter::default(),
             rx_buffer,
             tx_buffer,
             rx_admission_limit: None,
@@ -265,20 +284,33 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
-    /// Close the socket.
-    pub fn close(&mut self) {
-        // Clear the bound endpoint of the socket.
+    /// Remove binding and ingress constraints without destroying queued datagrams.
+    pub fn unbind(&mut self) {
         self.endpoint = IpListenEndpoint::default();
-
-        // Reset the RX and TX buffers of the socket.
-        self.tx_buffer.reset();
-        self.rx_buffer.reset();
-
+        self.receive_filter = ReceiveFilter::default();
         #[cfg(feature = "async")]
         {
             self.rx_waker.wake();
             self.tx_waker.wake();
         }
+    }
+
+    /// Close the socket, discarding all queued datagrams.
+    pub fn close(&mut self) {
+        self.unbind();
+        self.tx_buffer.reset();
+        self.rx_buffer.reset();
+    }
+
+    /// Replace admission constraints without changing previously queued packets.
+    pub fn set_receive_filter(&mut self, filter: ReceiveFilter) {
+        self.receive_filter = filter;
+    }
+
+    fn outgoing_metadata(&self, mut meta: UdpMetadata) -> UdpMetadata {
+        meta.local_port = Some(self.endpoint.port);
+        meta.local_address = meta.local_address.or(self.endpoint.addr);
+        meta
     }
 
     /// Check whether the socket is open.
@@ -338,7 +370,7 @@ impl<'a> Socket<'a> {
         size: usize,
         meta: impl Into<UdpMetadata>,
     ) -> Result<&mut [u8], SendError> {
-        let meta = meta.into();
+        let meta = self.outgoing_metadata(meta.into());
         if self.endpoint.port == 0 {
             return Err(SendError::Unaddressable);
         }
@@ -384,7 +416,7 @@ impl<'a> Socket<'a> {
     where
         F: FnOnce(&mut [u8]) -> usize,
     {
-        let meta = meta.into();
+        let meta = self.outgoing_metadata(meta.into());
         if self.endpoint.port == 0 {
             return Err(SendError::Unaddressable);
         }
@@ -525,7 +557,7 @@ impl<'a> Socket<'a> {
     }
 
     pub fn accepts(&self, cx: &mut Context, ip_repr: &IpRepr, repr: &UdpRepr) -> bool {
-        if self.endpoint.port != repr.dst_port {
+        if !self.is_open() || self.endpoint.port != repr.dst_port {
             return false;
         }
         if self.endpoint.addr.is_some()
@@ -536,7 +568,40 @@ impl<'a> Socket<'a> {
             return false;
         }
 
+        if self
+            .receive_filter
+            .local_address
+            .is_some_and(|addr| addr != ip_repr.dst_addr())
+        {
+            return false;
+        }
+        if self.receive_filter.remote.is_some_and(|remote| {
+            remote.addr != ip_repr.src_addr() || (remote.port != 0 && remote.port != repr.src_port)
+        }) {
+            return false;
+        }
+
         true
+    }
+
+    /// Check an ingress device constraint. Without packet IDs no device identity is available.
+    pub fn accepts_ingress(&self, meta: PacketMeta) -> bool {
+        #[cfg(feature = "packetmeta-id")]
+        {
+            let ifindex = if meta.id != 0 {
+                meta.id
+            } else {
+                self.receive_filter.ingress_ifindex
+            };
+            self.receive_filter
+                .bound_device
+                .map_or(true, |device| device.get() == ifindex)
+        }
+        #[cfg(not(feature = "packetmeta-id"))]
+        {
+            let _ = meta;
+            true
+        }
     }
 
     pub fn process(
@@ -548,6 +613,15 @@ impl<'a> Socket<'a> {
         payload: &[u8],
     ) {
         debug_assert!(self.accepts(cx, ip_repr, repr));
+        debug_assert!(self.accepts_ingress(meta));
+        #[cfg(feature = "packetmeta-id")]
+        let meta = {
+            let mut meta = meta;
+            if meta.id == 0 {
+                meta.id = self.receive_filter.ingress_ifindex;
+            }
+            meta
+        };
 
         let size = payload.len();
         if self
@@ -576,6 +650,7 @@ impl<'a> Socket<'a> {
         let metadata = UdpMetadata {
             endpoint: remote_endpoint,
             local_address: Some(ip_repr.dst_addr()),
+            local_port: Some(repr.dst_port),
             meta,
         };
 
@@ -603,19 +678,16 @@ impl<'a> Socket<'a> {
             let src_addr = if let Some(s) = packet_meta.local_address {
                 s
             } else {
-                match endpoint.addr {
+                match cx.get_source_address(&packet_meta.endpoint.addr) {
                     Some(addr) => addr,
-                    None => match cx.get_source_address(&packet_meta.endpoint.addr) {
-                        Some(addr) => addr,
-                        None => {
-                            net_trace!(
-                                "udp:{}:{}: cannot find suitable source address, dropping.",
-                                endpoint,
-                                packet_meta.endpoint
-                            );
-                            return Ok(());
-                        }
-                    },
+                    None => {
+                        net_trace!(
+                            "udp:{}:{}: cannot find suitable source address, dropping.",
+                            endpoint,
+                            packet_meta.endpoint
+                        );
+                        return Ok(());
+                    }
                 }
             };
 
@@ -627,7 +699,7 @@ impl<'a> Socket<'a> {
             );
 
             let repr = UdpRepr {
-                src_port: endpoint.port,
+                src_port: packet_meta.local_port.expect("queued UDP source port"),
                 dst_port: packet_meta.endpoint.port,
             };
             let ip_repr = IpRepr::new(
@@ -730,6 +802,7 @@ mod test {
         // Would be great as a const once we have const `.into()`.
         UdpMetadata {
             local_address: Some(LOCAL_ADDR.into()),
+            local_port: Some(LOCAL_PORT),
             ..REMOTE_END.into()
         }
     }
@@ -1144,5 +1217,205 @@ mod test {
         assert!(socket.is_open());
         socket.close();
         assert!(!socket.is_open());
+    }
+
+    #[rstest]
+    #[case::ip(Medium::Ip)]
+    #[cfg(feature = "medium-ip")]
+    #[case::ethernet(Medium::Ethernet)]
+    #[cfg(feature = "medium-ethernet")]
+    #[case::ieee802154(Medium::Ieee802154)]
+    #[cfg(feature = "medium-ieee802154")]
+    fn test_unbind_preserves_datagrams_and_transmit_identity(#[case] medium: Medium) {
+        let (mut iface, _, _) = setup(medium);
+        let cx = iface.context();
+        let mut socket = socket(buffer(4), buffer(4));
+        socket.bind(LOCAL_END).unwrap();
+        socket.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            PAYLOAD,
+        );
+        socket.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            &[],
+        );
+        socket.send_slice(PAYLOAD, REMOTE_END).unwrap();
+        socket
+            .send_with(0, remote_metadata_with_local(), |_| 0)
+            .unwrap();
+        socket.unbind();
+        assert!(!socket.is_open());
+        assert!(!socket.accepts(cx, &REMOTE_IP_REPR, &REMOTE_UDP_REPR));
+        assert_eq!(socket.peek().unwrap().1.local_port, Some(LOCAL_PORT));
+        assert_eq!(
+            socket.recv().unwrap(),
+            (PAYLOAD, remote_metadata_with_local())
+        );
+        assert_eq!(
+            socket.recv().unwrap(),
+            (&[][..], remote_metadata_with_local())
+        );
+        socket
+            .bind(IpEndpoint::new(OTHER_ADDR.into(), LOCAL_PORT + 1))
+            .unwrap();
+        for expected_payload in [PAYLOAD, &[][..]] {
+            socket
+                .dispatch(cx, |_, _, (ip, udp, payload)| {
+                    assert_eq!(ip.src_addr(), LOCAL_ADDR.into());
+                    assert_eq!(udp.src_port, LOCAL_PORT);
+                    assert_eq!(payload, expected_payload);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+        }
+        assert_eq!(socket.send_queue(), 0);
+        socket.send_slice(PAYLOAD, REMOTE_END).unwrap();
+        let new_ip = IpRepr::new(
+            REMOTE_END.addr,
+            OTHER_ADDR.into(),
+            IpProtocol::Udp,
+            REMOTE_UDP_REPR.header_len() + PAYLOAD.len(),
+            64,
+        );
+        let new_udp = UdpRepr {
+            src_port: REMOTE_PORT,
+            dst_port: LOCAL_PORT + 1,
+        };
+        socket.process(cx, PacketMeta::default(), &new_ip, &new_udp, PAYLOAD);
+        assert!(socket.can_recv());
+        socket.close();
+        assert!(!socket.can_recv());
+        assert_eq!(socket.send_queue(), 0);
+    }
+
+    #[rstest]
+    #[case::ip(Medium::Ip)]
+    #[cfg(feature = "medium-ip")]
+    #[case::ethernet(Medium::Ethernet)]
+    #[cfg(feature = "medium-ethernet")]
+    #[case::ieee802154(Medium::Ieee802154)]
+    #[cfg(feature = "medium-ieee802154")]
+    fn test_wildcard_queued_source_does_not_follow_rebind(#[case] medium: Medium) {
+        let (mut iface, _, _) = setup(medium);
+        let cx = iface.context();
+        let expected = cx.get_source_address(&REMOTE_END.addr).unwrap();
+        let mut socket = socket(buffer(0), buffer(2));
+        socket.bind(LOCAL_PORT).unwrap();
+        // A caller's received metadata must not override the source port of a new send.
+        let mut outgoing = UdpMetadata::from(REMOTE_END);
+        outgoing.local_port = Some(999);
+        socket.send_slice(PAYLOAD, outgoing).unwrap();
+        socket.unbind();
+        socket
+            .bind(IpEndpoint::new(OTHER_ADDR.into(), LOCAL_PORT + 1))
+            .unwrap();
+        socket
+            .dispatch(cx, |_, _, (ip, udp, _)| {
+                assert_eq!(ip.src_addr(), expected);
+                assert_eq!(udp.src_port, LOCAL_PORT);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+    }
+
+    #[rstest]
+    #[case::ip(Medium::Ip)]
+    #[cfg(feature = "medium-ip")]
+    #[case::ethernet(Medium::Ethernet)]
+    #[cfg(feature = "medium-ethernet")]
+    #[case::ieee802154(Medium::Ieee802154)]
+    #[cfg(feature = "medium-ieee802154")]
+    fn test_receive_filters_do_not_revalidate_queued_data(#[case] medium: Medium) {
+        let (mut iface, _, _) = setup(medium);
+        let cx = iface.context();
+        let mut socket = socket(buffer(2), buffer(0));
+        socket.bind(LOCAL_PORT).unwrap();
+        socket.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            PAYLOAD,
+        );
+        let mut filter = ReceiveFilter {
+            remote: Some(IpEndpoint::new(REMOTE_END.addr, REMOTE_PORT + 1)),
+            local_address: Some(LOCAL_ADDR.into()),
+            bound_device: None,
+            ingress_ifindex: 0,
+        };
+        socket.set_receive_filter(filter);
+        assert!(!socket.accepts(cx, &REMOTE_IP_REPR, &REMOTE_UDP_REPR));
+        filter.remote.as_mut().unwrap().port = 0;
+        socket.set_receive_filter(filter);
+        assert!(socket.accepts(cx, &REMOTE_IP_REPR, &REMOTE_UDP_REPR));
+        assert!(!socket.accepts(cx, &BAD_IP_REPR, &REMOTE_UDP_REPR));
+        filter.remote.as_mut().unwrap().addr = OTHER_ADDR.into();
+        socket.set_receive_filter(filter);
+        assert!(!socket.accepts(cx, &REMOTE_IP_REPR, &REMOTE_UDP_REPR));
+        assert_eq!(
+            socket.recv().unwrap(),
+            (PAYLOAD, remote_metadata_with_local())
+        );
+        socket.unbind();
+        socket.bind(LOCAL_PORT).unwrap();
+        assert!(socket.accepts(cx, &REMOTE_IP_REPR, &REMOTE_UDP_REPR));
+    }
+
+    #[cfg(feature = "packetmeta-id")]
+    #[test]
+    fn test_device_filter_uses_actual_ingress_before_owner_fallback() {
+        let mut socket = socket(buffer(0), buffer(0));
+        socket.set_receive_filter(ReceiveFilter {
+            bound_device: NonZeroU32::new(2),
+            ingress_ifindex: 2,
+            ..ReceiveFilter::default()
+        });
+        let mut meta = PacketMeta::default();
+        assert!(socket.accepts_ingress(meta));
+        meta.id = 3;
+        assert!(!socket.accepts_ingress(meta));
+        meta.id = 2;
+        assert!(socket.accepts_ingress(meta));
+        socket.unbind();
+        meta.id = 3;
+        assert!(socket.accepts_ingress(meta));
+    }
+
+    #[cfg(feature = "packetmeta-id")]
+    #[rstest]
+    #[case::ip(Medium::Ip)]
+    #[cfg(feature = "medium-ip")]
+    #[case::ethernet(Medium::Ethernet)]
+    #[cfg(feature = "medium-ethernet")]
+    #[case::ieee802154(Medium::Ieee802154)]
+    #[cfg(feature = "medium-ieee802154")]
+    fn test_received_ingress_identity_survives_unbind(#[case] medium: Medium) {
+        let (mut iface, _, _) = setup(medium);
+        let cx = iface.context();
+        let mut socket = socket(buffer(2), buffer(0));
+        socket.bind(LOCAL_PORT).unwrap();
+        socket.set_receive_filter(ReceiveFilter {
+            ingress_ifindex: 7,
+            ..ReceiveFilter::default()
+        });
+        socket.process(
+            cx,
+            PacketMeta::default(),
+            &REMOTE_IP_REPR,
+            &REMOTE_UDP_REPR,
+            PAYLOAD,
+        );
+        let mut meta = PacketMeta::default();
+        meta.id = 9;
+        socket.process(cx, meta, &REMOTE_IP_REPR, &REMOTE_UDP_REPR, &[]);
+        socket.unbind();
+        assert_eq!(socket.recv().unwrap().1.meta.id, 7);
+        assert_eq!(socket.recv().unwrap().1.meta.id, 9);
     }
 }

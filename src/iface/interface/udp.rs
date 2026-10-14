@@ -54,7 +54,7 @@ impl InterfaceInner {
             .items_mut()
             .filter_map(|i| UdpSocket::downcast_mut(&mut i.socket))
         {
-            if udp_socket.accepts(self, &ip_repr, &udp_repr) {
+            if udp_socket.accepts(self, &ip_repr, &udp_repr) && udp_socket.accepts_ingress(meta) {
                 udp_socket.process(self, meta, &ip_repr, &udp_repr, udp_packet.payload());
                 return None;
             }

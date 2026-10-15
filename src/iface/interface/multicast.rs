@@ -10,6 +10,88 @@ use crate::wire::*;
 
 const MULTICAST_RETRY_DELAY: crate::time::Duration = crate::time::Duration::from_millis(200);
 
+#[cfg(all(test, feature = "proto-ipv6", feature = "medium-ethernet"))]
+mod ownership_tests {
+    use super::*;
+    use crate::phy::Medium;
+
+    fn address(tail: u16) -> Ipv6Address {
+        Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, tail)
+    }
+
+    #[test]
+    fn explicit_unrelated_solicited_group_survives_address_update() {
+        let (mut iface, _, _) = crate::tests::setup(Medium::Ethernet);
+        let group = address(0x1234).solicited_node();
+        iface.join_multicast_group(group).unwrap();
+        assert!(iface.has_multicast_group(group));
+        iface.update_ip_addrs(|addresses| {
+            addresses.clear();
+            addresses
+                .push(IpCidr::new(address(0x5678).into(), 64))
+                .unwrap();
+        });
+        assert!(iface.has_multicast_group(group));
+        iface.leave_multicast_group(group).unwrap();
+        assert!(!iface.has_multicast_group(group));
+    }
+
+    #[test]
+    fn explicit_owner_survives_last_corresponding_address_removal() {
+        let (mut iface, _, _) = crate::tests::setup(Medium::Ethernet);
+        let local = address(0x1234);
+        let group = local.solicited_node();
+        iface.update_ip_addrs(|addresses| {
+            addresses.clear();
+            addresses.push(IpCidr::new(local.into(), 64)).unwrap();
+        });
+        iface.join_multicast_group(group).unwrap();
+        iface.update_ip_addrs(|addresses| addresses.clear());
+        assert!(iface.has_multicast_group(group));
+        iface.leave_multicast_group(group).unwrap();
+        assert!(!iface.has_multicast_group(group));
+    }
+
+    #[test]
+    fn explicit_leave_keeps_address_owner_and_rejoin_is_idempotent() {
+        let (mut iface, _, _) = crate::tests::setup(Medium::Ethernet);
+        let local = address(0x1234);
+        let group = local.solicited_node();
+        iface.update_ip_addrs(|addresses| {
+            addresses.clear();
+            addresses.push(IpCidr::new(local.into(), 64)).unwrap();
+        });
+        iface.join_multicast_group(group).unwrap();
+        iface.join_multicast_group(group).unwrap();
+        iface.leave_multicast_group(group).unwrap();
+        assert!(iface.has_multicast_group(group));
+        iface.leave_multicast_group(group).unwrap();
+        assert!(iface.has_multicast_group(group));
+        iface.update_ip_addrs(|addresses| addresses.clear());
+        assert!(!iface.has_multicast_group(group));
+    }
+
+    #[test]
+    fn shared_solicited_node_remains_until_last_address_disappears() {
+        let (mut iface, _, _) = crate::tests::setup(Medium::Ethernet);
+        let first = address(0x1234);
+        let second = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x1234);
+        let group = first.solicited_node();
+        assert_eq!(group, second.solicited_node());
+        iface.update_ip_addrs(|addresses| {
+            addresses.clear();
+            addresses.push(IpCidr::new(first.into(), 64)).unwrap();
+            addresses.push(IpCidr::new(second.into(), 64)).unwrap();
+        });
+        iface.update_ip_addrs(|addresses| {
+            addresses.remove(0);
+        });
+        assert!(iface.has_multicast_group(group));
+        iface.update_ip_addrs(|addresses| addresses.clear());
+        assert!(!iface.has_multicast_group(group));
+    }
+}
+
 /// Error type for `join_multicast_group`, `leave_multicast_group`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -58,8 +140,20 @@ enum GroupState {
     Leaving,
 }
 
+const EXPLICIT_OWNER: u8 = 1;
+#[cfg(feature = "proto-ipv6")]
+const SOLICITED_NODE_OWNER: u8 = 2;
+
+/// Report progress and subscription ownership are independent. In particular,
+/// changing local addresses must not revoke an application's explicit join.
+#[derive(Debug, Clone, Copy)]
+struct Group {
+    state: GroupState,
+    owners: u8,
+}
+
 pub struct State {
-    groups: LinearMap<IpAddress, GroupState, IFACE_MAX_MULTICAST_GROUP_COUNT>,
+    groups: LinearMap<IpAddress, Group, IFACE_MAX_MULTICAST_GROUP_COUNT>,
     /// Back off only after a transient transmit failure. A permanent policy
     /// or route denial still finishes this report attempt.
     retry_at: Option<crate::time::Instant>,
@@ -89,12 +183,9 @@ impl State {
     pub fn has_multicast_group<T: Into<IpAddress>>(&self, addr: T) -> bool {
         // Return false if we don't have the multicast group,
         // or we're leaving it.
-        match self.groups.get(&addr.into()) {
-            None => false,
-            Some(GroupState::Joining) => true,
-            Some(GroupState::Joined) => true,
-            Some(GroupState::Leaving) => false,
-        }
+        self.groups
+            .get(&addr.into())
+            .is_some_and(|group| group.owners != 0)
     }
 }
 
@@ -116,22 +207,30 @@ impl Interface {
         &mut self,
         addr: T,
     ) -> Result<(), MulticastError> {
-        let addr = addr.into();
+        self.join_group(addr.into(), EXPLICIT_OWNER)
+    }
+
+    fn join_group(&mut self, addr: IpAddress, owner: u8) -> Result<(), MulticastError> {
         if !addr.is_multicast() {
             return Err(MulticastError::Unaddressable);
         }
 
-        if let Some(state) = self.inner.multicast.groups.get_mut(&addr) {
-            *state = match state {
-                GroupState::Joining => GroupState::Joining,
-                GroupState::Joined => GroupState::Joined,
-                GroupState::Leaving => GroupState::Joined,
-            };
+        if let Some(group) = self.inner.multicast.groups.get_mut(&addr) {
+            group.owners |= owner;
+            if group.state == GroupState::Leaving {
+                group.state = GroupState::Joined;
+            }
         } else {
             self.inner
                 .multicast
                 .groups
-                .insert(addr, GroupState::Joining)
+                .insert(
+                    addr,
+                    Group {
+                        state: GroupState::Joining,
+                        owners: owner,
+                    },
+                )
                 .map_err(|_| MulticastError::GroupTableFull)?;
         }
         Ok(())
@@ -142,14 +241,21 @@ impl Interface {
         &mut self,
         addr: T,
     ) -> Result<(), MulticastError> {
-        let addr = addr.into();
+        self.leave_group(addr.into(), EXPLICIT_OWNER)
+    }
+
+    fn leave_group(&mut self, addr: IpAddress, owner: u8) -> Result<(), MulticastError> {
         if !addr.is_multicast() {
             return Err(MulticastError::Unaddressable);
         }
 
-        if let Some(state) = self.inner.multicast.groups.get_mut(&addr) {
+        if let Some(group) = self.inner.multicast.groups.get_mut(&addr) {
+            group.owners &= !owner;
+            if group.owners != 0 {
+                return Ok(());
+            }
             let delete;
-            (*state, delete) = match state {
+            (group.state, delete) = match group.state {
                 GroupState::Joining => (GroupState::Joined, true),
                 GroupState::Joined => (GroupState::Leaving, false),
                 GroupState::Leaving => (GroupState::Leaving, false),
@@ -173,18 +279,22 @@ impl Interface {
             .inner
             .multicast
             .groups
-            .keys()
-            .cloned()
-            .filter(|a| matches!(a, IpAddress::Ipv6(a) if a.is_solicited_node_multicast() && !self.inner.has_solicited_node(*a)))
+            .iter()
+            .filter(|(a, group)| {
+                group.owners & SOLICITED_NODE_OWNER != 0
+                    && matches!(a, IpAddress::Ipv6(a) if !self.inner.has_solicited_node(*a))
+            })
+            .map(|(a, _)| *a)
             .collect();
         for removal in removals {
-            let _ = self.leave_multicast_group(removal);
+            let _ = self.leave_group(removal, SOLICITED_NODE_OWNER);
         }
 
         let cidrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT> = Vec::from_slice(self.ip_addrs()).unwrap();
         for cidr in cidrs {
             if let IpCidr::Ipv6(cidr) = cidr {
-                let _ = self.join_multicast_group(cidr.address().solicited_node());
+                let _ =
+                    self.join_group(cidr.address().solicited_node().into(), SOLICITED_NODE_OWNER);
             }
         }
     }
@@ -254,7 +364,7 @@ impl Interface {
             .multicast
             .groups
             .iter()
-            .find(|(_, &state)| state == GroupState::Joining)
+            .find(|(_, group)| group.state == GroupState::Joining)
         {
             match addr {
                 #[cfg(feature = "proto-ipv4")]
@@ -268,7 +378,7 @@ impl Interface {
                 #[cfg(feature = "proto-ipv6")]
                 IpAddress::Ipv6(addr) => {
                     if let Some(pkt) = self.inner.mldv2_report_packet(&[MldAddressRecordRepr::new(
-                        MldRecordType::ChangeToInclude,
+                        MldRecordType::ChangeToExclude,
                         addr,
                     )]) {
                         if !self.dispatch_multicast_report(device, pkt) {
@@ -278,12 +388,8 @@ impl Interface {
                 }
             }
 
-            // NOTE(unwrap): this is always replacing an existing entry, so it can't fail due to the map being full.
-            self.inner
-                .multicast
-                .groups
-                .insert(addr, GroupState::Joined)
-                .unwrap();
+            // The report does not acquire or release any subscription owner.
+            self.inner.multicast.groups.get_mut(&addr).unwrap().state = GroupState::Joined;
         }
 
         // Process multicast leaves.
@@ -292,7 +398,7 @@ impl Interface {
             .multicast
             .groups
             .iter()
-            .find(|(_, &state)| state == GroupState::Leaving)
+            .find(|(_, group)| group.state == GroupState::Leaving)
         {
             match addr {
                 #[cfg(feature = "proto-ipv4")]
@@ -306,7 +412,7 @@ impl Interface {
                 #[cfg(feature = "proto-ipv6")]
                 IpAddress::Ipv6(addr) => {
                     if let Some(pkt) = self.inner.mldv2_report_packet(&[MldAddressRecordRepr::new(
-                        MldRecordType::ChangeToExclude,
+                        MldRecordType::ChangeToInclude,
                         addr,
                     )]) {
                         if !self.dispatch_multicast_report(device, pkt) {
@@ -683,7 +789,12 @@ mod policy_tests {
 
         iface.poll_egress(Instant::ZERO, &mut rejecting, &mut sockets);
         assert_eq!(
-            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            iface
+                .inner
+                .multicast
+                .groups
+                .get(&IpAddress::Ipv4(group))
+                .map(|g| &g.state),
             Some(&GroupState::Joined)
         );
     }
@@ -705,7 +816,12 @@ mod policy_tests {
 
         iface.poll_egress(Instant::ZERO, &mut rejecting, &mut sockets);
         assert_eq!(
-            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            iface
+                .inner
+                .multicast
+                .groups
+                .get(&IpAddress::Ipv4(group))
+                .map(|g| &g.state),
             Some(&GroupState::Joining)
         );
         assert_eq!(
@@ -725,7 +841,12 @@ mod policy_tests {
         rejecting.error = Some(IpOutputError::NoRoute);
         iface.poll_egress(Instant::from_millis(400), &mut rejecting, &mut sockets);
         assert_eq!(
-            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            iface
+                .inner
+                .multicast
+                .groups
+                .get(&IpAddress::Ipv4(group))
+                .map(|g| &g.state),
             Some(&GroupState::Joined)
         );
         assert_eq!(iface.poll_at(Instant::from_millis(400), &sockets), None);
@@ -748,7 +869,12 @@ mod policy_tests {
 
         iface.poll_egress(Instant::ZERO, &mut output, &mut sockets);
         assert_eq!(
-            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            iface
+                .inner
+                .multicast
+                .groups
+                .get(&IpAddress::Ipv4(group))
+                .map(|g| &g.state),
             Some(&GroupState::Joining)
         );
         assert_eq!(
@@ -758,12 +884,22 @@ mod policy_tests {
         output.no_token = false;
         iface.poll_egress(Instant::from_millis(100), &mut output, &mut sockets);
         assert_eq!(
-            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            iface
+                .inner
+                .multicast
+                .groups
+                .get(&IpAddress::Ipv4(group))
+                .map(|g| &g.state),
             Some(&GroupState::Joining)
         );
         iface.poll_egress(Instant::from_millis(200), &mut output, &mut sockets);
         assert_eq!(
-            iface.inner.multicast.groups.get(&IpAddress::Ipv4(group)),
+            iface
+                .inner
+                .multicast
+                .groups
+                .get(&IpAddress::Ipv4(group))
+                .map(|g| &g.state),
             Some(&GroupState::Joined)
         );
         assert_eq!(output.sent.get(), 1);
@@ -788,7 +924,12 @@ mod policy_tests {
 
         iface.poll_egress(Instant::ZERO, &mut rejecting, &mut sockets);
         assert_eq!(
-            iface.inner.multicast.groups.get(&IpAddress::Ipv6(group)),
+            iface
+                .inner
+                .multicast
+                .groups
+                .get(&IpAddress::Ipv6(group))
+                .map(|g| &g.state),
             Some(&GroupState::Joining)
         );
         assert_eq!(
@@ -798,7 +939,12 @@ mod policy_tests {
         rejecting.error = Some(IpOutputError::PolicyDrop);
         iface.poll_egress(Instant::from_millis(200), &mut rejecting, &mut sockets);
         assert_eq!(
-            iface.inner.multicast.groups.get(&IpAddress::Ipv6(group)),
+            iface
+                .inner
+                .multicast
+                .groups
+                .get(&IpAddress::Ipv6(group))
+                .map(|g| &g.state),
             Some(&GroupState::Joined)
         );
     }
@@ -822,18 +968,33 @@ mod policy_tests {
 
         iface.poll_egress(Instant::ZERO, &mut rejecting, &mut sockets);
         assert_eq!(
-            iface.inner.multicast.groups.get(&IpAddress::Ipv4(first)),
+            iface
+                .inner
+                .multicast
+                .groups
+                .get(&IpAddress::Ipv4(first))
+                .map(|g| &g.state),
             Some(&GroupState::Joined)
         );
         assert_eq!(
-            iface.inner.multicast.groups.get(&IpAddress::Ipv4(second)),
+            iface
+                .inner
+                .multicast
+                .groups
+                .get(&IpAddress::Ipv4(second))
+                .map(|g| &g.state),
             Some(&GroupState::Joining)
         );
         rejecting.current = true;
         rejecting.stale_after_transmit = false;
         iface.poll_egress(Instant::ZERO, &mut rejecting, &mut sockets);
         assert_eq!(
-            iface.inner.multicast.groups.get(&IpAddress::Ipv4(second)),
+            iface
+                .inner
+                .multicast
+                .groups
+                .get(&IpAddress::Ipv4(second))
+                .map(|g| &g.state),
             Some(&GroupState::Joined)
         );
     }

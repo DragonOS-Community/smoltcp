@@ -659,9 +659,7 @@ impl<'a> Socket<'a> {
     pub(crate) fn lifecycle_device(&self) -> u32 {
         #[cfg(feature = "packetmeta-id")]
         {
-            self.connection_bound_device
-                .or(self.listen_bound_device)
-                .map_or(0, |d| d.get())
+            self.bound_device().map_or(0, |d| d.get())
         }
         #[cfg(not(feature = "packetmeta-id"))]
         {
@@ -675,11 +673,21 @@ impl<'a> Socket<'a> {
         remote: IpEndpoint,
         replacing: Option<u64>,
     ) -> bool {
+        self.prepare_open_on_device(local, remote, self.lifecycle_device(), replacing)
+    }
+
+    fn prepare_open_on_device(
+        &self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        device: u32,
+        replacing: Option<u64>,
+    ) -> bool {
         #[cfg(feature = "alloc")]
         if let Some(observer) = &self.lifecycle_observer {
-            return observer.prepare_open(local, remote, self.lifecycle_device(), replacing);
+            return observer.prepare_open(local, remote, device, replacing);
         }
-        let _ = (local, remote, replacing);
+        let _ = (local, remote, device, replacing);
         true
     }
 
@@ -2277,12 +2285,44 @@ impl<'a> Socket<'a> {
         ip_repr: &IpRepr,
         repr: &TcpRepr,
     ) -> Option<(IpRepr, TcpRepr<'static>)> {
-        self.process_with_reuse(cx, ip_repr, repr, None)
+        self.process_with_meta(cx, PacketMeta::default(), ip_repr, repr)
+    }
+
+    pub(crate) fn process_with_meta(
+        &mut self,
+        cx: &mut Context,
+        meta: PacketMeta,
+        ip_repr: &IpRepr,
+        repr: &TcpRepr,
+    ) -> Option<(IpRepr, TcpRepr<'static>)> {
+        self.process_with_reuse(cx, meta, ip_repr, repr, None)
+    }
+
+    fn passive_open_device(&self, _ip: &IpRepr, _meta: PacketMeta) -> u32 {
+        #[cfg(feature = "packetmeta-id")]
+        {
+            let device = self.listen_bound_device;
+            #[cfg(feature = "proto-ipv6")]
+            let device = device.or_else(|| match _ip.src_addr() {
+                IpAddress::Ipv6(address)
+                    if address.octets()[0] == 0xfe && address.octets()[1] & 0xc0 == 0x80 =>
+                {
+                    NonZeroU32::new(_meta.id)
+                }
+                _ => None,
+            });
+            device.map_or(0, NonZeroU32::get)
+        }
+        #[cfg(not(feature = "packetmeta-id"))]
+        {
+            0
+        }
     }
 
     pub(crate) fn process_with_reuse(
         &mut self,
         cx: &mut Context,
+        meta: PacketMeta,
         ip_repr: &IpRepr,
         repr: &TcpRepr,
         reuse: Option<(&TimeWaitState, Option<u64>)>,
@@ -2309,20 +2349,22 @@ impl<'a> Socket<'a> {
         if self.state != State::Listen && time_wait::paws_reject(self.ts_recent, repr, cx.now()) {
             return self.challenge_ack_reply(cx, ip_repr, repr);
         }
+        let passive_device = self.passive_open_device(ip_repr, meta);
         if self.state == State::Listen
             && repr.control == TcpControl::Syn
             && repr.ack_number.is_none()
             && (repr.max_seg_size == Some(0)
-                || !self.prepare_open(
+                || !self.prepare_open_on_device(
                     IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
                     IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
+                    passive_device,
                     reuse.and_then(|(_, id)| id),
                 ))
         {
             return None;
         }
         let was_listen = self.state == State::Listen;
-        let result = self.process_inner(cx, ip_repr, repr);
+        let result = self.process_inner(cx, ip_repr, repr, passive_device);
         if was_listen && self.state == State::SynReceived {
             if let Some((old, _)) = reuse {
                 self.local_seq_no = old.new_isn();
@@ -2352,6 +2394,7 @@ impl<'a> Socket<'a> {
         cx: &mut Context,
         ip_repr: &IpRepr,
         repr: &TcpRepr,
+        _passive_device: u32,
     ) -> Option<(IpRepr, TcpRepr<'static>)> {
         debug_assert!(self.accepts(cx, ip_repr, repr));
 
@@ -2664,7 +2707,7 @@ impl<'a> Socket<'a> {
 
                 #[cfg(feature = "packetmeta-id")]
                 {
-                    self.connection_bound_device = self.listen_bound_device;
+                    self.connection_bound_device = NonZeroU32::new(_passive_device);
                 }
                 self.tuple = Some(Tuple {
                     local: IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
@@ -5095,6 +5138,7 @@ mod test {
         );
         assert_eq!(s.state, State::Listen);
         assert_eq!(s.bound_device(), b);
+        assert_eq!(s.lifecycle_device(), 8);
         assert!(!s.accepts_ingress(PacketMeta { id: 7 }));
         assert!(s.accepts_ingress(PacketMeta { id: 8 }));
         send!(
@@ -5107,6 +5151,158 @@ mod test {
             }
         );
         assert_eq!(s.bound_device(), b);
+    }
+
+    #[test]
+    #[cfg(all(feature = "packetmeta-id", feature = "proto-ipv6"))]
+    fn test_linklocal_passive_scope_and_relisten() {
+        let mut s = socket_listen();
+        s.listen_endpoint.addr = None;
+        let syn = TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            ..SEND_TEMPL
+        };
+        let ip = IpRepr::Ipv6(crate::wire::Ipv6Repr {
+            src_addr: crate::wire::Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
+            dst_addr: crate::wire::Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            next_header: IpProtocol::Tcp,
+            payload_len: syn.buffer_len(),
+            hop_limit: 64,
+        });
+        s.socket
+            .process_with_meta(&mut s.cx, PacketMeta { id: 7 }, &ip, &syn);
+        assert_eq!(s.state, State::SynReceived);
+        assert_eq!(s.lifecycle_device(), 7);
+        assert_eq!(s.egress_meta().id, 7);
+        let rst = TcpRepr {
+            control: TcpControl::Rst,
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(s.local_seq_no),
+            ..SEND_TEMPL
+        };
+        s.socket
+            .process_with_meta(&mut s.cx, PacketMeta { id: 7 }, &ip, &rst);
+        assert_eq!(s.state, State::Listen);
+        assert_eq!(s.lifecycle_device(), 0);
+        s.socket
+            .process_with_meta(&mut s.cx, PacketMeta { id: 8 }, &ip, &syn);
+        assert_eq!(s.state, State::SynReceived);
+        assert_eq!(s.lifecycle_device(), 8);
+        assert_eq!(s.egress_meta().id, 8);
+    }
+
+    #[test]
+    #[cfg(all(feature = "packetmeta-id", feature = "proto-ipv6"))]
+    fn test_passive_scope_preserves_explicit_policy_and_unscoped_peers() {
+        for (prefix, explicit, expected) in [(0xfe80, 0, 7), (0xfe80, 8, 8), (0xfd00, 0, 0)] {
+            let mut s = socket_listen();
+            s.listen_endpoint.addr = None;
+            s.set_listen_bound_device(NonZeroU32::new(explicit));
+            let syn = TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            };
+            let ip = IpRepr::Ipv6(crate::wire::Ipv6Repr {
+                src_addr: crate::wire::Ipv6Address::new(prefix, 0, 0, 0, 0, 0, 0, 2),
+                dst_addr: crate::wire::Ipv6Address::new(prefix, 0, 0, 0, 0, 0, 0, 1),
+                next_header: IpProtocol::Tcp,
+                payload_len: syn.buffer_len(),
+                hop_limit: 64,
+            });
+            let meta = PacketMeta {
+                id: if explicit != 0 { explicit } else { 7 },
+            };
+            assert!(s.accepts_ingress(meta));
+            if explicit != 0 {
+                assert!(!s.accepts_ingress(PacketMeta { id: 7 }));
+            }
+            s.socket.process_with_meta(&mut s.cx, meta, &ip, &syn);
+            assert_eq!(s.lifecycle_device(), expected);
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "alloc", feature = "packetmeta-id", feature = "proto-ipv6"))]
+    fn test_passive_scope_admission_precedes_connection_publication() {
+        use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        #[derive(Debug)]
+        struct Observer {
+            allow: AtomicBool,
+            prepared: AtomicU32,
+            published: AtomicU32,
+        }
+        impl LifecycleObserver for Observer {
+            fn identity(&self) -> u64 {
+                92
+            }
+            fn prepare_open(
+                &self,
+                _: IpEndpoint,
+                _: IpEndpoint,
+                device: u32,
+                _: Option<u64>,
+            ) -> bool {
+                self.prepared.store(device, Ordering::Relaxed);
+                self.allow.load(Ordering::Relaxed)
+            }
+            fn on_state_change(
+                &self,
+                _: State,
+                _: Option<IpEndpoint>,
+                _: Option<IpEndpoint>,
+                device: u32,
+            ) {
+                self.published.store(device, Ordering::Relaxed);
+            }
+        }
+        let observer = Shared::new(Observer {
+            allow: AtomicBool::new(false),
+            prepared: AtomicU32::new(0),
+            published: AtomicU32::new(0),
+        });
+        let mut s = socket_listen();
+        s.listen_endpoint.addr = None;
+        s.set_lifecycle_observer(Some(observer.clone()));
+        let syn = TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            max_seg_size: Some(BASE_MSS),
+            ..SEND_TEMPL
+        };
+        let ip = IpRepr::Ipv6(crate::wire::Ipv6Repr {
+            src_addr: crate::wire::Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
+            dst_addr: crate::wire::Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            next_header: IpProtocol::Tcp,
+            payload_len: syn.buffer_len(),
+            hop_limit: 64,
+        });
+        s.socket
+            .process_with_meta(&mut s.cx, PacketMeta { id: 7 }, &ip, &syn);
+        assert_eq!(observer.prepared.load(Ordering::Relaxed), 7);
+        assert_eq!(s.state, State::Listen);
+        assert_eq!(s.lifecycle_device(), 0);
+        assert_eq!(observer.published.load(Ordering::Relaxed), 0);
+        observer.allow.store(true, Ordering::Relaxed);
+        observer.prepared.store(99, Ordering::Relaxed);
+        let invalid = TcpRepr {
+            max_seg_size: Some(0),
+            ..syn
+        };
+        s.socket
+            .process_with_meta(&mut s.cx, PacketMeta { id: 8 }, &ip, &invalid);
+        assert_eq!(observer.prepared.load(Ordering::Relaxed), 99);
+        assert_eq!(s.state, State::Listen);
+        assert_eq!(s.lifecycle_device(), 0);
+        s.socket
+            .process_with_meta(&mut s.cx, PacketMeta { id: 8 }, &ip, &syn);
+        assert_eq!(observer.prepared.load(Ordering::Relaxed), 8);
+        assert_eq!(observer.published.load(Ordering::Relaxed), 8);
+        assert_eq!(s.lifecycle_device(), 8);
     }
 
     #[test]

@@ -60,7 +60,7 @@ impl InterfaceInner {
                 {
                     let tx_meta = tcp_socket.egress_meta();
                     return tcp_socket
-                        .process(self, &ip_repr, &tcp_repr)
+                        .process_with_meta(self, meta, &ip_repr, &tcp_repr)
                         .map(|(ip, tcp)| {
                             Packet::new(ip, IpPayload::Tcp(tcp)).with_tx_meta(tx_meta)
                         });

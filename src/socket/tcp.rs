@@ -58,6 +58,37 @@ pub trait LifecycleObserver: fmt::Debug + Send + Sync {
     );
 }
 
+/// Protocol-independent network failure reported by an ICMP error handler.
+/// Integrations translate these reasons to their own socket ABI errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkError {
+    NetworkUnreachable,
+    HostUnreachable,
+    ProtocolUnreachable,
+    ConnectionRefused,
+    PermissionDenied,
+    ProtocolError,
+    HostDown,
+    NoNetwork,
+    OperationNotSupported,
+    MessageTooLarge,
+}
+
+/// A socket error is independent of whether the TCP connection has terminated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorReason {
+    Reset,
+    Network(NetworkError),
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingError {
+    pub reason: ErrorReason,
+    /// Transport state before the error, needed by socket compatibility layers.
+    pub state: State,
+}
+
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
 }
@@ -492,7 +523,8 @@ pub enum CongestionControl {
 #[derive(Debug)]
 pub struct Socket<'a> {
     state: State,
-    pending_reset: Option<State>,
+    pending_error: Option<PendingError>,
+    soft_error: Option<NetworkError>,
     timer: Timer,
     rtte: RttEstimator,
     assembler: Assembler,
@@ -524,6 +556,8 @@ pub struct Socket<'a> {
     /// Explicit passive-open policies, selected from the actual admitted SYN
     /// under protocol serialization, never from an external ingress snapshot.
     listen_pmtu_policies: Option<[u8; 2]>,
+    recv_error_policies: [bool; 2],
+    listen_recv_error_policies: [bool; 2],
     #[cfg(feature = "packetmeta-id")]
     listen_bound_device: Option<NonZeroU32>,
     #[cfg(feature = "packetmeta-id")]
@@ -731,7 +765,8 @@ impl<'a> Socket<'a> {
 
         Socket {
             state: State::Closed,
-            pending_reset: None,
+            pending_error: None,
+            soft_error: None,
             timer: Timer::new(),
             rtte: RttEstimator::default(),
             assembler: Assembler::new(),
@@ -747,6 +782,8 @@ impl<'a> Socket<'a> {
             listen_endpoint: IpListenEndpoint::default(),
             listen_ip_version: None,
             listen_pmtu_policies: None,
+            recv_error_policies: [false; 2],
+            listen_recv_error_policies: [false; 2],
             #[cfg(feature = "packetmeta-id")]
             listen_bound_device: None,
             #[cfg(feature = "packetmeta-id")]
@@ -1184,10 +1221,39 @@ impl<'a> Socket<'a> {
         self.output_ip_mtu
     }
 
+    pub fn recv_error_policies(&self) -> [bool; 2] {
+        self.recv_error_policies
+    }
+
+    pub fn set_recv_error_policy(&mut self, version: crate::wire::IpVersion, enabled: bool) {
+        let index = match version {
+            #[cfg(feature = "proto-ipv4")]
+            crate::wire::IpVersion::Ipv4 => 0,
+            #[cfg(feature = "proto-ipv6")]
+            crate::wire::IpVersion::Ipv6 => 1,
+        };
+        self.recv_error_policies[index] = enabled;
+    }
+
+    pub fn set_listen_recv_error_policies(&mut self, policies: [bool; 2]) {
+        self.listen_recv_error_policies = policies;
+    }
+
     /// Validate the original outbound TCP header quoted by an ICMP error.
     /// The inclusive sequence interval follows Linux's snd_una..snd_nxt
     /// check, using admitted high water rather than the retransmit cursor.
     pub fn accepts_pmtu_quote(
+        &self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        seq: TcpSeqNumber,
+        ingress: u32,
+    ) -> bool {
+        self.accepts_error_quote(local, remote, seq, ingress)
+    }
+
+    /// Associate an ICMP quotation with the currently admitted TCP connection.
+    pub fn accepts_error_quote(
         &self,
         local: IpEndpoint,
         remote: IpEndpoint,
@@ -1201,6 +1267,11 @@ impl<'a> Socket<'a> {
             return false;
         };
         if tuple.local != local || tuple.remote != remote {
+            return false;
+        }
+        // Linux request_sock ICMP association requires exactly the SYNACK ISN,
+        // unlike the inclusive send interval used by full TCP sockets.
+        if self.is_passive_open() && seq != self.local_seq_no {
             return false;
         }
         #[cfg(feature = "packetmeta-id")]
@@ -1469,12 +1540,90 @@ impl<'a> Socket<'a> {
     /// the socket is reused by [`Self::listen`] or [`Self::connect`]. A normal
     /// FIN, a local abort, and a rejected RST do not create an event.
     pub fn reset_state(&self) -> Option<State> {
-        self.pending_reset
+        self.pending_error
+            .filter(|error| error.reason == ErrorReason::Reset)
+            .map(|error| error.state)
     }
 
     /// Consume the pending remote reset event, returning the pre-reset state.
     pub fn take_reset(&mut self) -> Option<State> {
-        self.pending_reset.take()
+        self.reset_state().map(|state| {
+            self.pending_error = None;
+            state
+        })
+    }
+
+    pub fn pending_error(&self) -> Option<PendingError> {
+        self.pending_error
+    }
+
+    pub fn is_passive_open(&self) -> bool {
+        self.state == State::SynReceived && self.listen_endpoint.port != 0
+    }
+
+    pub fn take_error(&mut self) -> Option<PendingError> {
+        self.pending_error.take()
+    }
+
+    /// SO_ERROR may explicitly consume a soft error, unlike ordinary I/O.
+    pub fn take_soft_error(&mut self) -> Option<NetworkError> {
+        self.soft_error.take()
+    }
+
+    /// Restore the next queued ABI error without changing TCP state.
+    pub fn set_reported_network_error(&mut self, reason: NetworkError) {
+        self.pending_error = Some(PendingError {
+            reason: ErrorReason::Network(reason),
+            state: self.state,
+        });
+    }
+
+    /// Apply an already associated and sequence-validated control error.
+    /// Passive SYN requests are discarded silently only when their caller's
+    /// protocol policy requests it. No synthetic TCP reset is emitted.
+    pub fn report_network_error(
+        &mut self,
+        reason: NetworkError,
+        report: bool,
+        abort_request: bool,
+    ) {
+        if matches!(self.state, State::Closed | State::Listen | State::TimeWait) {
+            return;
+        }
+        let state = self.state;
+        if state == State::SynReceived && self.listen_endpoint.port != 0 {
+            if abort_request {
+                self.tuple = None;
+                self.ts_recent = None;
+                self.last_remote_tsval = 0;
+                self.tsval_generator = self.configured_tsval_generator;
+                self.remote_last_ack = None;
+                self.admitted_seq_end = None;
+                self.soft_error = None;
+                self.pending_error = None;
+                self.set_state(State::Listen);
+                self.notify_lifecycle();
+            }
+            return;
+        }
+        if matches!(state, State::SynSent | State::SynReceived) {
+            self.pending_error = Some(PendingError {
+                reason: ErrorReason::Network(reason),
+                state,
+            });
+            self.tx_buffer.clear();
+            self.tuple = None;
+            self.time_wait = None;
+            self.set_state(State::Closed);
+            self.notify_lifecycle();
+        } else if report {
+            self.pending_error = Some(PendingError {
+                reason: ErrorReason::Network(reason),
+                state,
+            });
+        } else {
+            self.soft_error = Some(reason);
+        }
     }
 
     /// Returns the window scaling factor advertised to the remote.
@@ -1495,7 +1644,8 @@ impl<'a> Socket<'a> {
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
 
         self.state = State::Closed;
-        self.pending_reset = None;
+        self.pending_error = None;
+        self.soft_error = None;
         self.timer = Timer::new();
         self.rtte = RttEstimator::default();
         self.assembler = Assembler::new();
@@ -2614,6 +2764,11 @@ impl<'a> Socket<'a> {
         let mut ack_all = false;
         if repr.control != TcpControl::Rst {
             if let Some(ack_number) = repr.ack_number {
+                // A valid current ACK demonstrates a working path. Linux
+                // tcp_ack clears sk_err_soft here, not in user I/O itself.
+                if ack_number >= self.local_seq_no {
+                    self.soft_error = None;
+                }
                 // Sequence number corresponding to the first byte in `tx_buffer`.
                 // This normally equals `local_seq_no`, but is 1 higher if we have sent a SYN,
                 // as the SYN occupies 1 sequence number "before" the data.
@@ -2676,7 +2831,10 @@ impl<'a> Socket<'a> {
             // RSTs in any other state close the socket.
             (_, TcpControl::Rst) => {
                 tcp_trace!("received RST");
-                self.pending_reset = Some(self.state);
+                self.pending_error = Some(PendingError {
+                    reason: ErrorReason::Reset,
+                    state: self.state,
+                });
                 self.set_state(State::Closed);
                 self.tuple = None;
                 return None;
@@ -2696,6 +2854,7 @@ impl<'a> Socket<'a> {
                     self.remote_mss = max_seg_size as usize
                 }
 
+                self.recv_error_policies = self.listen_recv_error_policies;
                 if let Some(policies) = self.listen_pmtu_policies {
                     self.pmtu_discover = policies[match ip_repr {
                         #[cfg(feature = "proto-ipv4")]
@@ -3351,6 +3510,13 @@ impl<'a> Socket<'a> {
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
+            self.pending_error = Some(PendingError {
+                reason: self
+                    .soft_error
+                    .take()
+                    .map_or(ErrorReason::TimedOut, ErrorReason::Network),
+                state: self.state,
+            });
             self.set_state(State::Closed);
         } else if let Some(retransmit_delta) = self.timer.should_retransmit(cx.now()) {
             // If a retransmit timer expired, we should resend data starting at the last ACK.
@@ -10584,5 +10750,85 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    #[test]
+    fn control_error_active_handshake_closes_without_sending_rst() {
+        let mut s = socket_syn_sent();
+        s.report_network_error(NetworkError::ConnectionRefused, false, false);
+        assert_eq!(s.state(), State::Closed);
+        assert_eq!(s.reset_state(), None);
+        assert_eq!(
+            s.pending_error(),
+            Some(PendingError {
+                reason: ErrorReason::Network(NetworkError::ConnectionRefused),
+                state: State::SynSent,
+            })
+        );
+        recv_nothing!(s);
+        assert!(s.take_error().is_some());
+        assert_eq!(s.take_error(), None);
+    }
+
+    #[test]
+    fn control_error_established_soft_and_reported_do_not_close() {
+        let mut s = socket_established();
+        s.report_network_error(NetworkError::HostUnreachable, false, false);
+        assert_eq!(s.state(), State::Established);
+        assert_eq!(s.take_error(), None);
+        assert_eq!(s.take_soft_error(), Some(NetworkError::HostUnreachable));
+        assert_eq!(s.take_soft_error(), None);
+        s.report_network_error(NetworkError::ConnectionRefused, true, false);
+        assert_eq!(s.state(), State::Established);
+        assert!(s.can_send());
+        assert_eq!(
+            s.take_error().unwrap().reason,
+            ErrorReason::Network(NetworkError::ConnectionRefused)
+        );
+        assert_eq!(s.send_slice(b"still alive"), Ok(11));
+    }
+
+    #[test]
+    fn control_error_passive_request_policy_recycles_without_error() {
+        let mut s = socket_syn_received();
+        s.listen_endpoint = LOCAL_END.into();
+        s.admitted_seq_end = Some(s.local_seq_no + 1);
+        assert!(s.accepts_error_quote(TUPLE.local, TUPLE.remote, s.local_seq_no, 0));
+        assert!(!s.accepts_error_quote(TUPLE.local, TUPLE.remote, s.local_seq_no + 1, 0));
+        s.report_network_error(NetworkError::ConnectionRefused, false, false);
+        assert_eq!(s.state(), State::SynReceived);
+        s.report_network_error(NetworkError::NetworkUnreachable, true, true);
+        assert_eq!(s.state(), State::Listen);
+        assert_eq!(s.take_error(), None);
+        assert_eq!(s.take_soft_error(), None);
+        assert_eq!(s.tuple, None);
+    }
+
+    #[test]
+    fn control_error_reuse_clears_soft_and_reported_errors() {
+        let mut s = socket_established();
+        s.report_network_error(NetworkError::HostUnreachable, false, false);
+        s.report_network_error(NetworkError::ConnectionRefused, true, false);
+        s.reset();
+        assert_eq!(s.take_error(), None);
+        assert_eq!(s.take_soft_error(), None);
+    }
+
+    #[test]
+    fn control_error_real_timeout_promotes_soft_reason() {
+        let mut s = socket_established();
+        s.send_slice(b"pending").unwrap();
+        s.set_timeout(Some(Duration::from_millis(100)));
+        pmtu_dispatch(&mut s, 1500, 0, TcpPacketAdmission::Admitted);
+        s.report_network_error(NetworkError::HostUnreachable, false, false);
+        assert_eq!(s.state(), State::Established);
+        s.cx.set_now(Instant::from_millis(100));
+        pmtu_dispatch(&mut s, 1500, 100, TcpPacketAdmission::Admitted);
+        assert_eq!(s.state(), State::Closed);
+        assert_eq!(
+            s.take_error().unwrap().reason,
+            ErrorReason::Network(NetworkError::HostUnreachable)
+        );
+        assert_eq!(s.take_soft_error(), None);
     }
 }

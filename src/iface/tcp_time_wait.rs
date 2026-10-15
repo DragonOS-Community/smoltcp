@@ -248,7 +248,10 @@ impl<'storage, 'a: 'storage> SocketSet<'storage, 'a> {
             if self.get::<tcp::Socket>(h).state() != State::TimeWait {
                 let s = self.get_mut::<tcp::Socket>(h);
                 let tx = s.egress_meta();
-                return Some(s.process(cx, ip, tcp).map(|(ip, tcp)| (tx, ip, tcp)));
+                return Some(
+                    s.process_with_meta(cx, meta, ip, tcp)
+                        .map(|(ip, tcp)| (tx, ip, tcp)),
+                );
             }
         }
         #[cfg(feature = "packetmeta-id")]
@@ -287,6 +290,7 @@ impl<'storage, 'a: 'storage> SocketSet<'storage, 'a> {
                 if let Some(h) = listener {
                     self.get_mut::<tcp::Socket>(h).process_with_reuse(
                         cx,
+                        meta,
                         ip,
                         tcp,
                         Some((&state, identity)),

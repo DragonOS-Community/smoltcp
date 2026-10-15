@@ -2723,7 +2723,7 @@ fn test_join_ipv6_multicast_group(#[case] medium: Medium) {
             MldAddressRecordRepr {
                 num_srcs: 0,
                 mcast_addr: group_addr,
-                record_type: MldRecordType::ChangeToInclude,
+                record_type: MldRecordType::ChangeToExclude,
                 aux_data_len: 0,
                 payload: &[],
             }
@@ -2734,6 +2734,30 @@ fn test_join_ipv6_multicast_group(#[case] medium: Medium) {
             assert!(!iface.has_multicast_group(group_addr));
             iface.poll(timestamp, &mut device, &mut sockets);
             assert!(!iface.has_multicast_group(group_addr));
+            let leaves = recv_icmpv6(&mut device, timestamp);
+            assert_eq!(leaves.len(), 1);
+            let bytes = leaves.into_iter().next().unwrap().into_inner();
+            let ipv6 = Ipv6Packet::new_unchecked(bytes.as_slice());
+            let payload = ipv6.payload();
+            let hbh_header = Ipv6HopByHopHeader::new_checked(&payload[..8]).unwrap();
+            let hbh = Ipv6HopByHopRepr::parse(&hbh_header).unwrap();
+            let packet = Icmpv6Packet::new_checked(&payload[hbh.buffer_len()..]).unwrap();
+            let report =
+                Icmpv6Repr::parse(&ipv6.src_addr(), &ipv6.dst_addr(), &packet, checksum_caps)
+                    .unwrap();
+            let Icmpv6Repr::Mld(MldRepr::Report {
+                nr_mcast_addr_rcrds,
+                data,
+            }) = report
+            else {
+                panic!("expected an MLD leave report");
+            };
+            assert_eq!(nr_mcast_addr_rcrds, 1);
+            let record = MldAddressRecord::new_checked(data).unwrap();
+            let record = MldAddressRecordRepr::parse(&record).unwrap();
+            assert_eq!(record.mcast_addr, group_addr);
+            assert_eq!(record.record_type, MldRecordType::ChangeToInclude);
+            assert_eq!(record.num_srcs, 0);
         }
     }
 }

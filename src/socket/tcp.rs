@@ -2183,7 +2183,31 @@ impl<'a> Socket<'a> {
     ///
     /// This function otherwise behaves identically to [recv_slice](#method.recv_slice).
     pub fn peek_slice(&mut self, data: &mut [u8]) -> Result<usize, RecvError> {
-        Ok(self.rx_buffer.read_allocated(0, data))
+        self.peek_slice_at(0, data)
+    }
+
+    /// Peek at received octets starting at `offset` past the unread head,
+    /// without consuming data or pending errors.
+    ///
+    /// Returns zero when the offset is at or beyond the queued data. Like
+    /// [`Self::peek_slice`], this copies across a receive-buffer wrap.
+    pub fn peek_slice_at(&mut self, offset: usize, data: &mut [u8]) -> Result<usize, RecvError> {
+        // Guard before ring indexing, including for an arbitrarily large offset.
+        if offset >= self.rx_buffer.len() {
+            return Ok(0);
+        }
+        Ok(self.rx_buffer.read_allocated(offset, data))
+    }
+
+    /// Return the sequence position of the first unread payload byte.
+    ///
+    /// Consuming payload advances this position; receiving more payload or a
+    /// FIN does not. A caller keeping a private peek cursor can compare this
+    /// position between receive attempts to detect another consumer.
+    pub fn recv_head_seq(&self) -> TcpSeqNumber {
+        // remote_seq_no includes an accepted FIN before queued payload has
+        // necessarily been consumed. Exclude that control byte from the head.
+        self.remote_seq_no - usize::from(self.rx_fin_received)
     }
 
     /// Return the amount of octets queued in the transmit buffer.
@@ -6473,6 +6497,130 @@ mod test {
             &mut peeked_buf[..actually_peeked],
             &mut recv_buf[..actually_recvd]
         );
+    }
+
+    #[test]
+    fn test_peek_cursor_slice_offset_and_consumption() {
+        let mut s = socket_established();
+        assert_eq!(s.rx_buffer.enqueue_slice(b"abcdef"), 6);
+        let head = s.recv_head_seq();
+        let mut bytes = [b'!'; 8];
+        assert_eq!(s.peek_slice_at(2, &mut bytes[..3]), Ok(3));
+        assert_eq!(&bytes[..3], b"cde");
+        assert_eq!(s.recv_queue(), 6);
+        assert_eq!(s.recv_head_seq(), head);
+        assert_eq!(s.recv_slice(&mut bytes[..2]), Ok(2));
+        assert_eq!(s.recv_head_seq(), head + 2);
+        assert_eq!(s.peek_slice_at(1, &mut bytes), Ok(3));
+        assert_eq!(&bytes[..3], b"def");
+        assert_eq!(s.recv_queue(), 4);
+    }
+
+    #[test]
+    fn test_peek_cursor_slice_offset_wrap() {
+        let mut s = socket_established_with_buffer_sizes(10, 10);
+        assert_eq!(s.rx_buffer.enqueue_slice(b"01234567"), 8);
+        let mut consumed = [0; 6];
+        assert_eq!(s.recv_slice(&mut consumed), Ok(6));
+        assert_eq!(s.rx_buffer.enqueue_slice(b"89012"), 5);
+        let head = s.recv_head_seq();
+        let mut bytes = [b'!'; 8];
+        assert_eq!(s.peek_slice_at(1, &mut bytes), Ok(6));
+        assert_eq!(&bytes[..6], b"789012");
+        assert_eq!(&bytes[6..], b"!!");
+        assert_eq!(s.recv_queue(), 7);
+        assert_eq!(s.recv_head_seq(), head);
+        assert_eq!(s.peek_slice(&mut bytes), Ok(7));
+        assert_eq!(&bytes[..7], b"6789012");
+    }
+
+    #[test]
+    fn test_peek_cursor_slice_offset_empty_and_out_of_bounds() {
+        let mut s = socket_established_with_buffer_sizes(0, 0);
+        let mut bytes = [b'!'; 4];
+        for offset in [0, 1, usize::MAX] {
+            assert_eq!(s.peek_slice_at(offset, &mut bytes), Ok(0));
+            assert_eq!(&bytes, b"!!!!");
+        }
+        let mut s = socket_established();
+        assert_eq!(s.rx_buffer.enqueue_slice(b"abc"), 3);
+        let head = s.recv_head_seq();
+        for offset in [3, 4, usize::MAX] {
+            assert_eq!(s.peek_slice_at(offset, &mut bytes), Ok(0));
+            assert_eq!(&bytes, b"!!!!");
+        }
+        assert_eq!(s.peek_slice_at(1, &mut []), Ok(0));
+        assert_eq!(s.recv_head_seq(), head);
+        assert_eq!(s.recv_queue(), 3);
+    }
+
+    #[test]
+    fn test_peek_cursor_fin_keeps_queued_payload_head() {
+        let mut s = socket_established();
+        let head = s.recv_head_seq();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: b"abcdef",
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state(), State::CloseWait);
+        assert_eq!(s.recv_head_seq(), head);
+        let mut bytes = [0; 4];
+        assert_eq!(s.peek_slice_at(2, &mut bytes), Ok(4));
+        assert_eq!(&bytes, b"cdef");
+        assert_eq!(s.recv_slice(&mut bytes), Ok(4));
+        assert_eq!(s.recv_head_seq(), head + 4);
+        assert_eq!(s.recv_slice(&mut bytes), Ok(2));
+        assert_eq!(s.recv_head_seq(), head + 6);
+        assert_eq!(s.recv_slice(&mut bytes), Err(RecvError::Finished));
+        assert_eq!(s.recv_head_seq(), head + 6);
+    }
+
+    #[test]
+    fn test_peek_cursor_head_sequence_wrap_with_fin() {
+        let mut s = socket_established();
+        s.remote_seq_no = TcpSeqNumber(-2);
+        assert_eq!(s.rx_buffer.enqueue_slice(b"abcd"), 4);
+        let head = s.recv_head_seq();
+        let mut bytes = [0; 3];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(3));
+        assert_eq!(s.recv_head_seq(), head + 3);
+        s.remote_seq_no += 1;
+        s.rx_fin_received = true;
+        s.state = State::CloseWait;
+        assert_eq!(s.recv_head_seq(), head + 3);
+        assert_eq!(s.recv_slice(&mut bytes), Ok(1));
+        assert_eq!(s.recv_head_seq(), head + 4);
+    }
+
+    #[test]
+    fn test_peek_cursor_does_not_consume_reset_error() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        let pending = s.pending_error();
+        assert!(pending.is_some());
+        let head = s.recv_head_seq();
+        let mut bytes = [b'!'; 4];
+        assert_eq!(s.peek_slice(&mut bytes), Ok(0));
+        assert_eq!(s.peek_slice_at(usize::MAX, &mut bytes), Ok(0));
+        assert_eq!(&bytes, b"!!!!");
+        assert_eq!(s.pending_error(), pending);
+        assert_eq!(s.recv_head_seq(), head);
+        assert_eq!(s.take_reset(), Some(State::Established));
+        assert!(s.pending_error().is_none());
     }
 
     fn setup_rfc2018_cases() -> (TestSocket, Vec<u8>) {

@@ -32,6 +32,7 @@ mod wire {
             control: TcpControl::Syn,
             seq_number: TcpSeqNumber(0x01234567),
             ack_number: None,
+            urgent_at: None,
             window_len: 0x0123,
             window_scale: None,
             max_seg_size: None,

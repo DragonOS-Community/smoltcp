@@ -514,6 +514,24 @@ pub enum CongestionControl {
     Cubic,
 }
 
+/// State of the most recent BSD/Linux urgent mark. The byte remains in the
+/// ordinary sequence space until an ordinary receiver passes the mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrgentState {
+    Pending,
+    Valid(u8),
+    Read,
+}
+
+/// One ordinary receive span. A non-inline urgent byte is represented as a
+/// skipped sequence byte, never as a second payload queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiveSpan {
+    pub offset: usize,
+    pub len: usize,
+    pub boundary: bool,
+}
+
 /// A Transmission Control Protocol socket.
 ///
 /// A TCP socket may passively listen for connections or actively connect to another endpoint.
@@ -537,6 +555,10 @@ pub struct Socket<'a> {
     /// closed the receive side, new data in FIN-WAIT states must reset the
     /// connection instead of being queued indefinitely.
     rx_shutdown: bool,
+    rx_urgent: Option<(TcpSeqNumber, UrgentState)>,
+    urgent_inline: bool,
+    urgent_notification: bool,
+    tx_urgent_end: Option<TcpSeqNumber>,
     tx_buffer: SocketBuffer<'a>,
     // Optional integration admission limit, independent of retained physical
     // storage. Shrinking it never discards already queued transmit bytes.
@@ -776,6 +798,10 @@ impl<'a> Socket<'a> {
             rx_admission_limit: None,
             rx_fin_received: false,
             rx_shutdown: false,
+            rx_urgent: None,
+            urgent_inline: false,
+            urgent_notification: false,
+            tx_urgent_end: None,
             timeout: None,
             keep_alive: None,
             hop_limit: None,
@@ -1653,6 +1679,9 @@ impl<'a> Socket<'a> {
         self.rx_buffer.clear();
         self.rx_fin_received = false;
         self.rx_shutdown = false;
+        self.rx_urgent = None;
+        self.urgent_notification = false;
+        self.tx_urgent_end = None;
         self.time_wait = None;
         self.ts_recent = None;
         self.last_remote_tsval = 0;
@@ -2122,6 +2151,12 @@ impl<'a> Socket<'a> {
         let _old_length = self.rx_buffer.len();
         let (size, result) = f(&mut self.rx_buffer);
         self.remote_seq_no += size;
+        if self
+            .rx_urgent
+            .is_some_and(|(mark, _)| self.remote_seq_no - usize::from(self.rx_fin_received) > mark)
+        {
+            self.rx_urgent = None;
+        }
         if size > 0 {
             #[cfg(any(test, feature = "verbose"))]
             tcp_trace!(
@@ -2199,6 +2234,122 @@ impl<'a> Socket<'a> {
         Ok(self.rx_buffer.read_allocated(offset, data))
     }
 
+    /// Select a bounded ordinary span without changing the receive head.
+    /// Callers retain the returned physical offset when peeking across a hole.
+    pub fn receive_span(&self, offset: usize, limit: usize) -> ReceiveSpan {
+        let queued = self.rx_buffer.len();
+        let mut offset = offset.min(queued);
+        let mut boundary = false;
+        let mut end = queued;
+        if let Some((mark, _)) = self.rx_urgent {
+            let seq = self.recv_head_seq() + offset;
+            if seq < mark {
+                end = end.min(offset + (mark - seq));
+                boundary = end == offset + (mark - seq);
+            } else if seq == mark && !self.urgent_inline && offset < queued {
+                offset += 1;
+            }
+        }
+        let len = limit.min(end.saturating_sub(offset));
+        ReceiveSpan {
+            offset,
+            len,
+            boundary: boundary && offset + len == end,
+        }
+    }
+
+    /// FIONREAD stops at the urgent mark unless SO_OOBINLINE is enabled.
+    pub fn ordinary_queue(&self) -> usize {
+        if !self.urgent_inline {
+            if let Some((mark, _)) = self.rx_urgent {
+                let head = self.recv_head_seq();
+                if mark >= head && mark < head + self.rx_buffer.len() {
+                    return mark - head;
+                }
+            }
+        }
+        self.rx_buffer.len()
+    }
+
+    pub fn ordinary_can_recv(&self) -> bool {
+        self.receive_span(0, usize::MAX).len != 0
+    }
+
+    /// Whether FIN has been accepted, independently of queued payload.
+    pub fn received_fin(&self) -> bool {
+        self.rx_fin_received
+    }
+
+    pub fn urgent_state(&self) -> Option<UrgentState> {
+        self.rx_urgent.map(|(_, state)| state)
+    }
+
+    pub fn at_urgent_mark(&self) -> bool {
+        self.rx_urgent
+            .is_some_and(|(mark, _)| mark == self.recv_head_seq())
+    }
+
+    pub fn urgent_inline(&self) -> bool {
+        self.urgent_inline
+    }
+
+    pub fn set_urgent_inline(&mut self, enabled: bool) {
+        self.urgent_inline = enabled;
+    }
+
+    /// OOB consumption is independent of ordinary stream consumption.
+    pub fn consume_urgent(&mut self) {
+        if let Some((_, state)) = self.rx_urgent.as_mut() {
+            *state = UrgentState::Read;
+        }
+    }
+
+    pub fn take_urgent_notification(&mut self) -> bool {
+        core::mem::take(&mut self.urgent_notification)
+    }
+
+    /// Queue data and publish the accepted urgent prefix in one transport
+    /// transaction. `urgent_end` is a one-based offset in `data`; a partial
+    /// enqueue advances the mark as Linux does before waiting for send space.
+    pub fn send_slice_with_urgent(
+        &mut self,
+        data: &[u8],
+        urgent_end: Option<usize>,
+    ) -> Result<usize, SendError> {
+        let start = self.local_seq_no + self.tx_buffer.len();
+        let written = self.send_slice(data)?;
+        if let Some(end) = urgent_end.filter(|end| *end != 0) {
+            if written != 0 {
+                self.tx_urgent_end = Some(start + end.min(written));
+            }
+        }
+        Ok(written)
+    }
+
+    fn process_urgent(&mut self, repr: &TcpRepr) {
+        if let Some(pointer) = repr.urgent_at {
+            let mark = repr.seq_number + usize::from(pointer.saturating_sub(1));
+            let head = self.recv_head_seq();
+            let next = head + self.rx_buffer.len();
+            if mark >= head && mark >= next && self.rx_urgent.is_none_or(|(old, _)| mark > old) {
+                // Replacing a mark at the current head must not expose its
+                // already excluded byte as ordinary data.
+                if self.at_urgent_mark() && !self.urgent_inline && !self.rx_buffer.is_empty() {
+                    self.rx_buffer.dequeue_many(1);
+                    self.remote_seq_no += 1;
+                }
+                self.rx_urgent = Some((mark, UrgentState::Pending));
+                self.urgent_notification = true;
+            }
+        }
+        if let Some((mark, state @ UrgentState::Pending)) = self.rx_urgent.as_mut() {
+            let start = repr.seq_number + usize::from(repr.control == TcpControl::Syn);
+            if *mark >= start && *mark < start + repr.payload.len() {
+                *state = UrgentState::Valid(repr.payload[*mark - start]);
+            }
+        }
+    }
+
     /// Return the sequence position of the first unread payload byte.
     ///
     /// Consuming payload advances this position; receiving more payload or a
@@ -2250,6 +2401,7 @@ impl<'a> Socket<'a> {
             control: TcpControl::None,
             seq_number: TcpSeqNumber(0),
             ack_number: None,
+            urgent_at: None,
             window_len: 0,
             window_scale: None,
             max_seg_size: None,
@@ -3143,6 +3295,9 @@ impl<'a> Socket<'a> {
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
             self.local_seq_no = ack_number;
+            if self.tx_urgent_end.is_some_and(|end| ack_number >= end) {
+                self.tx_urgent_end = None;
+            }
             // During retransmission, if an earlier segment got lost but later was
             // successfully received, self.local_seq_no can move past self.remote_last_seq.
             // Do not attempt to retransmit the latter segments; not only this is pointless
@@ -3163,6 +3318,13 @@ impl<'a> Socket<'a> {
             {
                 self.ts_recent = Some((timestamp.tsval, cx.now()));
             }
+        }
+
+        if !matches!(
+            self.state,
+            State::Listen | State::SynSent | State::SynReceived | State::Closed | State::TimeWait
+        ) {
+            self.process_urgent(repr);
         }
 
         let payload_len = payload.len();
@@ -3321,7 +3483,12 @@ impl<'a> Socket<'a> {
         // * There's no data in flight
         // * We can send a full packet
         // * We have all the data we'll ever send (we're closing send)
-        if self.nagle && data_in_flight && !can_send_full && !want_fin {
+        if self.nagle
+            && self.tx_urgent_end.is_none()
+            && data_in_flight
+            && !can_send_full
+            && !want_fin
+        {
             can_send = false;
         }
 
@@ -3623,6 +3790,7 @@ impl<'a> Socket<'a> {
             control: TcpControl::None,
             seq_number: self.remote_last_seq,
             ack_number: Some(self.remote_seq_no + self.rx_buffer.len()),
+            urgent_at: None,
             window_len: self.scaled_window(),
             window_scale: None,
             max_seg_size: None,
@@ -3775,6 +3943,19 @@ impl<'a> Socket<'a> {
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
             let max_segment_size = ip_mtu.saturating_sub(ip_repr.header_len() + TCP_HEADER_LEN);
             repr.max_seg_size = Some(max_segment_size as u16);
+        }
+
+        if let Some(end) = self.tx_urgent_end {
+            if repr.seq_number < end {
+                let distance = end - repr.seq_number;
+                repr.urgent_at = if distance <= u16::MAX as usize {
+                    Some(distance as u16)
+                } else if repr.seq_number + u16::MAX as usize > self.send_sequence_end() {
+                    Some(u16::MAX)
+                } else {
+                    None
+                };
+            }
         }
 
         // Actually send the packet. If this succeeds, it means the packet is in
@@ -4065,6 +4246,7 @@ mod test {
         control: TcpControl::None,
         seq_number: TcpSeqNumber(0),
         ack_number: Some(TcpSeqNumber(0)),
+        urgent_at: None,
         window_len: 256,
         window_scale: None,
         max_seg_size: None,
@@ -4086,6 +4268,7 @@ mod test {
         control: TcpControl::None,
         seq_number: TcpSeqNumber(0),
         ack_number: Some(TcpSeqNumber(0)),
+        urgent_at: None,
         window_len: 64,
         window_scale: None,
         max_seg_size: None,
@@ -4320,6 +4503,7 @@ mod test {
             let probe = TcpRepr {
                 seq_number: s.remote_seq_no - 1,
                 ack_number: Some(start),
+                urgent_at: None,
                 ..SEND_TEMPL
             };
             let TestSocket { socket, cx } = &mut s;
@@ -4398,6 +4582,7 @@ mod test {
         let ack = TcpRepr {
             seq_number: s.remote_seq_no,
             ack_number: Some(start + 8),
+            urgent_at: None,
             window_len: s.remote_win_len as u16,
             ..SEND_TEMPL
         };
@@ -4941,6 +5126,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             }
@@ -4950,6 +5136,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 58,
                 ..RECV_TEMPL
             }]
@@ -5011,6 +5198,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 sack_permitted: false,
                 ..SEND_TEMPL
             }
@@ -5022,6 +5210,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 ..RECV_TEMPL
             }]
@@ -5034,6 +5223,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 sack_permitted: true,
                 ..SEND_TEMPL
             }
@@ -5045,6 +5235,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 sack_permitted: true,
                 ..RECV_TEMPL
@@ -5078,6 +5269,7 @@ mod test {
                     control: TcpControl::Syn,
                     seq_number: REMOTE_SEQ,
                     ack_number: None,
+                    urgent_at: None,
                     window_scale: Some(0),
                     ..SEND_TEMPL
                 }
@@ -5089,6 +5281,7 @@ mod test {
                     control: TcpControl::Syn,
                     seq_number: LOCAL_SEQ,
                     ack_number: Some(REMOTE_SEQ + 1),
+                    urgent_at: None,
                     max_seg_size: Some(BASE_MSS),
                     window_scale: Some(*shift_amt),
                     window_len: u16::try_from(*buffer_size).unwrap_or(u16::MAX),
@@ -5129,6 +5322,7 @@ mod test {
         let syn = TcpRepr {
             control: TcpControl::Syn,
             ack_number: None,
+            urgent_at: None,
             ..SEND_TEMPL
         };
         for constraint in [None, Some(IpVersion::Ipv4), Some(IpVersion::Ipv6)] {
@@ -5201,6 +5395,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -5218,6 +5413,7 @@ mod test {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             ack_number: None,
+            urgent_at: None,
             max_seg_size: Some(0),
             ..SEND_TEMPL
         };
@@ -5252,6 +5448,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(1200),
                 ..SEND_TEMPL
             };
@@ -5300,6 +5497,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -5313,6 +5511,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 ..RECV_TEMPL
             }]
@@ -5323,6 +5522,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -5337,6 +5537,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -5352,6 +5553,7 @@ mod test {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             ack_number: None,
+            urgent_at: None,
             ..SEND_TEMPL
         };
         let ip = IpRepr::Ipv6(crate::wire::Ipv6Repr {
@@ -5370,6 +5572,7 @@ mod test {
             control: TcpControl::Rst,
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(s.local_seq_no),
+            urgent_at: None,
             ..SEND_TEMPL
         };
         s.socket
@@ -5394,6 +5597,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             };
             let ip = IpRepr::Ipv6(crate::wire::Ipv6Repr {
@@ -5461,6 +5665,7 @@ mod test {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             ack_number: None,
+            urgent_at: None,
             max_seg_size: Some(BASE_MSS),
             ..SEND_TEMPL
         };
@@ -5524,6 +5729,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -5539,6 +5745,7 @@ mod test {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             ack_number: Some(LOCAL_SEQ),
+            urgent_at: None,
             ..SEND_TEMPL
         };
         assert!(!s.socket.accepts(&mut s.cx, &SEND_IP_TEMPL, &tcp_repr));
@@ -5555,6 +5762,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -5582,6 +5790,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 ..RECV_TEMPL
             }]
@@ -5591,6 +5800,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -5607,6 +5817,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 ..RECV_TEMPL
             }]
@@ -5616,12 +5827,14 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ), // wrong
+                urgent_at: None,
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 control: TcpControl::Rst,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 window_len: 0,
                 ..RECV_TEMPL
             })
@@ -5638,6 +5851,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 ..RECV_TEMPL
             }]
@@ -5647,12 +5861,14 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 2), // wrong
+                urgent_at: None,
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 control: TcpControl::Rst,
                 seq_number: LOCAL_SEQ + 2,
                 ack_number: None,
+                urgent_at: None,
                 window_len: 0,
                 ..RECV_TEMPL
             })
@@ -5669,6 +5885,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 ..RECV_TEMPL
             }]
@@ -5679,6 +5896,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             }
@@ -5688,6 +5906,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6 + 1),
+                urgent_at: None,
                 window_len: 58,
                 ..RECV_TEMPL
             }]
@@ -5710,6 +5929,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 ..RECV_TEMPL
             }]
@@ -5720,6 +5940,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -5738,6 +5959,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -5749,6 +5971,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: None,
                 ..RECV_TEMPL
@@ -5759,6 +5982,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 window_scale: None,
                 ..SEND_TEMPL
             }
@@ -5777,6 +6001,7 @@ mod test {
                     control: TcpControl::Syn,
                     seq_number: REMOTE_SEQ,
                     ack_number: None,
+                    urgent_at: None,
                     window_scale: Some(scale),
                     ..SEND_TEMPL
                 }
@@ -5789,6 +6014,7 @@ mod test {
                     control: TcpControl::Syn,
                     seq_number: LOCAL_SEQ,
                     ack_number: Some(REMOTE_SEQ + 1),
+                    urgent_at: None,
                     max_seg_size: Some(BASE_MSS),
                     window_scale: Some(0),
                     ..RECV_TEMPL
@@ -5799,6 +6025,7 @@ mod test {
                 TcpRepr {
                     seq_number: REMOTE_SEQ + 1,
                     ack_number: Some(LOCAL_SEQ + 1),
+                    urgent_at: None,
                     window_scale: None,
                     ..SEND_TEMPL
                 }
@@ -5856,6 +6083,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -5868,6 +6096,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(0),
                 ..SEND_TEMPL
@@ -5918,6 +6147,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -5930,6 +6160,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(0),
                 ..SEND_TEMPL
@@ -5940,6 +6171,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -5957,6 +6189,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -5971,6 +6204,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(0),
                 ..SEND_TEMPL
@@ -5985,6 +6219,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 ..RECV_TEMPL
@@ -6000,6 +6235,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 ..RECV_TEMPL
@@ -6013,6 +6249,7 @@ mod test {
                 control: TcpControl::None,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -6029,6 +6266,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -6041,6 +6279,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ), // WRONG
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(0),
                 ..SEND_TEMPL
@@ -6049,6 +6288,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 window_len: 0,
                 ..RECV_TEMPL
             })
@@ -6065,6 +6305,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -6079,6 +6320,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(0),
                 ..SEND_TEMPL
@@ -6093,6 +6335,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -6109,6 +6352,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -6125,6 +6369,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -6141,6 +6386,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(TcpSeqNumber(1234)),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -6157,6 +6403,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -6169,6 +6416,7 @@ mod test {
                 control: TcpControl::None, // Unexpected
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 1), // Correct
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -6187,6 +6435,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -6199,12 +6448,14 @@ mod test {
                 control: TcpControl::None,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ), // WRONG
+                urgent_at: None,
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 control: TcpControl::Rst,
                 seq_number: LOCAL_SEQ, // matching the ack_number of the unexpected ack
                 ack_number: None,
+                urgent_at: None,
                 window_len: 0,
                 ..RECV_TEMPL
             })
@@ -6223,6 +6474,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -6235,12 +6487,14 @@ mod test {
                 control: TcpControl::None,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 123456), // WRONG
+                urgent_at: None,
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 control: TcpControl::Rst,
                 seq_number: LOCAL_SEQ + 123456, // matching the ack_number of the unexpected ack
                 ack_number: None,
+                urgent_at: None,
                 window_len: 0,
                 ..RECV_TEMPL
             })
@@ -6266,6 +6520,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -6278,6 +6533,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -6293,6 +6549,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -6305,6 +6562,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(0),
                 sack_permitted: false,
@@ -6340,6 +6598,7 @@ mod test {
                     control: TcpControl::Syn,
                     seq_number: LOCAL_SEQ,
                     ack_number: None,
+                    urgent_at: None,
                     max_seg_size: Some(BASE_MSS),
                     window_scale: Some(*shift_amt),
                     window_len: u16::try_from(*buffer_size).unwrap_or(u16::MAX),
@@ -6359,6 +6618,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 // scaling does NOT apply to the window value in SYN packets
                 window_len: 65535,
@@ -6374,6 +6634,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: None,
                 window_len: 42,
@@ -6395,6 +6656,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -6407,6 +6669,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(7),
                 window_len: 42,
@@ -6431,6 +6694,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             }
@@ -6440,6 +6704,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 58,
                 ..RECV_TEMPL
             }]
@@ -6461,6 +6726,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &send_buf[..],
                 ..SEND_TEMPL
             }
@@ -6564,6 +6830,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: b"abcdef",
                 ..SEND_TEMPL
             }
@@ -6607,6 +6874,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -6645,6 +6913,7 @@ mod test {
                 TcpRepr {
                     seq_number: REMOTE_SEQ + 1 + offset,
                     ack_number: Some(LOCAL_SEQ + 1),
+                    urgent_at: None,
                     payload: &segment,
                     ..SEND_TEMPL
                 }
@@ -6654,6 +6923,7 @@ mod test {
                 [TcpRepr {
                     seq_number: LOCAL_SEQ + 1,
                     ack_number: Some(REMOTE_SEQ + 1 + offset + 500),
+                    urgent_at: None,
                     window_len: 3500,
                     ..RECV_TEMPL
                 }]
@@ -6701,12 +6971,14 @@ mod test {
                 TcpRepr {
                     seq_number: REMOTE_SEQ + 1 + offset + 5000,
                     ack_number: Some(LOCAL_SEQ + 1),
+                    urgent_at: None,
                     payload: &segment,
                     ..SEND_TEMPL
                 },
                 Some(TcpRepr {
                     seq_number: LOCAL_SEQ + 1,
                     ack_number: Some(REMOTE_SEQ + 1 + 5000),
+                    urgent_at: None,
                     window_len: 4000,
                     sack_ranges: [
                         Some((
@@ -6746,6 +7018,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &segment,
                 ..SEND_TEMPL
             }
@@ -6757,6 +7030,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1400),
+                urgent_at: None,
                 window_len: 65185,
                 ..RECV_TEMPL
             }]
@@ -6773,6 +7047,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
@@ -6783,6 +7058,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -6794,6 +7070,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"foobar"[..],
                 ..RECV_TEMPL
             }]
@@ -6803,6 +7080,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6 + 6),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -6819,6 +7097,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
@@ -6829,6 +7108,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"foobar"[..],
                 ..RECV_TEMPL
             }]
@@ -6850,6 +7130,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &data[0..16],
                 ..RECV_TEMPL
             }]
@@ -6867,6 +7148,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
@@ -6887,6 +7169,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 window_len: 3,
                 payload: &b"xyzxyz"[..],
                 ..SEND_TEMPL
@@ -6908,6 +7191,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 3,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 64 - 6,
                 ..RECV_TEMPL
             }]
@@ -6925,6 +7209,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -6943,6 +7228,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             }
@@ -6964,6 +7250,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -6982,6 +7269,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 control: TcpControl::Fin,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
@@ -7009,6 +7297,7 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: local_seq_start + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abc"[..],
             ..RECV_TEMPL
         }));
@@ -7022,6 +7311,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7036,6 +7326,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(TcpSeqNumber(LOCAL_SEQ.0 - 1)),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7046,11 +7337,13 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 10),
+                urgent_at: None,
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             })
         );
@@ -7066,11 +7359,13 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 256,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             })
         );
@@ -7083,6 +7378,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 256,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7094,11 +7390,13 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 256,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             })
         );
@@ -7114,6 +7412,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7122,6 +7421,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7139,12 +7439,14 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1 + 6,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"123456"[..],
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             })
         );
@@ -7154,12 +7456,14 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6 + 6),
+                urgent_at: None,
                 window_len: 52,
                 ..RECV_TEMPL
             })
@@ -7177,6 +7481,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7186,6 +7491,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
@@ -7201,6 +7507,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7223,6 +7530,7 @@ mod test {
                     control: TcpControl::Rst,
                     seq_number: REMOTE_SEQ + 1,
                     ack_number: None,
+                    urgent_at: None,
                     ..SEND_TEMPL
                 }
             );
@@ -7247,6 +7555,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ + 2,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7263,6 +7572,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7288,6 +7598,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"x"[..],
                 ..SEND_TEMPL
             },
@@ -7297,6 +7608,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: None,
+                urgent_at: None,
                 window_len: 0,
                 window_scale: None,
                 max_seg_size: None,
@@ -7321,6 +7633,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7335,11 +7648,13 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ, // Wrong seq
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             })
         );
@@ -7353,6 +7668,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1, // correct seq
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"a"[..],
                 ..SEND_TEMPL
             }
@@ -7368,11 +7684,13 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ, // Wrong seq
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 2), // this has changed
+                urgent_at: None,
                 window_len: 63,
                 ..RECV_TEMPL
             })
@@ -7392,6 +7710,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7400,6 +7719,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7416,6 +7736,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7425,6 +7746,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7443,6 +7765,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             })
@@ -7452,6 +7775,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7466,6 +7790,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -7496,6 +7821,7 @@ mod test {
             control: TcpControl::Fin,
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         assert_eq!(s.state, State::TimeWait);
@@ -7510,6 +7836,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -7525,6 +7852,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 3),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7549,12 +7877,14 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
         send!(s, time 1_000, TcpRepr {
             seq_number: REMOTE_SEQ + 1 + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         assert_eq!(s.state, State::TimeWait);
@@ -7580,6 +7910,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7606,6 +7937,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7613,10 +7945,12 @@ mod test {
             control: TcpControl::Fin,
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         }, Some(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 1),
+            urgent_at: None,
             ..RECV_TEMPL
         }));
         assert_eq!(
@@ -7635,6 +7969,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7656,6 +7991,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
@@ -7665,6 +8001,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7690,6 +8027,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7699,6 +8037,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7714,6 +8053,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7725,6 +8065,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7736,6 +8077,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7769,6 +8111,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7780,6 +8123,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 ..RECV_TEMPL
             }]
@@ -7789,6 +8133,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7806,6 +8151,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7815,6 +8161,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7826,6 +8173,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7834,6 +8182,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7851,6 +8200,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7859,6 +8209,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7869,6 +8220,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7878,6 +8230,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7895,6 +8248,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7904,6 +8258,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7913,6 +8268,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7922,6 +8278,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7940,6 +8297,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7949,6 +8307,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7958,6 +8317,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7976,6 +8336,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -7988,6 +8349,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -7998,6 +8360,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8019,6 +8382,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8031,6 +8395,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
@@ -8042,6 +8407,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8060,6 +8426,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
@@ -8078,6 +8445,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
@@ -8088,6 +8456,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8105,6 +8474,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
@@ -8114,6 +8484,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8124,6 +8495,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6 + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8132,6 +8504,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 6 + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             }]
         );
@@ -8151,12 +8524,14 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 58,
                 ..RECV_TEMPL
             })
@@ -8170,6 +8545,7 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
@@ -8177,6 +8553,7 @@ mod test {
         recv!(s, time 2000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
@@ -8192,6 +8569,7 @@ mod test {
             control:    TcpControl::None,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }), exact);
@@ -8199,6 +8577,7 @@ mod test {
             control:    TcpControl::Psh,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"012345"[..],
             ..RECV_TEMPL
         }), exact);
@@ -8210,6 +8589,7 @@ mod test {
             control:    TcpControl::None,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }), exact);
@@ -8217,6 +8597,7 @@ mod test {
             control:    TcpControl::Psh,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"012345"[..],
             ..RECV_TEMPL
         }), exact);
@@ -8233,6 +8614,7 @@ mod test {
             control:    TcpControl::None,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }), exact);
@@ -8240,6 +8622,7 @@ mod test {
             control:    TcpControl::Psh,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"012345"[..],
             ..RECV_TEMPL
         }), exact);
@@ -8247,6 +8630,7 @@ mod test {
         send!(s, time 5, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 6),
+            urgent_at: None,
             window_len: 6,
             ..SEND_TEMPL
         });
@@ -8255,6 +8639,7 @@ mod test {
             control:    TcpControl::Psh,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"012345"[..],
             ..RECV_TEMPL
         }), exact);
@@ -8273,6 +8658,7 @@ mod test {
             control:    TcpControl::None,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }), exact);
@@ -8280,6 +8666,7 @@ mod test {
             control:    TcpControl::Fin,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"012345"[..],
             ..RECV_TEMPL
         }), exact);
@@ -8287,6 +8674,7 @@ mod test {
         send!(s, time 5, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 6),
+            urgent_at: None,
             window_len: 6,
             ..SEND_TEMPL
         });
@@ -8295,6 +8683,7 @@ mod test {
             control:    TcpControl::Fin,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"012345"[..],
             ..RECV_TEMPL
         }), exact);
@@ -8309,6 +8698,7 @@ mod test {
             control:    TcpControl::Syn,
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             max_seg_size: Some(BASE_MSS),
             ..RECV_TEMPL
         }));
@@ -8316,6 +8706,7 @@ mod test {
             control:    TcpControl::Syn,
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             max_seg_size: Some(BASE_MSS),
             ..RECV_TEMPL
         }));
@@ -8324,6 +8715,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8334,6 +8726,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
@@ -8348,6 +8741,7 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abc"[..],
             ..RECV_TEMPL
         }));
@@ -8359,6 +8753,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8366,6 +8761,7 @@ mod test {
         recv!(s, time 4000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abc"[..],
             ..RECV_TEMPL
         }));
@@ -8381,30 +8777,35 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
         send!(s, time 1005, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 6),
+            urgent_at: None,
             window_len: 6,
             ..SEND_TEMPL
         });
         recv!(s, time 1010, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"123456"[..],
             ..RECV_TEMPL
         }));
         send!(s, time 1015, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 6 + 6),
+            urgent_at: None,
             window_len: 6,
             ..SEND_TEMPL
         });
         recv!(s, time 1020, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 6 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"ABCDEF"[..],
             ..RECV_TEMPL
         }));
@@ -8418,35 +8819,41 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         })); // this one is dropped
         recv!(s, time 1005, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"123456"[..],
             ..RECV_TEMPL
         })); // this one is received
         recv!(s, time 1010, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 6 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"ABCDEF"[..],
             ..RECV_TEMPL
         })); // also dropped
         recv!(s, time 2000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         })); // retransmission
         send!(s, time 2005, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 6 + 6),
+            urgent_at: None,
             ..SEND_TEMPL
         }); // acknowledgement of both segments
         recv!(s, time 2010, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 6 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"ABCDEF"[..],
             ..RECV_TEMPL
         })); // retransmission of only unacknowledged data
@@ -8462,30 +8869,35 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
         send!(s, time 1005, TcpRepr {
             seq_number: REMOTE_SEQ + 1 + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 6),
+            urgent_at: None,
             window_len: 6,
             ..SEND_TEMPL
         });
         recv!(s, time 1010, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1 + 1),
+            urgent_at: None,
             payload:    &b"123456"[..],
             ..RECV_TEMPL
         }));
         send!(s, time 1015, TcpRepr {
             seq_number: REMOTE_SEQ + 1 + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 6 + 6),
+            urgent_at: None,
             window_len: 6,
             ..SEND_TEMPL
         });
         recv!(s, time 1020, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 6 + 6,
             ack_number: Some(REMOTE_SEQ + 1 + 1),
+            urgent_at: None,
             payload:    &b"ABCDEF"[..],
             ..RECV_TEMPL
         }));
@@ -8502,24 +8914,28 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
         send!(s, time 1005, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 6),
+            urgent_at: None,
             window_len: 6,
             ..SEND_TEMPL
         });
         recv!(s, time 1010, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"123456"[..],
             ..RECV_TEMPL
         }));
         send!(s, time 1015, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 6 + 6),
+            urgent_at: None,
             window_len: 6,
             ..SEND_TEMPL
         });
@@ -8527,6 +8943,7 @@ mod test {
             control:    TcpControl::Fin,
             seq_number: LOCAL_SEQ + 1 + 6 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"ABCDEF"[..],
             ..RECV_TEMPL
         }));
@@ -8541,6 +8958,7 @@ mod test {
         send!(s, time 0, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
 
@@ -8551,24 +8969,28 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"xxxxxx"[..],
             ..RECV_TEMPL
         }));
         recv!(s, time 1005, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"yyyyyy"[..],
             ..RECV_TEMPL
         }));
         recv!(s, time 1010, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + (6 * 2),
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"wwwwww"[..],
             ..RECV_TEMPL
         }));
         recv!(s, time 1015, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + (6 * 3),
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"zzzzzz"[..],
             ..RECV_TEMPL
         }));
@@ -8577,12 +8999,14 @@ mod test {
         send!(s, time 1050, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         // Second duplicate ACK
         send!(s, time 1055, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         // Third duplicate ACK
@@ -8590,6 +9014,7 @@ mod test {
         send!(s, time 1060, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
 
@@ -8597,6 +9022,7 @@ mod test {
         recv!(s, time 1100, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"xxxxxx"[..],
             ..RECV_TEMPL
         }));
@@ -8604,18 +9030,21 @@ mod test {
         recv!(s, time 1105, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"yyyyyy"[..],
             ..RECV_TEMPL
         }));
         recv!(s, time 1110, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + (6 * 2),
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"wwwwww"[..],
             ..RECV_TEMPL
         }));
         recv!(s, time 1115, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + (6 * 3),
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"zzzzzz"[..],
             ..RECV_TEMPL
         }));
@@ -8631,6 +9060,7 @@ mod test {
         send!(s, time 1120, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + (6 * 4)),
+            urgent_at: None,
             ..SEND_TEMPL
         });
     }
@@ -8643,6 +9073,7 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abc"[..],
             ..RECV_TEMPL
         }));
@@ -8653,6 +9084,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8662,6 +9094,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8671,6 +9104,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8684,6 +9118,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"xxxxxx"[..],
                 ..SEND_TEMPL
             }
@@ -8694,6 +9129,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 3,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 58,
                 ..RECV_TEMPL
             }]
@@ -8713,6 +9149,7 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abc"[..],
             ..RECV_TEMPL
         }));
@@ -8723,6 +9160,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8732,6 +9170,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8741,6 +9180,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -8754,6 +9194,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 window_len: 400,
                 ..SEND_TEMPL
             }
@@ -8774,6 +9215,7 @@ mod test {
         send!(s, time 0, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
 
@@ -8781,6 +9223,7 @@ mod test {
         send!(s, time 0, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
 
@@ -8797,24 +9240,28 @@ mod test {
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"xxxxxx"[..],
             ..RECV_TEMPL
         }));
         recv!(s, time 1005, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"yyyyyy"[..],
             ..RECV_TEMPL
         }));
         recv!(s, time 1010, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + (6 * 2),
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"wwwwww"[..],
             ..RECV_TEMPL
         }));
         recv!(s, time 1015, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + (6 * 3),
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"zzzzzz"[..],
             ..RECV_TEMPL
         }));
@@ -8823,18 +9270,21 @@ mod test {
         send!(s, time 1050, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         // Second duplicate ACK
         send!(s, time 1055, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         // Reordered packet arrives which should reset duplicate ACK count
         send!(s, time 1060, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + (6 * 3)),
+            urgent_at: None,
             ..SEND_TEMPL
         });
 
@@ -8847,6 +9297,7 @@ mod test {
         send!(s, time 1120, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + (6 * 4)),
+            urgent_at: None,
             ..SEND_TEMPL
         });
     }
@@ -8859,6 +9310,7 @@ mod test {
         recv!(s, time 0, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abc"[..],
             ..RECV_TEMPL
         }));
@@ -8866,6 +9318,7 @@ mod test {
         send!(s, time 0, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
 
@@ -8878,16 +9331,19 @@ mod test {
         send!(s, time 0, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         send!(s, time 0, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         send!(s, time 0, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         assert_eq!(
@@ -8904,6 +9360,7 @@ mod test {
         send!(s, time 1000, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
 
@@ -8912,6 +9369,7 @@ mod test {
         recv!(s, time 0, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abc"[..],
             ..RECV_TEMPL
         }));
@@ -8920,16 +9378,19 @@ mod test {
         send!(s, time 1050, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         send!(s, time 1050, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         send!(s, time 1050, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             window_len: 0, // boom
             ..SEND_TEMPL
         });
@@ -8953,6 +9414,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(1000),
                 ..SEND_TEMPL
             }
@@ -8963,6 +9425,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 ..RECV_TEMPL
             }]
@@ -8972,6 +9435,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 window_len: 32767,
                 ..SEND_TEMPL
             }
@@ -8982,6 +9446,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &[0; 1000][..],
                 ..RECV_TEMPL
             })
@@ -8997,6 +9462,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &[1, 2, 3, 4],
                 ..SEND_TEMPL
             }
@@ -9009,6 +9475,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 6),
+                urgent_at: None,
                 window_len: 60,
                 ..RECV_TEMPL
             })
@@ -9030,6 +9497,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 2),
+                urgent_at: None,
                 payload: &[1, 2, 3, 4],
                 ..SEND_TEMPL
             }
@@ -9042,6 +9510,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 2,
                 ack_number: Some(REMOTE_SEQ + 6),
+                urgent_at: None,
                 window_len: 60,
                 ..RECV_TEMPL
             })
@@ -9068,6 +9537,7 @@ mod test {
             control:    TcpControl::None,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }), exact);
@@ -9075,6 +9545,7 @@ mod test {
             control:    TcpControl::Psh,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"123456"[..],
             ..RECV_TEMPL
         }), exact);
@@ -9089,6 +9560,7 @@ mod test {
                 control: TcpControl::Psh,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             }
@@ -9098,6 +9570,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 58,
                 ..RECV_TEMPL
             }]
@@ -9114,6 +9587,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             }
@@ -9123,6 +9597,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 0,
                 ..RECV_TEMPL
             }]
@@ -9132,12 +9607,14 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 6,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"123456"[..],
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 0,
                 ..RECV_TEMPL
             })
@@ -9156,6 +9633,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             }
@@ -9165,6 +9643,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 0,
                 ..RECV_TEMPL
             }]
@@ -9177,6 +9656,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 6,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &[],
                 control: TcpControl::Fin,
                 ..SEND_TEMPL
@@ -9189,6 +9669,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 7),
+                urgent_at: None,
                 window_len: 0,
                 ..RECV_TEMPL
             }]
@@ -9205,6 +9686,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             }
@@ -9214,6 +9696,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 0,
                 ..RECV_TEMPL
             }]
@@ -9227,6 +9710,7 @@ mod test {
         recv!(s, time 0, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 6),
+            urgent_at: None,
             window_len: 3,
             ..RECV_TEMPL
         }));
@@ -9239,6 +9723,7 @@ mod test {
         recv!(s, time 0, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 6),
+            urgent_at: None,
             window_len: 6,
             ..RECV_TEMPL
         }));
@@ -9254,6 +9739,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             }
@@ -9272,6 +9758,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 2,
                 ..RECV_TEMPL
             })
@@ -9295,6 +9782,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 4,
                 ..RECV_TEMPL
             })
@@ -9312,18 +9800,21 @@ mod test {
                 TcpRepr {
                     seq_number: LOCAL_SEQ + 1,
                     ack_number: Some(REMOTE_SEQ + 1),
+                    urgent_at: None,
                     payload: &b"abcdef"[..],
                     ..RECV_TEMPL
                 },
                 TcpRepr {
                     seq_number: LOCAL_SEQ + 1 + 6,
                     ack_number: Some(REMOTE_SEQ + 1),
+                    urgent_at: None,
                     payload: &b"123456"[..],
                     ..RECV_TEMPL
                 },
                 TcpRepr {
                     seq_number: LOCAL_SEQ + 1 + 6 + 6,
                     ack_number: Some(REMOTE_SEQ + 1),
+                    urgent_at: None,
                     payload: &b"!@#$%^"[..],
                     ..RECV_TEMPL
                 }
@@ -9341,6 +9832,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -9350,6 +9842,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 3),
+                urgent_at: None,
                 window_len: 3,
                 ..RECV_TEMPL
             }]
@@ -9363,6 +9856,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 3),
+                urgent_at: None,
                 window_len: 6,
                 ..RECV_TEMPL
             }]
@@ -9374,12 +9868,14 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 6,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"def"[..],
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 3),
+                urgent_at: None,
                 window_len: 6,
                 ..RECV_TEMPL
             })
@@ -9389,12 +9885,14 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 3,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 9),
+                urgent_at: None,
                 window_len: 0,
                 ..RECV_TEMPL
             })
@@ -9437,6 +9935,7 @@ mod test {
             control:    TcpControl::Syn,
             seq_number: LOCAL_SEQ,
             ack_number: None,
+            urgent_at: None,
             max_seg_size: Some(BASE_MSS),
             window_scale: Some(0),
             sack_permitted: true,
@@ -9451,6 +9950,7 @@ mod test {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(TcpSeqNumber(0)),
+            urgent_at: None,
             window_scale: None,
             ..RECV_TEMPL
         }));
@@ -9471,6 +9971,7 @@ mod test {
         recv!(s, time 255, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
@@ -9481,6 +9982,7 @@ mod test {
         recv!(s, time 955, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
@@ -9492,6 +9994,7 @@ mod test {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             ..RECV_TEMPL
         }));
         assert_eq!(s.state, State::Closed);
@@ -9505,6 +10008,7 @@ mod test {
         recv!(s, time 100, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &[0],
             ..RECV_TEMPL
         }));
@@ -9516,6 +10020,7 @@ mod test {
         send!(s, time 105, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         assert_eq!(
@@ -9525,6 +10030,7 @@ mod test {
         recv!(s, time 155, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &[0],
             ..RECV_TEMPL
         }));
@@ -9538,6 +10044,7 @@ mod test {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             ..RECV_TEMPL
         }));
         recv_nothing!(s, time 205);
@@ -9552,12 +10059,14 @@ mod test {
             control:    TcpControl::Fin,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             ..RECV_TEMPL
         }));
         recv!(s, time 1100, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1 + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             ..RECV_TEMPL
         }));
         assert_eq!(s.state, State::Closed);
@@ -9571,12 +10080,14 @@ mod test {
             control:    TcpControl::Fin,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 1),
+            urgent_at: None,
             ..RECV_TEMPL
         }));
         recv!(s, time 1100, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1 + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 1),
+            urgent_at: None,
             ..RECV_TEMPL
         }));
         assert_eq!(s.state, State::Closed);
@@ -9593,6 +10104,7 @@ mod test {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             ..RECV_TEMPL
         }));
         assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
@@ -9610,11 +10122,13 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             })
         );
@@ -9630,6 +10144,7 @@ mod test {
         recv!(s, time 0, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &[0],
             ..RECV_TEMPL
         }));
@@ -9642,6 +10157,7 @@ mod test {
         recv!(s, time 100, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &[0],
             ..RECV_TEMPL
         }));
@@ -9654,6 +10170,7 @@ mod test {
         recv!(s, time 200, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &[0],
             ..RECV_TEMPL
         }));
@@ -9661,6 +10178,7 @@ mod test {
         send!(s, time 250, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             ..SEND_TEMPL
         });
         assert_eq!(
@@ -9671,6 +10189,7 @@ mod test {
         recv!(s, time 350, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"\x00"[..],
             ..RECV_TEMPL
         }));
@@ -9718,12 +10237,14 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 3,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"def"[..],
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 ..RECV_TEMPL
             })
         );
@@ -9737,12 +10258,14 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                urgent_at: None,
                 window_len: 58,
                 ..RECV_TEMPL
             })
@@ -9764,6 +10287,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -9778,6 +10302,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 3,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"defghi"[..],
                 ..SEND_TEMPL
             }
@@ -9804,6 +10329,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"yyyabc"[..],
                 ..RECV_TEMPL
             })
@@ -9813,6 +10339,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"def"[..],
                 ..RECV_TEMPL
             })
@@ -9832,6 +10359,7 @@ mod test {
             control: TcpControl::Psh,
             seq_number: local_seq,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload: &b"abc"[..],
             ..RECV_TEMPL
         }), exact);
@@ -9907,6 +10435,7 @@ mod test {
             let syn = TcpRepr {
                 control: TcpControl::Syn,
                 ack_number: Some(base),
+                urgent_at: None,
                 window_len: 65535,
                 ..RECV_TEMPL
             };
@@ -9923,6 +10452,7 @@ mod test {
             let update = TcpRepr {
                 control: TcpControl::None,
                 ack_number: Some(ack),
+                urgent_at: None,
                 window_len: s.scaled_window(),
                 ..RECV_TEMPL
             };
@@ -10068,6 +10598,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -10089,6 +10620,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -10111,6 +10643,7 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -10132,6 +10665,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -10142,12 +10676,14 @@ mod test {
                 control: TcpControl::Fin,
                 seq_number: REMOTE_SEQ + 1 + 6,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"ghi"[..],
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 3),
+                urgent_at: None,
                 window_len: 61,
                 ..RECV_TEMPL
             })
@@ -10168,6 +10704,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ + 1 + 9,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -10184,6 +10721,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -10194,6 +10732,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ + 1 + 3,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -10213,6 +10752,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -10222,12 +10762,14 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 6,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"ghi"[..],
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 3),
+                urgent_at: None,
                 window_len: 61,
                 ..RECV_TEMPL
             })
@@ -10238,6 +10780,7 @@ mod test {
                 control: TcpControl::Rst,
                 seq_number: REMOTE_SEQ + 1 + 9,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -10262,6 +10805,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -10274,6 +10818,7 @@ mod test {
         recv!(s, time 11, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 3),
+            urgent_at: None,
             window_len: 61,
             ..RECV_TEMPL
         }));
@@ -10288,6 +10833,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -10307,6 +10853,7 @@ mod test {
         recv!(s, time 11, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 3),
+            urgent_at: None,
             ..RECV_TEMPL
         }));
     }
@@ -10320,6 +10867,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abc"[..],
                 ..SEND_TEMPL
             }
@@ -10340,6 +10888,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 3),
+                urgent_at: None,
                 payload: &b"xyz"[..],
                 ..RECV_TEMPL
             })
@@ -10355,6 +10904,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &[0; DEFAULT_MSS - 1],
                 ..SEND_TEMPL
             }
@@ -10368,6 +10918,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + (DEFAULT_MSS - 1),
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"a"[..],
                 ..SEND_TEMPL
             }
@@ -10381,6 +10932,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + DEFAULT_MSS,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"a"[..],
                 ..SEND_TEMPL
             }
@@ -10392,6 +10944,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + (DEFAULT_MSS + 1)),
+                urgent_at: None,
                 window_len: (DEFAULT_MSS - 1) as u16,
                 ..RECV_TEMPL
             })
@@ -10407,6 +10960,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &[0; DEFAULT_MSS],
                 ..SEND_TEMPL
             }
@@ -10420,6 +10974,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + DEFAULT_MSS,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"a"[..],
                 ..SEND_TEMPL
             }
@@ -10430,6 +10985,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + (DEFAULT_MSS + 1),
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 payload: &b"b"[..],
                 ..SEND_TEMPL
             }
@@ -10441,6 +10997,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + (DEFAULT_MSS + 2)),
+                urgent_at: None,
                 window_len: (DEFAULT_MSS - 2) as u16,
                 ..RECV_TEMPL
             })
@@ -10462,6 +11019,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
@@ -10474,6 +11032,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"foobar"[..],
                 ..RECV_TEMPL
             }]
@@ -10486,6 +11045,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 6 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"aaabbb"[..],
                 ..RECV_TEMPL
             }]
@@ -10497,6 +11057,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6 + 6 + 6),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -10507,6 +11068,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 6 + 6 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"ccc"[..],
                 ..RECV_TEMPL
             }]
@@ -10524,6 +11086,7 @@ mod test {
             control:    TcpControl::None,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }), exact);
@@ -10531,6 +11094,7 @@ mod test {
             control:    TcpControl::Fin,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
+            urgent_at: None,
             payload:    &b"0"[..],
             ..RECV_TEMPL
         }), exact);
@@ -10549,6 +11113,7 @@ mod test {
         let tcp_repr = TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             dst_port: LOCAL_PORT + 1,
             ..SEND_TEMPL
         };
@@ -10557,6 +11122,7 @@ mod test {
         let tcp_repr = TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             src_port: REMOTE_PORT + 1,
             ..SEND_TEMPL
         };
@@ -10570,6 +11136,7 @@ mod test {
         let tcp_repr = TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
+            urgent_at: None,
             payload: &b"abcdef"[..],
             ..SEND_TEMPL
         };
@@ -10683,6 +11250,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 timestamp: Some(TcpTimestampRepr::new(1, 0)),
                 ..RECV_TEMPL
@@ -10694,6 +11262,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6),
+                urgent_at: None,
                 timestamp: Some(TcpTimestampRepr::new(500, 1)),
                 ..SEND_TEMPL
             }
@@ -10706,6 +11275,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"foobar"[..],
                 timestamp: Some(TcpTimestampRepr::new(1, 500)),
                 ..RECV_TEMPL
@@ -10716,6 +11286,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6 + 6),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -10733,6 +11304,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -10745,6 +11317,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 ..RECV_TEMPL
             }]
@@ -10754,6 +11327,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -10773,6 +11347,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 timestamp: Some(TcpTimestampRepr::new(500, 0)),
                 ..SEND_TEMPL
             }
@@ -10786,6 +11361,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 ..RECV_TEMPL
             }]
@@ -10795,6 +11371,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 ..SEND_TEMPL
             }
         );
@@ -10819,6 +11396,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -10832,6 +11410,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(0),
                 timestamp: None,
@@ -10845,6 +11424,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 timestamp: None,
                 ..RECV_TEMPL
@@ -10868,6 +11448,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: LOCAL_SEQ,
                 ack_number: None,
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
@@ -10880,6 +11461,7 @@ mod test {
                 control: TcpControl::Syn,
                 seq_number: REMOTE_SEQ,
                 ack_number: Some(LOCAL_SEQ + 1),
+                urgent_at: None,
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(0),
                 timestamp: Some(TcpTimestampRepr::new(500, 0)),
@@ -10893,6 +11475,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
+                urgent_at: None,
                 payload: &b"abcdef"[..],
                 timestamp: None,
                 ..RECV_TEMPL
@@ -10978,5 +11561,269 @@ mod test {
             ErrorReason::Network(NetworkError::HostUnreachable)
         );
         assert_eq!(s.take_soft_error(), None);
+    }
+    fn urgent_input(
+        s: &mut TestSocket,
+        sequence: TcpSeqNumber,
+        payload: &[u8],
+        pointer: Option<u16>,
+    ) {
+        let repr = TcpRepr {
+            seq_number: sequence,
+            ack_number: Some(s.local_seq_no),
+            payload,
+            urgent_at: pointer,
+            ..SEND_TEMPL
+        };
+        send(s, Instant::from_millis(0), &repr);
+    }
+
+    #[test]
+    fn urgent_byte_shares_sequence_and_normal_boundary() {
+        let mut s = socket_established();
+        let head = s.recv_head_seq();
+        urgent_input(&mut s, head, b"abcXYdef", Some(5));
+        assert_eq!(s.urgent_state(), Some(UrgentState::Valid(b'Y')));
+        assert!(s.take_urgent_notification());
+        assert!(!s.take_urgent_notification());
+        assert_eq!(s.ordinary_queue(), 4);
+        assert_eq!(
+            s.receive_span(0, 64),
+            ReceiveSpan {
+                offset: 0,
+                len: 4,
+                boundary: true
+            }
+        );
+        let mut prefix = [0; 4];
+        assert_eq!(s.recv_slice(&mut prefix), Ok(4));
+        assert_eq!(&prefix, b"abcX");
+        assert!(s.at_urgent_mark());
+        assert_eq!(
+            s.receive_span(0, 64),
+            ReceiveSpan {
+                offset: 1,
+                len: 3,
+                boundary: false
+            }
+        );
+        assert_eq!(s.ordinary_queue(), 0);
+        s.consume_urgent();
+        assert_eq!(s.urgent_state(), Some(UrgentState::Read));
+        assert!(s.at_urgent_mark());
+        let _ = s.recv(|bytes| (1.min(bytes.len()), ()));
+        assert_eq!(s.urgent_state(), None);
+        let mut suffix = [0; 3];
+        assert_eq!(s.recv_slice(&mut suffix), Ok(3));
+        assert_eq!(&suffix, b"def");
+    }
+
+    #[test]
+    fn urgent_pending_then_unflagged_data_and_duplicate() {
+        let mut s = socket_established();
+        let head = s.recv_head_seq();
+        urgent_input(&mut s, head, &[], Some(4));
+        assert_eq!(s.urgent_state(), Some(UrgentState::Pending));
+        assert!(s.take_urgent_notification());
+        urgent_input(&mut s, head, &[], Some(4));
+        assert!(!s.take_urgent_notification());
+        urgent_input(&mut s, head, b"abcd", None);
+        assert_eq!(s.urgent_state(), Some(UrgentState::Valid(b'd')));
+        assert_eq!(s.recv_head_seq(), head);
+    }
+
+    #[test]
+    fn urgent_inline_preserves_byte_and_still_stops_prefix() {
+        let mut s = socket_established();
+        s.set_urgent_inline(true);
+        let head = s.recv_head_seq();
+        urgent_input(&mut s, head, b"abc!def", Some(4));
+        assert_eq!(s.ordinary_queue(), 7);
+        assert_eq!(
+            s.receive_span(0, 64),
+            ReceiveSpan {
+                offset: 0,
+                len: 3,
+                boundary: true
+            }
+        );
+        s.recv(|_| (3, ())).unwrap();
+        assert!(s.at_urgent_mark());
+        assert_eq!(
+            s.receive_span(0, 64),
+            ReceiveSpan {
+                offset: 0,
+                len: 4,
+                boundary: false
+            }
+        );
+        assert_eq!(s.urgent_state(), Some(UrgentState::Valid(b'!')));
+        s.recv(|_| (1, ())).unwrap();
+        assert_eq!(s.urgent_state(), None);
+    }
+
+    #[test]
+    fn urgent_only_byte_not_ordinary_readiness_and_peek_is_pure() {
+        let mut s = socket_established();
+        let head = s.recv_head_seq();
+        urgent_input(&mut s, head, b"!", Some(1));
+        assert!(s.can_recv());
+        assert!(!s.ordinary_can_recv());
+        assert_eq!(s.receive_span(0, 5).len, 0);
+        assert_eq!(s.recv_head_seq(), head);
+        assert_eq!(s.urgent_state(), Some(UrgentState::Valid(b'!')));
+        s.set_urgent_inline(true);
+        assert!(s.ordinary_can_recv());
+    }
+
+    #[test]
+    fn urgent_new_mark_retires_old_hole_at_head() {
+        let mut s = socket_established();
+        let head = s.recv_head_seq();
+        urgent_input(&mut s, head, b"A", Some(1));
+        urgent_input(&mut s, head + 1, b"B", Some(1));
+        assert_eq!(s.recv_head_seq(), head + 1);
+        assert_eq!(s.recv_queue(), 1);
+        assert_eq!(s.urgent_state(), Some(UrgentState::Valid(b'B')));
+        assert!(s.at_urgent_mark());
+    }
+
+    #[test]
+    fn urgent_out_of_order_wrap_and_old_pointer_ignored() {
+        let mut s = socket_established();
+        s.remote_seq_no = TcpSeqNumber(i32::MAX - 2);
+        let head = s.recv_head_seq();
+        urgent_input(&mut s, head + 3, b"!def", Some(1));
+        assert_eq!(s.urgent_state(), Some(UrgentState::Valid(b'!')));
+        assert_eq!(s.recv_queue(), 0);
+        urgent_input(&mut s, head, b"abc", None);
+        assert_eq!(s.recv_queue(), 7);
+        assert_eq!(s.ordinary_queue(), 3);
+        s.take_urgent_notification();
+        urgent_input(&mut s, head + 7, &[], Some(0));
+        assert_eq!(s.urgent_state(), Some(UrgentState::Pending));
+        assert!(s.take_urgent_notification());
+        assert_eq!(s.receive_span(0, 64).len, 7);
+    }
+
+    #[test]
+    fn urgent_out_of_window_does_not_publish_mark() {
+        let mut s = socket_established();
+        let head = s.recv_head_seq();
+        urgent_input(&mut s, head + 128, b"!", Some(1));
+        assert_eq!(s.urgent_state(), None);
+        assert!(!s.take_urgent_notification());
+    }
+
+    #[test]
+    fn urgent_send_partial_marks_only_accepted_prefix_and_reset_clears() {
+        let mut s = socket_established_with_buffer_sizes(4, 64);
+        let start = s.local_seq_no;
+        assert_eq!(s.send_slice_with_urgent(b"abcdef", Some(6)), Ok(4));
+        assert_eq!(s.tx_urgent_end, Some(start + 4));
+        s.reset();
+        assert_eq!(s.tx_urgent_end, None);
+        assert_eq!(s.urgent_state(), None);
+        assert!(!s.take_urgent_notification());
+    }
+
+    #[test]
+    fn urgent_send_wire_retransmit_and_ack_retirement() {
+        let mut s = socket_established();
+        let start = s.local_seq_no;
+        assert_eq!(s.send_slice_with_urgent(b"ab!", Some(3)), Ok(3));
+        let mut observed = None;
+        s.socket
+            .dispatch(&mut s.cx, |_, (_, repr)| {
+                observed = Some((repr.seq_number, repr.urgent_at, repr.payload.to_vec()));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(observed, Some((start, Some(3), b"ab!".to_vec())));
+        s.remote_last_seq = start;
+        s.timer.set_for_fast_retransmit();
+        let mut pointer = None;
+        s.socket
+            .dispatch(&mut s.cx, |_, (_, repr)| {
+                pointer = repr.urgent_at;
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(pointer, Some(3));
+        let head = s.recv_head_seq();
+        let repr = TcpRepr {
+            seq_number: head,
+            ack_number: Some(start + 3),
+            ..SEND_TEMPL
+        };
+        send(&mut s, Instant::from_millis(1), &repr);
+        assert_eq!(s.tx_urgent_end, None);
+    }
+    #[test]
+    fn urgent_ring_wrap_span_and_payload_stay_in_one_sequence_space() {
+        let mut s = socket_established_with_buffer_sizes(8, 8);
+        let start = s.recv_head_seq();
+        urgent_input(&mut s, start, b"abcdef", None);
+        let mut old = [0; 5];
+        assert_eq!(s.recv_slice(&mut old), Ok(5));
+        urgent_input(&mut s, start + 6, b"ghi!jk", Some(4));
+        assert_eq!(s.ordinary_queue(), 4);
+        assert_eq!(s.receive_span(0, 64).len, 4);
+        assert!(s.receive_span(0, 64).boundary);
+        let mut prefix = [0; 4];
+        assert_eq!(s.peek_slice_at(0, &mut prefix), Ok(4));
+        assert_eq!(&prefix, b"fghi");
+        assert_eq!(s.urgent_state(), Some(UrgentState::Valid(b'!')));
+        assert_eq!(s.recv_head_seq(), start + 5);
+    }
+
+    #[test]
+    fn urgent_pending_survives_fin_and_reset_for_owner_error_order() {
+        for control in [TcpControl::Fin, TcpControl::Rst] {
+            let mut s = socket_established();
+            let start = s.recv_head_seq();
+            urgent_input(&mut s, start, &[], Some(4));
+            assert_eq!(s.urgent_state(), Some(UrgentState::Pending));
+            let packet = TcpRepr {
+                seq_number: start,
+                ack_number: Some(s.local_seq_no),
+                control,
+                ..SEND_TEMPL
+            };
+            send(&mut s, Instant::from_millis(0), &packet);
+            assert_eq!(s.urgent_state(), Some(UrgentState::Pending));
+            assert_eq!(s.received_fin(), control == TcpControl::Fin);
+            assert_eq!(
+                s.state(),
+                if control == TcpControl::Fin {
+                    State::CloseWait
+                } else {
+                    State::Closed
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn urgent_read_byte_can_be_overwritten_by_a_new_pointer_and_old_replay_is_ignored() {
+        let mut s = socket_established();
+        let start = s.recv_head_seq();
+        urgent_input(&mut s, start, b"abc!", Some(4));
+        s.consume_urgent();
+        s.take_urgent_notification();
+        urgent_input(&mut s, start + 4, b"x", Some(0));
+        // ptr=0 denotes this segment's first byte under default Linux semantics.
+        assert_eq!(s.urgent_state(), Some(UrgentState::Valid(b'x')));
+        assert!(s.take_urgent_notification());
+        urgent_input(&mut s, start + 5, &[], Some(0));
+        s.take_urgent_notification();
+        let packet = TcpRepr {
+            seq_number: start + 5,
+            ack_number: Some(s.local_seq_no),
+            urgent_at: Some(0),
+            ..SEND_TEMPL
+        };
+        send(&mut s, Instant::from_millis(0), &packet);
+        assert!(!s.take_urgent_notification());
     }
 }

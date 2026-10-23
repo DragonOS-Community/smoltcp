@@ -1979,10 +1979,12 @@ impl InterfaceInner {
                         }
                         let first_frag_ip_len = ip_header_len + first_payload_len;
                         // Calculate how much we will send now (including the Ethernet header).
+                        let tx_len = first_frag_ip_len;
+                        #[cfg(feature = "medium-ethernet")]
                         let tx_len = if matches!(tx_medium, Medium::Ethernet) {
-                            first_frag_ip_len + EthernetFrame::<&[u8]>::header_len()
+                            tx_len + EthernetFrame::<&[u8]>::header_len()
                         } else {
-                            first_frag_ip_len
+                            tx_len
                         };
 
                         tx_token

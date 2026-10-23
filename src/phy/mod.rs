@@ -417,6 +417,14 @@ pub trait RxToken {
 
 /// A token to transmit a single network packet.
 pub trait TxToken {
+    /// Prepare the exact frame length before serialization or fragment progress
+    /// is committed. Repeating a successful preparation for the same length
+    /// must not acquire another reservation. Failure must leave emission and
+    /// protocol progress untouched. Existing infallible devices need no hook.
+    fn prepare_buffer(&mut self, _len: usize) -> Result<(), TxEgressError> {
+        Ok(())
+    }
+
     /// Whether this token hands a complete, serialized IP packet to its
     /// integration before smoltcp performs neighbor lookup or fragmentation.
     /// The default leaves all output ownership with smoltcp.
@@ -534,4 +542,79 @@ pub struct TxEgressOverride {
     pub ip_mtu: usize,
     /// Opaque integration-defined context preserved across IP fragments.
     pub context: [u64; 3],
+}
+
+#[cfg(all(test, feature = "std", feature = "medium-ip"))]
+mod preparation_tests {
+    use super::*;
+    use core::cell::Cell;
+    use std::rc::Rc;
+    struct Rx;
+    impl RxToken for Rx {
+        fn consume<R, F>(self, _: F) -> R
+        where
+            F: FnOnce(&[u8]) -> R,
+        {
+            unreachable!()
+        }
+    }
+    struct Tx(Rc<Cell<usize>>);
+    impl TxToken for Tx {
+        fn prepare_buffer(&mut self, len: usize) -> Result<(), TxEgressError> {
+            assert_eq!(len, 42);
+            self.0.set(self.0.get() + 1);
+            Err(TxEgressError::Exhausted)
+        }
+        fn consume<R, F>(self, _: usize, _: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            panic!("not prepared")
+        }
+    }
+    struct Dev(Rc<Cell<usize>>);
+    impl Device for Dev {
+        type RxToken<'a> = Rx;
+        type TxToken<'a> = Tx;
+        fn receive(&mut self, _: Instant) -> Option<(Rx, Tx)> {
+            None
+        }
+        fn transmit(&mut self, _: Instant) -> Option<Tx> {
+            Some(Tx(self.0.clone()))
+        }
+        fn capabilities(&self) -> DeviceCapabilities {
+            let mut caps = DeviceCapabilities::default();
+            caps.medium = Medium::Ip;
+            caps.max_transmission_unit = 1500;
+            caps
+        }
+    }
+    struct NoFuzz;
+    impl Fuzzer for NoFuzz {
+        fn fuzz_packet(&self, _: &mut [u8]) {
+            panic!("prepare must not fuzz")
+        }
+    }
+    struct Sink(Rc<Cell<usize>>);
+    impl PcapSink for Sink {
+        fn write(&mut self, _: &[u8]) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    #[test]
+    fn all_middleware_forward_prepare_without_emission_side_effects() {
+        let calls = Rc::new(Cell::new(0));
+        let writes = Rc::new(Cell::new(0));
+        let fuzz = FuzzInjector::new(Dev(calls.clone()), NoFuzz, NoFuzz);
+        let pcap = PcapWriter::new(fuzz, Sink(writes.clone()), PcapMode::Both);
+        let tracer = Tracer::new(pcap, |_, _| panic!("prepare must not trace"));
+        let mut fault = FaultInjector::new(tracer, 123);
+        let headers = writes.get();
+        let mut tx = fault.transmit(Instant::from_millis(0)).unwrap();
+        for _ in 0..2 {
+            assert_eq!(tx.prepare_buffer(42), Err(TxEgressError::Exhausted));
+        }
+        assert_eq!(calls.get(), 2);
+        assert_eq!(writes.get(), headers);
+    }
 }

@@ -296,6 +296,10 @@ pub struct TxToken<'a, Tx: phy::TxToken> {
 }
 
 impl<'a, Tx: phy::TxToken> phy::TxToken for TxToken<'a, Tx> {
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), phy::TxEgressError> {
+        self.token.prepare_buffer(len)
+    }
+
     fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -328,5 +332,51 @@ impl<'a, Tx: phy::TxToken> phy::TxToken for TxToken<'a, Tx> {
 
     fn set_meta(&mut self, meta: PacketMeta) {
         self.token.set_meta(meta);
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    use crate::phy::TxToken as _;
+    struct Reject;
+    impl phy::TxToken for Reject {
+        fn prepare_buffer(&mut self, len: usize) -> Result<(), phy::TxEgressError> {
+            assert_eq!(len, 123);
+            Err(phy::TxEgressError::Exhausted)
+        }
+        fn consume<R, F>(self, _: usize, _: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            panic!("not prepared")
+        }
+    }
+    #[test]
+    fn failed_prepare_does_not_consume_fault_rng_or_rate_limit() {
+        let mut state = State {
+            rng_seed: 123,
+            refilled_at: Instant::from_millis(0),
+            tx_bucket: 3,
+            rx_bucket: 7,
+        };
+        let before = state.clone();
+        let mut token = TxToken {
+            state: &mut state,
+            config: Config::default(),
+            token: Reject,
+            junk: [0; MTU],
+            timestamp: Instant::from_millis(100),
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                token.prepare_buffer(123),
+                Err(phy::TxEgressError::Exhausted)
+            );
+        }
+        assert_eq!(state.rng_seed, before.rng_seed);
+        assert_eq!(state.tx_bucket, before.tx_bucket);
+        assert_eq!(state.rx_bucket, before.rx_bucket);
+        assert_eq!(state.refilled_at, before.refilled_at);
     }
 }

@@ -248,6 +248,10 @@ pub struct TxToken<'a, Tx: phy::TxToken, S: PcapSink> {
 }
 
 impl<'a, Tx: phy::TxToken, S: PcapSink> phy::TxToken for TxToken<'a, Tx, S> {
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), phy::TxEgressError> {
+        self.token.prepare_buffer(len)
+    }
+
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,

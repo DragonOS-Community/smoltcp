@@ -53,7 +53,7 @@ impl InterfaceInner {
         meta: PacketMeta,
         packet: Packet,
         frag: &mut Fragmenter,
-    ) {
+    ) -> Result<(), DispatchError> {
         let ll_src_a = self.hardware_addr.ieee802154_or_panic();
 
         // Create the IEEE802.15.4 header.
@@ -71,7 +71,7 @@ impl InterfaceInner {
             src_addr: Some(ll_src_a),
         };
 
-        self.dispatch_sixlowpan(tx_token, meta, packet, ieee_repr, frag);
+        self.dispatch_sixlowpan(tx_token, meta, packet, ieee_repr, frag)
     }
 
     #[cfg(feature = "proto-sixlowpan-fragmentation")]

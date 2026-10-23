@@ -821,14 +821,18 @@ impl InterfaceInner {
         let ip_len = header_len + payload_len;
 
         let more_frags = remaining_payload != payload_len;
-        frag.ipv4.repr.payload_len = payload_len;
-        frag.sent_bytes += payload_len;
 
         let mut tx_len = ip_len;
         #[cfg(feature = "medium-ethernet")]
         if matches!(tx_medium, Medium::Ethernet) {
             tx_len += EthernetFrame::<&[u8]>::header_len();
         }
+
+        if tx_token.prepare_buffer(tx_len).is_err() {
+            return;
+        }
+        frag.ipv4.repr.payload_len = payload_len;
+        frag.sent_bytes += payload_len;
 
         // Emit function for the Ethernet header.
         #[cfg(feature = "medium-ethernet")]

@@ -116,7 +116,7 @@ impl InterfaceInner {
 
     pub(super) fn dispatch_ethernet<Tx, F>(
         &mut self,
-        tx_token: Tx,
+        mut tx_token: Tx,
         buffer_len: usize,
         f: F,
     ) -> Result<(), DispatchError>
@@ -125,6 +125,9 @@ impl InterfaceInner {
         F: FnOnce(EthernetFrame<&mut [u8]>),
     {
         let tx_len = EthernetFrame::<&[u8]>::buffer_len(buffer_len);
+        tx_token
+            .prepare_buffer(tx_len)
+            .map_err(|_| DispatchError::Exhausted)?;
         tx_token.consume(tx_len, |tx_buffer| {
             debug_assert!(tx_buffer.as_ref().len() == tx_len);
             let mut frame = EthernetFrame::new_unchecked(tx_buffer);

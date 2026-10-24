@@ -116,6 +116,10 @@ pub struct TxToken<'a, Tx: phy::TxToken, F: Fuzzer + 'a> {
 }
 
 impl<'a, Tx: phy::TxToken, FTx: Fuzzer> phy::TxToken for TxToken<'a, Tx, FTx> {
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), phy::TxEgressError> {
+        self.token.prepare_buffer(len)
+    }
+
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,

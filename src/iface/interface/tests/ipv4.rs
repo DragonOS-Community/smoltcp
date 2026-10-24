@@ -1867,6 +1867,7 @@ fn explicit_broadcast_route_suppresses_tcp_reset_and_protocol_error() {
         control: TcpControl::Syn,
         seq_number: TcpSeqNumber(1),
         ack_number: None,
+        urgent_at: None,
         window_len: 256,
         window_scale: None,
         max_seg_size: None,
@@ -3507,4 +3508,123 @@ fn test_icmp_reply_size(#[case] medium: Medium) {
             IpPayload::Icmpv4(expected_icmp_repr)
         ))
     );
+}
+
+#[test]
+#[cfg(all(feature = "proto-ipv4-fragmentation", feature = "medium-ip"))]
+fn exact_buffer_failure_preserves_ipv4_emission_and_fragment_progress() {
+    use core::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    struct PreparedTx {
+        fail: bool,
+        prepared: Rc<Cell<usize>>,
+        emitted: Rc<RefCell<Vec<Vec<u8>>>>,
+    }
+    impl TxToken for PreparedTx {
+        fn prepare_buffer(&mut self, len: usize) -> Result<(), crate::phy::TxEgressError> {
+            self.prepared.set(len);
+            if self.fail {
+                Err(crate::phy::TxEgressError::Exhausted)
+            } else {
+                Ok(())
+            }
+        }
+        fn consume<R, F>(self, len: usize, emit: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            assert!(!self.fail);
+            assert_eq!(self.prepared.get(), len);
+            let mut bytes = vec![0; len];
+            let result = emit(&mut bytes);
+            self.emitted.borrow_mut().push(bytes);
+            result
+        }
+    }
+    for fragmented in [false, true] {
+        let (mut iface, _, _) = setup(Medium::Ip);
+        let payload = vec![
+            0xa5;
+            if fragmented {
+                iface.inner.ip_mtu() + 256
+            } else {
+                64
+            }
+        ];
+        let packet = || {
+            Packet::new_ipv4(
+                Ipv4Repr {
+                    src_addr: Ipv4Address::new(192, 0, 2, 1),
+                    dst_addr: Ipv4Address::new(198, 51, 100, 1),
+                    next_header: IpProtocol::Udp,
+                    payload_len: payload.len(),
+                    hop_limit: 64,
+                },
+                IpPayload::Raw(&payload),
+            )
+        };
+        let prepared = Rc::new(Cell::new(0));
+        let emitted = Rc::new(RefCell::new(Vec::new()));
+        let token = |fail| PreparedTx {
+            fail,
+            prepared: prepared.clone(),
+            emitted: emitted.clone(),
+        };
+        let initial = (iface.fragmenter.packet_len, iface.fragmenter.sent_bytes);
+        assert_eq!(
+            iface.inner.dispatch_ip(
+                token(true),
+                PacketMeta::default(),
+                packet(),
+                &mut iface.fragmenter
+            ),
+            Err(DispatchError::Exhausted)
+        );
+        assert!(emitted.borrow().is_empty());
+        assert_eq!(
+            (iface.fragmenter.packet_len, iface.fragmenter.sent_bytes),
+            initial
+        );
+        iface
+            .inner
+            .dispatch_ip(
+                token(false),
+                PacketMeta::default(),
+                packet(),
+                &mut iface.fragmenter,
+            )
+            .unwrap();
+        if fragmented {
+            let before = (
+                iface.fragmenter.sent_bytes,
+                iface.fragmenter.ipv4.frag_offset,
+                iface.fragmenter.ipv4.repr.payload_len,
+            );
+            iface
+                .inner
+                .dispatch_ipv4_frag(token(true), &mut iface.fragmenter);
+            assert_eq!(emitted.borrow().len(), 1);
+            assert_eq!(
+                (
+                    iface.fragmenter.sent_bytes,
+                    iface.fragmenter.ipv4.frag_offset,
+                    iface.fragmenter.ipv4.repr.payload_len
+                ),
+                before
+            );
+            while !iface.fragmenter.finished() {
+                iface
+                    .inner
+                    .dispatch_ipv4_frag(token(false), &mut iface.fragmenter);
+            }
+        }
+        let mut recovered = Vec::new();
+        for frame in emitted.borrow().iter() {
+            let ip = Ipv4Packet::new_checked(&frame[..]).unwrap();
+            assert_eq!(ip.frag_offset() as usize, recovered.len());
+            recovered.extend_from_slice(ip.payload());
+        }
+        assert_eq!(recovered, payload);
+    }
 }

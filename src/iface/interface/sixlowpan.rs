@@ -300,7 +300,7 @@ impl InterfaceInner {
         packet: Packet,
         ieee_repr: Ieee802154Repr,
         frag: &mut Fragmenter,
-    ) {
+    ) -> core::result::Result<(), DispatchError> {
         let packet = match packet {
             #[cfg(feature = "proto-ipv4")]
             Packet::Ipv4(_) => unreachable!(),
@@ -327,6 +327,14 @@ impl InterfaceInner {
                 // `dispatch_ieee802154_frag` requires some information about the total packet size,
                 // the link local source and destination address...
 
+                // Compute the first wire size before modifying shared fragment state.
+                let header_len = SixlowpanFragRepr::FirstFragment { size: 0, tag: 0 }.buffer_len();
+                let header_diff = uncompressed_size - compressed_size;
+                let payload_len = (125 - ieee_len - header_len + header_diff) / 8 * 8 - header_diff;
+                tx_token
+                    .prepare_buffer(ieee_len + header_len + payload_len)
+                    .map_err(|_| DispatchError::Exhausted)?;
+
                 let pkt = frag;
                 if !pkt.prepare_buffer(total_size) {
                     net_debug!(
@@ -334,7 +342,7 @@ impl InterfaceInner {
                         fragmentation buffer is too small, at least {} needed",
                         total_size
                     );
-                    return;
+                    return Ok(());
                 }
 
                 let payload_length = packet.header.payload_len;
@@ -406,12 +414,15 @@ impl InterfaceInner {
                 net_debug!(
                     "Enable the `proto-sixlowpan-fragmentation` feature for fragmentation support."
                 );
-                return;
+                return Ok(());
             }
         } else {
             tx_token.set_meta(meta);
 
             // We don't need fragmentation, so we emit everything to the TX token.
+            tx_token
+                .prepare_buffer(total_size + ieee_len)
+                .map_err(|_| DispatchError::Exhausted)?;
             tx_token.consume(total_size + ieee_len, |mut tx_buf| {
                 let mut ieee_packet = Ieee802154Frame::new_unchecked(&mut tx_buf[..ieee_len]);
                 ieee_repr.emit(&mut ieee_packet);
@@ -420,6 +431,7 @@ impl InterfaceInner {
                 Self::ipv6_to_sixlowpan(&self.checksum_caps(), packet, &ieee_repr, tx_buf);
             });
         }
+        Ok(())
     }
 
     fn ipv6_to_sixlowpan(
@@ -656,7 +668,7 @@ impl InterfaceInner {
     #[cfg(feature = "proto-sixlowpan-fragmentation")]
     pub(super) fn dispatch_sixlowpan_frag<Tx: TxToken>(
         &mut self,
-        tx_token: Tx,
+        mut tx_token: Tx,
         ieee_repr: Ieee802154Repr,
         frag: &mut Fragmenter,
     ) {
@@ -669,6 +681,13 @@ impl InterfaceInner {
 
         let ieee_len = ieee_repr.buffer_len();
         let frag_size = (frag.packet_len - frag.sent_bytes).min(frag.sixlowpan.fragn_size);
+
+        if tx_token
+            .prepare_buffer(ieee_len + fragn.buffer_len() + frag_size)
+            .is_err()
+        {
+            return;
+        }
 
         tx_token.consume(
             ieee_repr.buffer_len() + fragn.buffer_len() + frag_size,

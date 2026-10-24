@@ -590,7 +590,7 @@ impl Interface {
     pub fn dispatch_ip_packet_with_arp_source<Tx: TxToken>(
         &mut self,
         timestamp: Instant,
-        tx_token: Tx,
+        mut tx_token: Tx,
         next_hop: IpAddress,
         destination_hardware_addr: Option<HardwareAddress>,
         ip_packet: &[u8],
@@ -624,10 +624,15 @@ impl Interface {
         self.inner.now = timestamp;
         match self.inner.caps.medium {
             #[cfg(feature = "medium-ip")]
-            Medium::Ip => tx_token.consume(packet_len, |buffer| {
-                buffer.copy_from_slice(ip_packet);
-                Ok(())
-            }),
+            Medium::Ip => {
+                tx_token
+                    .prepare_buffer(packet_len)
+                    .map_err(|_| IpPacketDispatchError::Exhausted)?;
+                tx_token.consume(packet_len, |buffer| {
+                    buffer.copy_from_slice(ip_packet);
+                    Ok(())
+                })
+            }
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => {
                 let (destination_hardware_addr, tx_token) =
@@ -1882,8 +1887,7 @@ impl InterfaceInner {
             };
             let addr = addr.ieee802154_or_panic();
 
-            self.dispatch_ieee802154(addr, tx_token, meta, packet, frag);
-            return Ok(());
+            return self.dispatch_ieee802154(addr, tx_token, meta, packet, frag);
         }
 
         // Dispatch IP/Ethernet:
@@ -1975,12 +1979,17 @@ impl InterfaceInner {
                         }
                         let first_frag_ip_len = ip_header_len + first_payload_len;
                         // Calculate how much we will send now (including the Ethernet header).
+                        let tx_len = first_frag_ip_len;
+                        #[cfg(feature = "medium-ethernet")]
                         let tx_len = if matches!(tx_medium, Medium::Ethernet) {
-                            first_frag_ip_len + EthernetFrame::<&[u8]>::header_len()
+                            tx_len + EthernetFrame::<&[u8]>::header_len()
                         } else {
-                            first_frag_ip_len
+                            tx_len
                         };
 
+                        tx_token
+                            .prepare_buffer(tx_len)
+                            .map_err(|_| DispatchError::Exhausted)?;
                         if !frag.prepare_buffer(total_ip_len) {
                             net_debug!(
                                 "Fragmentation buffer is too small, at least {} needed. Dropping",
@@ -2052,6 +2061,9 @@ impl InterfaceInner {
                     tx_token.set_meta(meta);
 
                     // No fragmentation is required.
+                    tx_token
+                        .prepare_buffer(total_len)
+                        .map_err(|_| DispatchError::Exhausted)?;
                     tx_token.consume(total_len, |mut tx_buffer| {
                         #[cfg(feature = "medium-ethernet")]
                         if matches!(tx_medium, Medium::Ethernet) {
@@ -2073,6 +2085,9 @@ impl InterfaceInner {
                     return Err(DispatchError::NoRoute);
                 }
                 tx_token.set_meta(meta);
+                tx_token
+                    .prepare_buffer(total_len)
+                    .map_err(|_| DispatchError::Exhausted)?;
                 tx_token.consume(total_len, |mut tx_buffer| {
                     #[cfg(feature = "medium-ethernet")]
                     if matches!(tx_medium, Medium::Ethernet) {

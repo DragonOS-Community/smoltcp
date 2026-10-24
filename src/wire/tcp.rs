@@ -814,6 +814,8 @@ pub struct Repr<'a> {
     pub control: Control,
     pub seq_number: SeqNumber,
     pub ack_number: Option<SeqNumber>,
+    /// URG pointer relative to this segment, using BSD/Linux semantics.
+    pub urgent_at: Option<u16>,
     pub window_len: u16,
     pub window_scale: Option<u8>,
     pub max_seg_size: Option<u16>,
@@ -886,9 +888,6 @@ impl<'a> Repr<'a> {
             false => None,
         };
         // The PSH flag is ignored.
-        // The URG flag and the urgent field is ignored. This behavior is standards-compliant,
-        // however, most deployed systems (e.g. Linux) are *not* standards-compliant, and would
-        // cut the byte at the urgent pointer from the stream.
 
         let mut max_seg_size = None;
         let mut window_scale = None;
@@ -936,6 +935,7 @@ impl<'a> Repr<'a> {
             control: control,
             seq_number: packet.seq_number(),
             ack_number: ack_number,
+            urgent_at: packet.urg().then(|| packet.urgent_at()),
             window_len: packet.window_len(),
             window_scale: window_scale,
             max_seg_size: max_seg_size,
@@ -1038,7 +1038,8 @@ impl<'a> Repr<'a> {
                 TcpOption::EndOfList.emit(options);
             }
         }
-        packet.set_urgent_at(0);
+        packet.set_urg(self.urgent_at.is_some());
+        packet.set_urgent_at(self.urgent_at.unwrap_or(0));
         packet.payload_mut()[..self.payload.len()].copy_from_slice(self.payload);
 
         if checksum_caps.tcp.tx() {
@@ -1285,6 +1286,7 @@ mod test {
             dst_port: 80,
             seq_number: SeqNumber(0x01234567),
             ack_number: None,
+            urgent_at: None,
             window_len: 0x0123,
             window_scale: None,
             control: Control::Syn,
@@ -1400,5 +1402,43 @@ mod test {
         assert_eq!(TcpOption::parse(&[0xc, 0x01]), Err(Error));
         assert_eq!(TcpOption::parse(&[0x2, 0x02]), Err(Error));
         assert_eq!(TcpOption::parse(&[0x3, 0x02]), Err(Error));
+    }
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn urgent_pointer_roundtrip_and_none_clear() {
+        for pointer in [0, 1, 65535] {
+            let mut repr = packet_repr();
+            repr.urgent_at = Some(pointer);
+            let mut bytes = vec![0; repr.buffer_len()];
+            let mut packet = Packet::new_unchecked(&mut bytes);
+            repr.emit(
+                &mut packet,
+                &SRC_ADDR.into(),
+                &DST_ADDR.into(),
+                &ChecksumCapabilities::default(),
+            );
+            assert!(packet.urg());
+            assert_eq!(packet.urgent_at(), pointer);
+            assert_eq!(
+                Repr::parse(
+                    &Packet::new_unchecked(packet.as_ref()),
+                    &SRC_ADDR.into(),
+                    &DST_ADDR.into(),
+                    &ChecksumCapabilities::default()
+                )
+                .unwrap()
+                .urgent_at,
+                Some(pointer)
+            );
+            repr.urgent_at = None;
+            repr.emit(
+                &mut packet,
+                &SRC_ADDR.into(),
+                &DST_ADDR.into(),
+                &ChecksumCapabilities::default(),
+            );
+            assert!(!packet.urg());
+            assert_eq!(packet.urgent_at(), 0);
+        }
     }
 }

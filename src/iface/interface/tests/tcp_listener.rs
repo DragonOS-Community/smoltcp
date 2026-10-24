@@ -24,6 +24,7 @@ fn syn() -> TcpRepr<'static> {
         control: TcpControl::Syn,
         seq_number: TcpSeqNumber(100),
         ack_number: None,
+        urgent_at: None,
         window_len: 256,
         window_scale: None,
         max_seg_size: None,

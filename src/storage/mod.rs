@@ -7,6 +7,10 @@ or `alloc` crates being available, and heap-allocated memory.
 
 mod assembler;
 mod packet_buffer;
+#[cfg(feature = "alloc")]
+mod packet_bytes;
+#[cfg(feature = "alloc")]
+pub use packet_bytes::{PacketBytes, PacketBytesAllocator, PacketBytesStorage};
 mod ring_buffer;
 
 pub use self::assembler::Assembler;

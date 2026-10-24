@@ -12,12 +12,12 @@ use crate::wire::*;
 use core::result::Result;
 
 #[cfg(feature = "alloc")]
-type Buffer = alloc::vec::Vec<u8>;
+type Buffer = crate::storage::PacketBytes;
 #[cfg(not(feature = "alloc"))]
 type Buffer = [u8; REASSEMBLY_BUFFER_SIZE];
 
 #[cfg(feature = "alloc")]
-type FragmentationBuffer = alloc::vec::Vec<u8>;
+type FragmentationBuffer = crate::storage::PacketBytes;
 #[cfg(not(feature = "alloc"))]
 type FragmentationBuffer = [u8; FRAGMENTATION_BUFFER_SIZE];
 
@@ -180,8 +180,10 @@ impl<K> PacketAssembler<K> {
 
     fn release_oversized_buffer(&mut self) {
         #[cfg(feature = "alloc")]
+        self.buffer.release_owned();
+        #[cfg(feature = "alloc")]
         if self.buffer.capacity() > REASSEMBLY_BUFFER_SIZE {
-            self.buffer = Buffer::new();
+            drop(self.buffer.take());
         }
     }
 
@@ -304,6 +306,20 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
         Self {
             assemblers: [Self::NEW_PA; REASSEMBLY_BUFFER_COUNT],
         }
+    }
+
+    #[cfg(feature = "alloc")]
+    pub(crate) fn set_allocator(
+        &mut self,
+        allocator: crate::storage::PacketBytesAllocator,
+    ) -> Result<(), crate::storage::OwnedBufferResizeError> {
+        if self.assemblers.iter().any(|a| !a.is_free()) {
+            return Err(crate::storage::OwnedBufferResizeError);
+        }
+        for assembler in &mut self.assemblers {
+            assembler.buffer = crate::storage::PacketBytes::with_allocator(allocator);
+        }
+        Ok(())
     }
 
     /// Get a [`PacketAssembler`] for a specific key.
@@ -434,7 +450,7 @@ impl Fragmenter {
     pub fn new() -> Self {
         Self {
             #[cfg(feature = "alloc")]
-            buffer: alloc::vec::Vec::new(),
+            buffer: crate::storage::PacketBytes::new(),
             #[cfg(not(feature = "alloc"))]
             buffer: [0u8; FRAGMENTATION_BUFFER_SIZE],
             packet_len: 0,
@@ -509,6 +525,8 @@ impl Fragmenter {
     pub fn reset(&mut self) {
         self.packet_len = 0;
         self.sent_bytes = 0;
+        #[cfg(feature = "alloc")]
+        self.buffer.release_owned();
 
         #[cfg(feature = "proto-ipv4-fragmentation")]
         {
@@ -661,6 +679,60 @@ mod tests {
         set.remove_expired(Instant::ZERO);
         let assembler = set.get(&Key { id: 2 }, Instant::ZERO).unwrap();
         assert_eq!(assembler.buffer.capacity(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn custom_reassembly_storage_failure_and_expiry_preserve_policy() {
+        use crate::storage::{OwnedBufferResizeError, PacketBytesStorage};
+        fn fail(_: usize) -> Result<PacketBytesStorage, OwnedBufferResizeError> {
+            Err(OwnedBufferResizeError)
+        }
+        #[derive(Debug)]
+        struct Bytes(alloc::vec::Vec<u8>);
+        impl AsRef<[u8]> for Bytes {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl AsMut<[u8]> for Bytes {
+            fn as_mut(&mut self) -> &mut [u8] {
+                &mut self.0
+            }
+        }
+        fn mapped(len: usize) -> Result<PacketBytesStorage, OwnedBufferResizeError> {
+            Ok(PacketBytesStorage::Owned(alloc::boxed::Box::new(Bytes(
+                alloc::vec![0; len],
+            ))))
+        }
+        let mut set = PacketAssemblerSet::new();
+        set.set_allocator(fail).unwrap();
+        let a = set.get(&Key { id: 9 }, Instant::ZERO).unwrap();
+        assert_eq!(a.set_total_size(32), Err(AssemblerError));
+        assert_eq!(a.total_size, None);
+        assert_eq!(a.buffer.capacity(), 0);
+        set.remove_expired(Instant::from_millis(1));
+        set.set_allocator(mapped).unwrap();
+        let a = set.get(&Key { id: 10 }, Instant::ZERO).unwrap();
+        a.set_total_size(32).unwrap();
+        a.add(&[0xa5; 32], 0).unwrap();
+        assert_eq!(a.assemble(), Some(&[0xa5; 32][..]));
+        // The borrowed assembled bytes remain valid until maintenance retires them.
+        assert_eq!(a.buffer.capacity(), 32);
+        set.remove_expired(Instant::ZERO);
+        let a = set.get(&Key { id: 11 }, Instant::ZERO).unwrap();
+        assert_eq!(a.buffer.capacity(), 0);
+        a.set_total_size(16).unwrap();
+        assert_eq!(a.buffer.capacity(), 16);
+        a.reset();
+        set.remove_expired(Instant::ZERO);
+        assert_eq!(
+            set.get(&Key { id: 12 }, Instant::ZERO)
+                .unwrap()
+                .buffer
+                .capacity(),
+            0
+        );
     }
 
     #[test]

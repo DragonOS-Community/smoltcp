@@ -157,7 +157,7 @@ impl InterfaceInner {
         source_hardware_addr: HardwareAddress,
         ipv4_packet: &Ipv4Packet<&'a [u8]>,
         frag: &'a mut FragmentsBuffer,
-        scratch: &'a mut AllocVec<u8>,
+        scratch: &'a mut crate::storage::PacketBytes,
         filter: &mut dyn IpIngressFilter,
     ) -> Option<Packet<'a>> {
         self.process_ipv4_inner(
@@ -179,7 +179,7 @@ impl InterfaceInner {
         source_hardware_addr: HardwareAddress,
         ipv4_packet: &Ipv4Packet<&'a [u8]>,
         frag: &'a mut FragmentsBuffer,
-        #[cfg(feature = "alloc")] mut scratch: Option<&'a mut AllocVec<u8>>,
+        #[cfg(feature = "alloc")] mut scratch: Option<&'a mut crate::storage::PacketBytes>,
         #[cfg(feature = "alloc")] mut filter: Option<&mut dyn IpIngressFilter>,
     ) -> Option<Packet<'a>> {
         let ipv4_repr = check!(Ipv4Repr::parse(ipv4_packet, &self.caps.checksum));
@@ -296,7 +296,16 @@ impl InterfaceInner {
                             f.set_first_ipv4_header(
                                 &ipv4_packet.as_ref()[..ipv4_packet.header_len() as usize],
                                 source_hardware_addr,
-                                filter.as_ref().map_or(0, |filter| filter.packet_mark()),
+                                {
+                                    #[cfg(feature = "alloc")]
+                                    {
+                                        filter.as_ref().map_or(0, |filter| filter.packet_mark())
+                                    }
+                                    #[cfg(not(feature = "alloc"))]
+                                    {
+                                        0
+                                    }
+                                },
                             );
                         }
                     }

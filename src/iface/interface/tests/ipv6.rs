@@ -88,7 +88,7 @@ impl IpIngressFilter for CountValidatedIpv6 {
         _: PacketMeta,
         _: HardwareAddress,
     ) -> PreRoutingVerdict {
-        self.observed.push(packet.take_owned().unwrap());
+        self.observed.push(packet.take_owned().unwrap().to_vec());
         PreRoutingVerdict::Drop
     }
 }
@@ -126,7 +126,7 @@ fn ipv6_pre_routing_receives_rx_token_metadata() {
 #[test]
 fn ipv6_receive_validation_precedes_filter_callback() {
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = CountValidatedIpv6 {
         observed: Vec::new(),
     };
@@ -185,7 +185,7 @@ fn ipv6_receive_validation_precedes_filter_callback() {
 #[test]
 fn ipv6_discard_option_after_four_padding_options_is_not_observed() {
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = CountValidatedIpv6 {
         observed: Vec::new(),
     };
@@ -230,7 +230,7 @@ fn ipv6_discard_option_after_four_padding_options_is_not_observed() {
 #[test]
 fn non_loopback_ip_medium_rejects_ipv6_loopback_and_interface_local() {
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = CountValidatedIpv6 {
         observed: Vec::new(),
     };
@@ -277,7 +277,7 @@ fn non_loopback_ip_medium_rejects_ipv6_loopback_and_interface_local() {
 #[test]
 fn ethernet_ipv6_invalid_scopes_never_reach_filter_callback() {
     let (mut iface, mut sockets, _) = setup(Medium::Ethernet);
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = CountValidatedIpv6 {
         observed: Vec::new(),
     };
@@ -441,7 +441,7 @@ fn local_input_ipv6_rewrite_is_validated_before_transport_reply() {
     );
     let original = bytes.clone();
     let packet = Ipv6Packet::new_checked(&bytes[..]).unwrap();
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = RewriteSource {
         calls: 0,
         repair_checksum: true,
@@ -548,7 +548,7 @@ fn local_input_ipv6_cannot_rewrite_destination_to_nonlocal() {
         &ChecksumCapabilities::default(),
     );
     let packet = Ipv6Packet::new_checked(&bytes[..]).unwrap();
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     assert!(iface
         .inner
         .process_ipv6_filtered(
@@ -615,7 +615,7 @@ fn ipv6_packet_aware_filter_selects_fragments_without_slowing_plain_packets() {
     }
 
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = SelectFragments { calls: 0 };
     let normal = routed_ipv6_bytes();
     let _ = iface.inner.process_ip_filtered(
@@ -679,7 +679,7 @@ fn ipv6_defrag_callback_runs_before_ordinary_pre_routing() {
     }
 
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = Capture { stages: Vec::new() };
     let normal = routed_ipv6_bytes();
     let normal = Ipv6Packet::new_checked(&normal[..]).unwrap();
@@ -742,7 +742,7 @@ fn ipv6_route_handoff_runs_after_prerouting_and_before_local_fanout() {
             _: HardwareAddress,
         ) -> RouteInputVerdict {
             assert!(self.pre_routing);
-            self.transferred = packet.take_owned().unwrap();
+            self.transferred = packet.take_owned().unwrap().to_vec();
             RouteInputVerdict::Forward
         }
 
@@ -761,7 +761,7 @@ fn ipv6_route_handoff_runs_after_prerouting_and_before_local_fanout() {
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
     let bytes = routed_ipv6_bytes();
     let packet = Ipv6Packet::new_checked(&bytes[..]).unwrap();
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = Capture {
         pre_routing: false,
         transferred: Vec::new(),
@@ -1832,7 +1832,7 @@ fn routed_link_control_updates_only_the_receiving_interfaces_neighbor_cache() {
     Icmpv6Packet::new_unchecked(&mut data[40..]).fill_checksum(&src, &dst);
 
     let (mut iface, mut sockets, _) = setup(Medium::Ethernet);
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = KeepOnIngress {
         local_input_calls: 0,
     };

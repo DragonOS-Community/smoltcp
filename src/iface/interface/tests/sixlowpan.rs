@@ -580,3 +580,133 @@ fn exact_buffer_failure_keeps_sixlowpan_fragments_pending() {
         }
     }
 }
+
+#[test]
+#[cfg(all(
+    feature = "proto-sixlowpan-fragmentation",
+    feature = "medium-ieee802154"
+))]
+fn fragment_storage_failure_keeps_sixlowpan_payload_pending() {
+    use core::cell::Cell;
+    use std::rc::Rc;
+    struct PreparedTx {
+        fail: bool,
+        emits: Rc<Cell<usize>>,
+        prepared: usize,
+    }
+    impl TxToken for PreparedTx {
+        fn prepare_buffer(
+            &mut self,
+            len: usize,
+        ) -> core::result::Result<(), crate::phy::TxEgressError> {
+            self.prepared = len;
+            if self.fail {
+                Err(crate::phy::TxEgressError::Exhausted)
+            } else {
+                Ok(())
+            }
+        }
+        fn consume<R, F>(self, len: usize, emit: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            assert!(!self.fail);
+            assert_eq!(self.prepared, len);
+            self.emits.set(self.emits.get() + 1);
+            emit(&mut vec![0; len])
+        }
+    }
+    for len in [256] {
+        let (mut iface, _, _) = setup(Medium::Ieee802154);
+        fn fail_storage(
+            _: usize,
+        ) -> Result<crate::storage::PacketBytesStorage, crate::storage::OwnedBufferResizeError>
+        {
+            Err(crate::storage::OwnedBufferResizeError)
+        }
+        iface.set_packet_buffer_allocator(fail_storage).unwrap();
+        let data = vec![0xa5; len];
+        let packet = || {
+            Packet::new_ipv6(
+                Ipv6Repr {
+                    src_addr: Ipv6Address::UNSPECIFIED,
+                    dst_addr: Ipv6Address::UNSPECIFIED,
+                    next_header: IpProtocol::Udp,
+                    payload_len: data.len() + 8,
+                    hop_limit: 64,
+                },
+                IpPayload::Udp(
+                    UdpRepr {
+                        src_port: 1234,
+                        dst_port: 1234,
+                    },
+                    &data,
+                ),
+            )
+        };
+        let emits = Rc::new(Cell::new(0));
+        let token = |fail| PreparedTx {
+            fail,
+            emits: emits.clone(),
+            prepared: 0,
+        };
+        let before = (
+            iface.fragmenter.packet_len,
+            iface.fragmenter.sent_bytes,
+            iface.fragmenter.sixlowpan.datagram_offset,
+        );
+        assert_eq!(
+            iface.inner.dispatch_ieee802154(
+                Ieee802154Address::default(),
+                token(false),
+                PacketMeta::default(),
+                packet(),
+                &mut iface.fragmenter
+            ),
+            Err(DispatchError::Exhausted)
+        );
+        assert_eq!(emits.get(), 0);
+        assert_eq!(
+            (
+                iface.fragmenter.packet_len,
+                iface.fragmenter.sent_bytes,
+                iface.fragmenter.sixlowpan.datagram_offset
+            ),
+            before
+        );
+        iface.fragmenter.buffer = crate::storage::PacketBytes::new();
+        iface
+            .inner
+            .dispatch_ieee802154(
+                Ieee802154Address::default(),
+                token(false),
+                PacketMeta::default(),
+                packet(),
+                &mut iface.fragmenter,
+            )
+            .unwrap();
+        if !iface.fragmenter.finished() {
+            let before = (
+                iface.fragmenter.sent_bytes,
+                iface.fragmenter.sixlowpan.datagram_offset,
+            );
+            iface
+                .inner
+                .dispatch_ieee802154_frag(token(true), &mut iface.fragmenter);
+            assert_eq!(emits.get(), 1);
+            assert_eq!(
+                (
+                    iface.fragmenter.sent_bytes,
+                    iface.fragmenter.sixlowpan.datagram_offset
+                ),
+                before
+            );
+            while !iface.fragmenter.finished() {
+                iface
+                    .inner
+                    .dispatch_ieee802154_frag(token(false), &mut iface.fragmenter);
+            }
+            assert!(emits.get() > 1);
+        }
+    }
+}

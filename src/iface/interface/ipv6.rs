@@ -191,7 +191,7 @@ impl InterfaceInner {
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
-        scratch: &'frame mut AllocVec<u8>,
+        scratch: &'frame mut crate::storage::PacketBytes,
         filter: &mut dyn IpIngressFilter,
     ) -> Option<Packet<'frame>> {
         // The integration may retain a Forward packet before the local

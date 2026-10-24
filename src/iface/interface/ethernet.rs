@@ -25,7 +25,7 @@ impl InterfaceInner {
         meta: crate::phy::PacketMeta,
         frame: &'frame [u8],
         fragments: &'frame mut FragmentsBuffer,
-        scratch: &'frame mut AllocVec<u8>,
+        scratch: &'frame mut crate::storage::PacketBytes,
         filter: &mut dyn IpIngressFilter,
     ) -> Option<EthernetPacket<'frame>> {
         self.process_ethernet_inner(sockets, meta, frame, fragments, Some((scratch, filter)))
@@ -38,7 +38,7 @@ impl InterfaceInner {
         frame: &'frame [u8],
         fragments: &'frame mut FragmentsBuffer,
         #[cfg(feature = "alloc")] filter: Option<(
-            &'frame mut AllocVec<u8>,
+            &'frame mut crate::storage::PacketBytes,
             &mut dyn IpIngressFilter,
         )>,
     ) -> Option<EthernetPacket<'frame>> {

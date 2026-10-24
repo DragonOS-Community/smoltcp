@@ -1,8 +1,8 @@
 //! A single received IP packet that is copied only if a hook needs to rewrite it.
 
 use crate::phy::PacketMeta;
+use crate::storage::PacketBytes;
 use crate::wire::{HardwareAddress, IpProtocol, IpVersion};
-use alloc::vec::Vec;
 
 /// The packet could not be made writable. Callers must drop it, never pass
 /// the original bytes on as if the rewrite had succeeded.
@@ -204,21 +204,21 @@ impl<'p, 'a> RoutedIngressPacket<'p, 'a> {
         self.packet.bytes()
     }
 
-    pub fn take_owned(&mut self) -> Result<Vec<u8>, IngressPacketAllocError> {
+    pub fn take_owned(&mut self) -> Result<PacketBytes, IngressPacketAllocError> {
         self.packet.take_owned()
     }
 }
 
 pub struct IngressPacket<'a> {
     original: &'a [u8],
-    scratch: &'a mut Vec<u8>,
+    scratch: &'a mut PacketBytes,
     copied: bool,
     failed: bool,
     transferred: bool,
 }
 
 impl<'a> IngressPacket<'a> {
-    pub(crate) fn borrowed(original: &'a [u8], scratch: &'a mut Vec<u8>) -> Self {
+    pub(crate) fn borrowed(original: &'a [u8], scratch: &'a mut PacketBytes) -> Self {
         Self {
             original,
             scratch,
@@ -229,7 +229,7 @@ impl<'a> IngressPacket<'a> {
     }
 
     /// Use bytes already assembled into scratch without an unnecessary second copy.
-    pub(crate) fn assembled(scratch: &'a mut Vec<u8>) -> Self {
+    pub(crate) fn assembled(scratch: &'a mut PacketBytes) -> Self {
         Self {
             original: &[],
             scratch,
@@ -272,7 +272,7 @@ impl<'a> IngressPacket<'a> {
     /// queue. Borrowed packets are copied once because the receive token may
     /// cease to exist when this callback returns. After transfer, the packet
     /// cannot be passed to the local socket demultiplexer.
-    pub fn take_owned(&mut self) -> Result<Vec<u8>, IngressPacketAllocError> {
+    pub fn take_owned(&mut self) -> Result<PacketBytes, IngressPacketAllocError> {
         if self.failed || self.transferred {
             return Err(IngressPacketAllocError);
         }
@@ -280,7 +280,7 @@ impl<'a> IngressPacket<'a> {
             self.writable()?;
         }
         self.transferred = true;
-        Ok(core::mem::take(self.scratch))
+        Ok(self.scratch.take())
     }
 
     pub(crate) fn into_bytes(self) -> Result<&'a [u8], IngressPacketAllocError> {
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn pass_borrows_original_and_rewrite_copies_once() {
         let original = [1, 2, 3, 4];
-        let mut scratch = Vec::new();
+        let mut scratch = crate::storage::PacketBytes::new();
         let pass = IngressPacket::borrowed(&original, &mut scratch);
         assert!(core::ptr::eq(
             pass.into_bytes().unwrap().as_ptr(),
@@ -318,7 +318,9 @@ mod tests {
 
     #[test]
     fn assembled_packet_is_mutated_in_place() {
-        let mut scratch = Vec::from([1, 2, 3]);
+        let mut scratch = crate::storage::PacketBytes::new();
+        scratch.try_reserve_exact(3).unwrap();
+        scratch.extend_from_slice(&[1, 2, 3]);
         let original = scratch.as_ptr();
         let mut packet = IngressPacket::assembled(&mut scratch);
         packet.writable().unwrap()[2] = 4;
@@ -330,15 +332,15 @@ mod tests {
     #[test]
     fn forwarding_moves_rewritten_buffer_and_invalidates_local_delivery() {
         let original = [1, 2, 3];
-        let mut scratch = Vec::new();
+        let mut scratch = crate::storage::PacketBytes::new();
         let mut packet = IngressPacket::borrowed(&original, &mut scratch);
         packet.writable().unwrap()[0] = 9;
         let rewritten = packet.bytes().as_ptr();
         let forwarded = packet.take_owned().unwrap();
         assert!(core::ptr::eq(forwarded.as_ptr(), rewritten));
-        assert_eq!(forwarded, [9, 2, 3]);
+        assert_eq!(&forwarded[..], &[9, 2, 3]);
         assert_eq!(packet.writable(), Err(IngressPacketAllocError));
-        assert_eq!(packet.take_owned(), Err(IngressPacketAllocError));
+        assert!(matches!(packet.take_owned(), Err(IngressPacketAllocError)));
         assert_eq!(packet.into_bytes(), Err(IngressPacketAllocError));
         assert_eq!(original, [1, 2, 3]);
     }
@@ -346,9 +348,9 @@ mod tests {
     #[test]
     fn forwarding_borrowed_packet_copies_before_receive_token_expires() {
         let original = [1, 2, 3];
-        let mut scratch = Vec::new();
+        let mut scratch = crate::storage::PacketBytes::new();
         let mut packet = IngressPacket::borrowed(&original, &mut scratch);
-        assert_eq!(packet.take_owned().unwrap(), original);
+        assert_eq!(&packet.take_owned().unwrap()[..], &original);
         assert_eq!(packet.into_bytes(), Err(IngressPacketAllocError));
     }
 }

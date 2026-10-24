@@ -83,7 +83,7 @@ fn arp_reply_ownership_preserves_learning(
     frame.set_src_addr(source_mac);
     frame.set_ethertype(EthernetProtocol::Arp);
     arp.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
-    let mut scratch = Vec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = Ownership(ownership, source, target);
     let result = iface.inner.process_ethernet_filtered(
         &mut sockets,
@@ -158,7 +158,7 @@ fn arp_local_dad_does_not_learn_zero(
     frame.set_src_addr(EthernetAddress([0x52, 0x54, 0, 0, 0, 1]));
     frame.set_ethertype(EthernetProtocol::Arp);
     arp.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
-    let mut scratch = Vec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = Ownership(ownership);
     assert_eq!(
         iface
@@ -397,7 +397,7 @@ impl IpIngressFilter for TransferIpv4Packet {
         _: PacketMeta,
         _: HardwareAddress,
     ) -> RouteInputVerdict {
-        self.forwarded.push(packet.take_owned().unwrap());
+        self.forwarded.push(packet.take_owned().unwrap().to_vec());
         RouteInputVerdict::Forward
     }
 
@@ -441,7 +441,7 @@ fn forwarded_ipv4_packet_survives_rx_token_without_local_reply() {
 #[test]
 fn forwarded_ipv4_fragments_do_not_use_local_reassembly_slots() {
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = TransferIpv4Packet {
         forwarded: Vec::new(),
     };
@@ -524,7 +524,7 @@ fn stateless_fragment_policy_can_drop_local_and_transit_fragments() {
     }
 
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = DropFragments(0);
     for destination in [
         Ipv4Address::new(198, 51, 100, 1),
@@ -625,7 +625,7 @@ fn local_ipv4_fragments_run_policy_once_per_fragment() {
     }
 
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = AcceptFragments {
         fragments: 0,
         assembled: 0,
@@ -799,7 +799,7 @@ fn rewritten_ipv4_packet_keeps_reply_borrow_alive() {
     let src = Ipv4Address::new(127, 0, 0, 2);
     let bytes = icmp_request_for_rewrite();
     let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = RewriteIpv4Destination { calls: 0 };
     let response = iface.inner.process_ipv4_filtered(
         &mut sockets,
@@ -875,7 +875,7 @@ fn local_input_ipv4_rewrite_is_validated_before_transport_reply() {
     ip.fill_checksum();
     let original = bytes.clone();
     let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = RewriteSource {
         calls: 0,
         repair_checksum: true,
@@ -964,7 +964,7 @@ fn local_input_ipv4_cannot_rewrite_destination_to_nonlocal() {
     ip.set_dst_addr(Ipv4Address::new(127, 0, 0, 1));
     ip.fill_checksum();
     let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     assert!(iface
         .inner
         .process_ipv4_filtered(
@@ -1095,7 +1095,7 @@ fn filtered_ipv4_fragments_are_reassembled_before_rewrite() {
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
     let original = icmp_request_for_rewrite();
     let datagram = &original[20..];
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = RewriteIpv4Destination { calls: 0 };
 
     for (offset, payload, more_fragments) in [(0, &datagram[..8], true), (8, &datagram[8..], false)]
@@ -1165,7 +1165,7 @@ fn filtered_ipv4_reassembly_reports_the_first_fragment_source_mac() {
     let datagram = &original[20..];
     let first_mac = HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 1]));
     let final_mac = HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 2]));
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = CaptureSource(None);
 
     for (offset, payload, more_fragments, source) in [
@@ -1902,7 +1902,7 @@ fn explicit_broadcast_route_suppresses_tcp_reset_and_protocol_error() {
         );
         bytes[repr.buffer_len()..].copy_from_slice(payload);
         let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
-        let mut scratch = AllocVec::new();
+        let mut scratch = crate::storage::PacketBytes::new();
         assert!(iface
             .inner
             .process_ipv4_filtered(
@@ -3175,7 +3175,7 @@ fn filtered_local_input_receives_original_ipv4_and_owns_raw_fanout() {
     packet.fill_checksum();
     packet.payload_mut()[0] = 0x42;
     let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
-    let mut scratch = AllocVec::new();
+    let mut scratch = crate::storage::PacketBytes::new();
     let mut filter = Capture(Vec::new());
     assert!(iface
         .inner
@@ -3627,4 +3627,86 @@ fn exact_buffer_failure_preserves_ipv4_emission_and_fragment_progress() {
         }
         assert_eq!(recovered, payload);
     }
+}
+
+#[test]
+#[cfg(all(
+    feature = "alloc",
+    feature = "proto-ipv4-fragmentation",
+    feature = "medium-ip"
+))]
+fn fragment_storage_failure_never_acknowledges_unsent_payload() {
+    use core::cell::Cell;
+    use std::rc::Rc;
+    fn fail(
+        _: usize,
+    ) -> Result<crate::storage::PacketBytesStorage, crate::storage::OwnedBufferResizeError> {
+        Err(crate::storage::OwnedBufferResizeError)
+    }
+    struct Tx(Rc<Cell<usize>>);
+    impl TxToken for Tx {
+        fn consume<R, F>(self, len: usize, emit: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            self.0.set(self.0.get() + 1);
+            emit(&mut vec![0; len])
+        }
+    }
+    let (mut iface, _, _) = setup(Medium::Ip);
+    iface.set_packet_buffer_allocator(fail).unwrap();
+    let payload = vec![0xa5; iface.inner.ip_mtu() + 256];
+    let packet = || {
+        Packet::new_ipv4(
+            Ipv4Repr {
+                src_addr: Ipv4Address::new(192, 0, 2, 1),
+                dst_addr: Ipv4Address::new(198, 51, 100, 1),
+                next_header: IpProtocol::Udp,
+                payload_len: payload.len(),
+                hop_limit: 64,
+            },
+            IpPayload::Raw(&payload),
+        )
+    };
+    let emitted = Rc::new(Cell::new(0));
+    let before = (
+        iface.fragmenter.packet_len,
+        iface.fragmenter.sent_bytes,
+        iface.fragmenter.ipv4.frag_offset,
+    );
+    assert_eq!(
+        iface.inner.dispatch_ip(
+            Tx(emitted.clone()),
+            PacketMeta::default(),
+            packet(),
+            &mut iface.fragmenter
+        ),
+        Err(DispatchError::Exhausted)
+    );
+    assert_eq!(emitted.get(), 0);
+    assert_eq!(
+        (
+            iface.fragmenter.packet_len,
+            iface.fragmenter.sent_bytes,
+            iface.fragmenter.ipv4.frag_offset
+        ),
+        before
+    );
+    iface.fragmenter.buffer = crate::storage::PacketBytes::new();
+    assert_eq!(
+        iface.inner.dispatch_ip(
+            Tx(emitted.clone()),
+            PacketMeta::default(),
+            packet(),
+            &mut iface.fragmenter
+        ),
+        Ok(())
+    );
+    assert_eq!(emitted.get(), 1);
+    while !iface.fragmenter.is_empty() && !iface.fragmenter.finished() {
+        iface
+            .inner
+            .dispatch_ipv4_frag(Tx(emitted.clone()), &mut iface.fragmenter);
+    }
+    assert!(emitted.get() >= 2);
 }

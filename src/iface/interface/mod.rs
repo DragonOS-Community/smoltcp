@@ -30,8 +30,6 @@ use super::ingress_packet::{
     RoutedIngressPacket,
 };
 use super::packet::*;
-#[cfg(feature = "alloc")]
-use alloc::vec::Vec as AllocVec;
 
 use core::result::Result;
 use heapless::Vec;
@@ -162,7 +160,7 @@ pub struct Interface {
     fragments: FragmentsBuffer,
     fragmenter: Fragmenter,
     #[cfg(feature = "alloc")]
-    ingress_scratch: AllocVec<u8>,
+    ingress_scratch: crate::storage::PacketBytes,
 }
 
 /// The device independent part of an Ethernet network interface.
@@ -305,7 +303,7 @@ impl Interface {
             },
             fragmenter: Fragmenter::new(),
             #[cfg(feature = "alloc")]
-            ingress_scratch: AllocVec::new(),
+            ingress_scratch: crate::storage::PacketBytes::new(),
             inner: InterfaceInner {
                 now,
                 caps,
@@ -1053,6 +1051,27 @@ impl Interface {
         }
     }
 
+    /// Configure linear CPU packet storage before processing packets. This does
+    /// not change device DMA storage. An active fragmented datagram is retained.
+    #[cfg(feature = "alloc")]
+    pub fn set_packet_buffer_allocator(
+        &mut self,
+        allocator: crate::storage::PacketBytesAllocator,
+    ) -> Result<(), crate::storage::OwnedBufferResizeError> {
+        #[cfg(feature = "_proto-fragmentation")]
+        if !self.fragmenter.is_empty() {
+            return Err(crate::storage::OwnedBufferResizeError);
+        }
+        #[cfg(feature = "_proto-fragmentation")]
+        self.fragments.assembler.set_allocator(allocator)?;
+        self.ingress_scratch = crate::storage::PacketBytes::with_allocator(allocator);
+        #[cfg(feature = "_proto-fragmentation")]
+        {
+            self.fragmenter.buffer = crate::storage::PacketBytes::with_allocator(allocator);
+        }
+        Ok(())
+    }
+
     fn socket_ingress(
         &mut self,
         device: &mut (impl Device + ?Sized),
@@ -1064,7 +1083,7 @@ impl Interface {
         };
 
         let rx_meta = rx_token.meta();
-        rx_token.consume(|frame| {
+        let result = rx_token.consume(|frame| {
             #[cfg(feature = "alloc")]
             if let Some(filter) = filter.as_deref_mut() {
                 filter.begin_packet(rx_meta);
@@ -1165,7 +1184,10 @@ impl Interface {
             // We should return `PacketProcessed` for these to save the user from
             // doing useless socket polls.
             PollIngressSingleResult::SocketStateChanged
-        })
+        });
+        #[cfg(feature = "alloc")]
+        self.ingress_scratch.release_owned();
+        result
     }
 
     fn socket_egress(
@@ -1449,7 +1471,7 @@ impl InterfaceInner {
         meta: PacketMeta,
         ip_payload: &'frame [u8],
         frag: &'frame mut FragmentsBuffer,
-        scratch: &'frame mut AllocVec<u8>,
+        scratch: &'frame mut crate::storage::PacketBytes,
         filter: &mut dyn IpIngressFilter,
     ) -> Option<Packet<'frame>> {
         self.process_ip_inner(sockets, meta, ip_payload, frag, Some((scratch, filter)))
@@ -1463,7 +1485,7 @@ impl InterfaceInner {
         ip_payload: &'frame [u8],
         frag: &'frame mut FragmentsBuffer,
         #[cfg(feature = "alloc")] filter: Option<(
-            &'frame mut AllocVec<u8>,
+            &'frame mut crate::storage::PacketBytes,
             &mut dyn IpIngressFilter,
         )>,
     ) -> Option<Packet<'frame>> {
@@ -1995,6 +2017,9 @@ impl InterfaceInner {
                                 "Fragmentation buffer is too small, at least {} needed. Dropping",
                                 total_ip_len
                             );
+                            #[cfg(feature = "alloc")]
+                            return Err(DispatchError::Exhausted);
+                            #[cfg(not(feature = "alloc"))]
                             return Ok(());
                         }
 

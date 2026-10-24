@@ -342,6 +342,9 @@ impl InterfaceInner {
                         fragmentation buffer is too small, at least {} needed",
                         total_size
                     );
+                    #[cfg(feature = "alloc")]
+                    return Err(DispatchError::Exhausted);
+                    #[cfg(not(feature = "alloc"))]
                     return Ok(());
                 }
 

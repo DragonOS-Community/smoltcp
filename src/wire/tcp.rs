@@ -1421,7 +1421,7 @@ mod test {
             assert_eq!(packet.urgent_at(), pointer);
             assert_eq!(
                 Repr::parse(
-                    &Packet::new_unchecked(&packet.as_ref()[..]),
+                    &Packet::new_unchecked(packet.as_ref()),
                     &SRC_ADDR.into(),
                     &DST_ADDR.into(),
                     &ChecksumCapabilities::default()

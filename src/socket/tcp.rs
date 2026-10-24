@@ -2331,11 +2331,11 @@ impl<'a> Socket<'a> {
             let mark = repr.seq_number + usize::from(pointer.saturating_sub(1));
             let head = self.recv_head_seq();
             let next = head + self.rx_buffer.len();
-            if mark >= head && mark >= next && self.rx_urgent.is_none_or(|(old, _)| mark > old) {
+            if mark >= head && mark >= next && self.rx_urgent.map_or(true, |(old, _)| mark > old) {
                 // Replacing a mark at the current head must not expose its
                 // already excluded byte as ordinary data.
                 if self.at_urgent_mark() && !self.urgent_inline && !self.rx_buffer.is_empty() {
-                    self.rx_buffer.dequeue_many(1);
+                    let _ = self.rx_buffer.dequeue_many(1);
                     self.remote_seq_no += 1;
                 }
                 self.rx_urgent = Some((mark, UrgentState::Pending));

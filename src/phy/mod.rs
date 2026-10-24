@@ -583,10 +583,11 @@ mod preparation_tests {
             Some(Tx(self.0.clone()))
         }
         fn capabilities(&self) -> DeviceCapabilities {
-            let mut caps = DeviceCapabilities::default();
-            caps.medium = Medium::Ip;
-            caps.max_transmission_unit = 1500;
-            caps
+            DeviceCapabilities {
+                medium: Medium::Ip,
+                max_transmission_unit: 1500,
+                ..DeviceCapabilities::default()
+            }
         }
     }
     struct NoFuzz;
